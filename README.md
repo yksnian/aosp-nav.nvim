@@ -1,13 +1,16 @@
 # aosp-dev.nvim
 
 为 Android 源码阅读提供语言服务配置集合。
-实现了 Java的 Android 特化配置（会从编译环境获取依赖的jar包并导入jdtls），支持Android所有Java模块代码自动补全和跳转。
 
+实现了针对Android的jdtls配置（会从编译环境获取依赖的jar包并导入jdtls），支持Android所有Java模块代码自动补全和跳转。
+
+Android Java代码跳转
 <img width="2560" height="1380" alt="2026-09-01-10-04-53" src="https://github.com/user-attachments/assets/3a9ed67a-55fc-41e3-aca6-41554897a619" />
-
+Android Java代码补全
 <img width="2560" height="1380" alt="2026-09-01-10-05-58" src="https://github.com/user-attachments/assets/d64d173f-4483-44dd-bd6c-3fbda535d5e6" />
 
-Android c/cpp模块代码跳转和补全请查看FAQ章节。
+Android cpp代码演示（c/cpp代码跳转和补全请查看FAQ章节）。
+<img width="1800" height="995" alt="cpp_demo" src="https://github.com/user-attachments/assets/8847ce0d-df1c-43b6-af34-2efd76b1e659" />
 
 ## 功能
 
@@ -225,6 +228,7 @@ source ~/.bashrc
 lunch_ex <build_target>   # 代替 lunch
 make_ex -j8               # 代替 make
 ```
+
 
 ## License
 
