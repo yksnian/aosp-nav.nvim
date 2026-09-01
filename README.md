@@ -196,6 +196,36 @@ ln -sf out/soong/development/ide/compdb/compile_commands.json .
 ```
 然后用nvim打开你需要查看的cpp文件即可。
 
+**备注**
+
+可以将 
+`SOONG_GEN_COMPDB=1` 和 `ln -sf out/soong/development/ide/compdb/compile_commands.json .` 
+封装为lunch和make的拓展函数放到~/.bashrc文件中.
+```
+function lunch_ex() {
+    lunch "$@"
+    if [ $? -eq 0 ]; then
+        export SOONG_GEN_COMPDB=1
+        export SOONG_GEN_COMPDB_DEBUG=1
+        echo "✅ SOONG_GEN_COMPDB=1"
+    fi
+}
+
+function make_ex() {
+    command make "$@"
+    if [ -f "out/soong/development/ide/compdb/compile_commands.json" ]; then
+        ln -sf out/soong/development/ide/compdb/compile_commands.json .
+        echo "🔗 compile_commands.json is created"
+    fi
+}
+```
+想生成compile_commands.json时用这俩替代lunch和make来编译项目。
+```
+source ~/.bashrc
+lunch_ex <build_target>   # 代替 lunch
+make_ex -j8               # 代替 make
+```
+
 ## License
 
 MIT
