@@ -142,7 +142,8 @@ jdtls 的 FoldingRangeHandler 在解析某些 token 时抛 NegativeArraySizeExce
 
 ### jdtls 显示 Download gradle wrapper checksums
 
-AOSP 非构建系统项目, 工作站无网时 jdtls 尝试下载 Gradle checksums. 插件已默认禁用 Gradle/Maven 导入.
+插件已默认禁用 Gradle/Maven 导入，但jdtls检测到build.gradle仍然会出现，导致补全和跳转失效，通常在`frameworks/base`下打开文件时出现。
+需要在所打开文件模块包含Android.bp的目录(如`frameworks/base/services/`)下创建.project文件来避免。
 
 ### 修改配置后不生效
 
@@ -168,6 +169,7 @@ rm ~/.cache/nvim/aosp_dev/*.txt
 
 然后需要在Android源码环境中生成 compile_commands.json。
 （clangd 默认会从当前文件所在目录向上查找 compile_commands.json，因此最简单的方法是在 Android 源码根目录下创建一个软链接，指向实际的文件。）
+
 操作步骤：
 1. 进入源码根目录，配置编译参数（和平时make前操作一样）
 ```
@@ -215,7 +217,7 @@ function lunch_ex() {
 }
 
 function make_ex() {
-    command make "$@"
+    make "$@"
     if [ -f "out/soong/development/ide/compdb/compile_commands.json" ]; then
         ln -sf out/soong/development/ide/compdb/compile_commands.json .
         echo "🔗 compile_commands.json is created"
