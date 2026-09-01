@@ -1,13 +1,13 @@
 # aosp-dev.nvim
 
-为 Android 源码阅读提供语言服务配置集合。 实现了 Java的 Android 特化配置（会从编译环境获取依赖的jar包并导入jdtls）.
-
-当前适用于Android Framework开发者阅读/修改代码。
+为 Android 源码阅读提供语言服务配置集合。
+实现了 Java的 Android 特化配置（会从编译环境获取依赖的jar包并导入jdtls），支持Android所有Java模块代码自动补全和跳转。
 
 <img width="2560" height="1380" alt="2026-09-01-10-04-53" src="https://github.com/user-attachments/assets/3a9ed67a-55fc-41e3-aca6-41554897a619" />
 
 <img width="2560" height="1380" alt="2026-09-01-10-05-58" src="https://github.com/user-attachments/assets/d64d173f-4483-44dd-bd6c-3fbda535d5e6" />
 
+C/Cpp代码跳转请查看FAQ章节。
 
 ## 功能
 
@@ -164,30 +164,21 @@ rm ~/.cache/nvim/aosp_dev/*.txt
 
 或在 nvim 中重新打开 java 文件时会自动重新扫描.
 
-### 拓展：如何查看Android native代码（在cpp中跳转和语义联想）
+### 拓展：如何查看Android Native代码（在c/cpp中跳转和自动补全）
 安装LSP和clangd插件并配置好。
-我使用的LazyVim，在extra中勾选了lang.clangd即可。
+若使用的LazyVim，在extra中勾选了lang.clangd即可。
 
 然后需要在Android源码环境中生成 compile_commands.json。
+（clangd 默认会从当前文件所在目录向上查找 compile_commands.json，因此最简单的方法是在 Android 源码根目录下创建一个软链接，指向实际的文件。）
 操作步骤：
-
-进入源码根目录并配置环境：
-
+1. 进入源码根目录，配置编译参数（和平时make前操作一样）
 bash
 ```
-cd /path/to/android/root  # 替换为你的AOSP根目录
+cd /path/to/android/  # 替换为你的AOSP根目录
 source build/envsetup.sh
 lunch <your_target>       # 例如: lunch aosp_arm64-eng
 ```
-进入你的模块目录：
-
-bash
-```
-cd /path/to/your/module   # 包含 Android.bp 或 Android.mk 的目录[reference:2]
-设置环境变量并执行编译：
-设置 SOONG_GEN_COMPDB=1 来启用生成功能。
-```
-
+2. 重要，设置 SOONG_GEN_COMPDB=1
 bash
 ```
 export SOONG_GEN_COMPDB=1
@@ -195,15 +186,17 @@ export SOONG_GEN_COMPDB=1
 export SOONG_GEN_COMPDB_DEBUG=1
 # 可选：指定输出目录，$(pwd) 表示当前目录
 export SOONG_LINK_COMPDB_TO=$(pwd)
-# 执行编译，例如编译当前目录下的模块
-mm
-# 或者编译整个项目（耗时较长）
-# m nothing
 ```
-文件通常生成在你通过 SOONG_LINK_COMPDB_TO 指定的目录，或在out/soong/development/ide/compdb/compile_commands.json
+3. 执行编译，例如某个模块
+```
+mm
+# 或者编译整个Android项目
+# make -j8
+```
+文件通常生成在out/soong/development/ide/compdb/compile_commands.json
 可在根目录下执行以下命令创建一个软链接。
 ```
-cd /path/to/android/root  # 替换为你的AOSP根目录
+cd /path/to/android/ # 替换为你的AOSP根目录
 ln -sf out/soong/development/ide/compdb/compile_commands.json .
 ```
 然后用nvim打开你需要查看的cpp文件即可。
