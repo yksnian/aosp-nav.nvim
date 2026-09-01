@@ -7,7 +7,7 @@
 
 <img width="2560" height="1380" alt="2026-09-01-10-05-58" src="https://github.com/user-attachments/assets/d64d173f-4483-44dd-bd6c-3fbda535d5e6" />
 
-C/Cpp代码跳转请查看FAQ章节。
+Android c/cpp模块代码跳转和补全请查看FAQ章节。
 
 ## 功能
 
@@ -84,22 +84,17 @@ require("aosp-dev").setup({
 ```
 :AospCollectJars [aosp_root] [output_dir]
 ```
-
-从 AOSP out 目录收集 jar 供无编译产物的机器 fallback.
+使用场景，某台PC只是下载了部分Android仓库代码，或者未编译过，把另一台已编译过Android设备中的jar导出使用。
 
 - 无参数: 自动检测 android_root, 输出到 java.jar_fallback_dir
 - 指定参数: :AospCollectJars ~/aosp ~/downloads/aosp_jars
 
 收集后自动清除 jar 缓存, 重新打开 java 文件即可加载新 jar.
 
-## AOSP 双机工作流
-
-工作站有编译产物, PC 没有. 用此工作流同步:
-
-1. **工作站**: 打开 AOSP java 文件, jdtls 自动从 out/soong/.intermediates/ 加载 jar
-2. **工作站**: :AospCollectJars 收集 jar 到 ~/.usr/android_jars/
-3. **同步**: scp -r workstation:~/.usr/android_jars/ ~/.usr/android_jars/
-4. **PC**: 打开 AOSP java 文件, jdtls 自动 fallback 到 ~/.usr/android_jars/ 加载 jar
+1. **设备1**: 打开 AOSP java 文件, jdtls 自动从 out/soong/.intermediates/ 加载 jar
+2. **设备1**: :AospCollectJars 收集 jar 到 ~/.usr/android_jars/
+3. **复制**: scp -r <user_name>:~/.usr/android_jars/ ~/.usr/android_jars/或使用U盘
+5. **设备2**: 打开 AOSP java 文件, jdtls 自动 fallback 到 ~/.usr/android_jars/ 加载 jar
 
 ## 配置项
 
@@ -172,14 +167,13 @@ rm ~/.cache/nvim/aosp_dev/*.txt
 （clangd 默认会从当前文件所在目录向上查找 compile_commands.json，因此最简单的方法是在 Android 源码根目录下创建一个软链接，指向实际的文件。）
 操作步骤：
 1. 进入源码根目录，配置编译参数（和平时make前操作一样）
-bash
 ```
 cd /path/to/android/  # 替换为你的AOSP根目录
 source build/envsetup.sh
 lunch <your_target>       # 例如: lunch aosp_arm64-eng
 ```
+
 2. 重要，设置 SOONG_GEN_COMPDB=1
-bash
 ```
 export SOONG_GEN_COMPDB=1
 # 可选：生成格式化（便于阅读）的 JSON 文件
@@ -195,6 +189,7 @@ mm
 ```
 文件通常生成在out/soong/development/ide/compdb/compile_commands.json
 可在根目录下执行以下命令创建一个软链接。
+
 ```
 cd /path/to/android/ # 替换为你的AOSP根目录
 ln -sf out/soong/development/ide/compdb/compile_commands.json .
