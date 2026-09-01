@@ -1,6 +1,13 @@
 # aosp-dev.nvim
 
-Neovim 插件: 为 Android 源码阅读提供语言服务配置集合. 当前实现 Java (jdtls) 的 Android 特化配置, 未来考虑扩展 C/C++ (clangd).
+为 Android 源码阅读提供语言服务配置集合。 实现了 Java的 Android 特化配置（会从编译环境获取依赖的jar包并导入jdtls）, 未来考虑扩展 C/C++ (clangd).
+
+当前适用于Android Framework开发者阅读/修改代码。
+
+<img width="2560" height="1380" alt="2026-09-01-10-04-53" src="https://github.com/user-attachments/assets/3a9ed67a-55fc-41e3-aca6-41554897a619" />
+
+<img width="2560" height="1380" alt="2026-09-01-10-05-58" src="https://github.com/user-attachments/assets/d64d173f-4483-44dd-bd6c-3fbda535d5e6" />
+
 
 ## 功能
 
