@@ -84,20 +84,22 @@ require("aosp-dev").setup({
 
 ### :AospCollectJars
 
+用于从已编译项目out收集jar包存放到`~/.usr/android_jars/`。
+
+当设备有多个Android项目时，可能有些已编译，有些未编译。
+
+当我们打开已编译的项目，会使用out下的jar解析;
+
+若执行该命令，则会把out下的jar包复制到`~/.usr/android_jars/`。
+
+此后即使打开未编译的项目，也能正常跳转和补全，因为插件会让jdtls使用`~/.usr/android_jars/`进行解析。
+
 ```
 :AospCollectJars [aosp_root] [output_dir]
 ```
-使用场景，某台PC只是下载了部分Android仓库代码，或者未编译过，把另一台已编译过Android设备中的jar导出使用。
 
 - 无参数: 自动检测 android_root, 输出到 java.jar_fallback_dir
 - 指定参数: :AospCollectJars ~/aosp ~/downloads/aosp_jars
-
-收集后自动清除 jar 缓存, 重新打开 java 文件即可加载新 jar.
-
-1. **设备1**: 打开 AOSP java 文件, jdtls 自动从 out/soong/.intermediates/ 加载 jar
-2. **设备1**: :AospCollectJars 收集 jar 到 ~/.usr/android_jars/
-3. **复制**: scp -r <user_name>:~/.usr/android_jars/ ~/.usr/android_jars/或使用U盘
-5. **设备2**: 打开 AOSP java 文件, jdtls 自动 fallback 到 ~/.usr/android_jars/ 加载 jar
 
 ## 配置项
 
