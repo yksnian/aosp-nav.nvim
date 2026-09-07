@@ -14,7 +14,7 @@ Android cpp代码演示（c/cpp代码跳转和补全请查看FAQ章节）。
 
 ## 功能
 
-- **android_root 自动检测**: 支持多子项目结构 (soc/qcom/qssi, google/aosp 等), 兄弟子项目 fallback
+- **android_root 自动检测**: 支持多子项目结构
 - **Soong intermediates jar 加载**: Android 15+ 的 out/soong/.intermediates/ 目录扫描, fd 优先 find 备选
 - **文件缓存**: jar 列表缓存到 ~/.cache/nvim/aosp_dev/, 避免每次打开都全盘扫描
 - **深层嵌套源码根推断**: 根据打开文件的 package 声明反推源码根, 解决同级类跳转失败
@@ -78,6 +78,63 @@ require("aosp-dev").setup({
     inlay_hints_mode = "auto",  -- "auto" | "off" | "all"
   },
 })
+```
+
+### 本人配置
+LazyVim，开启java extra的支持
+.config/nvim/jdtls.lua
+```
+return {
+  {
+    "mfussenegger/nvim-jdtls",
+    dependencies = { "aosp-dev" },
+    ft = "java",
+    opts = function(_, opts)
+      -- Initialize aosp-dev plugin (lazy.nvim has loaded deps before opts runs)
+      require("aosp-dev").setup()
+
+      -- 配置 JDTLS 启动命令
+      -- 注意: jdtls python wrapper 会把无法识别的裸参数放到 -jar equinox.launcher.jar
+      -- 之后 (equinox 应用参数, JVM 不识别), 因此所有 JVM 参数必须用 --jvm-arg= 前缀,
+      -- 否则实际生效的是 JVM 默认值 (G1GC + ~3.8G 堆), 导致大项目 GC 抖动/OOM
+      opts.cmd = {
+        "jdtls",
+        "--jvm-arg=-XX:+UseParallelGC",
+        "--jvm-arg=-XX:GCTimeRatio=4",
+        "--jvm-arg=-Xmx8G",  -- 最大堆内存 8GB
+        "--jvm-arg=-Xms2G",  -- 初始堆内存 2GB
+        "--jvm-arg=--add-modules=ALL-SYSTEM",
+        "--jvm-arg=--add-opens=java.base/java.util=ALL-UNNAMED",
+        "--jvm-arg=-javaagent:" .. vim.fn.expand("~/.local/share/nvim/mason/packages/jdtls/lombok.jar"),
+      }
+
+      -- 项目根目录检测 (复用已有 jdtls 实例避免为巨型 .git 目录启动新 workspace)
+      local root_pattern = require("lspconfig.util").root_pattern
+      opts.root_dir = function(fname)
+        local detected = root_pattern(".project", ".git")(fname)
+        if detected then
+          local clients = vim.lsp.get_clients({ name = "jdtls" })
+          for _, c in ipairs(clients) do
+            local existing = c.root_dir or (c.config and c.config.root_dir)
+            if existing and existing ~= detected then
+              return existing
+            end
+          end
+        end
+        return detected
+      end
+
+      -- init options
+      opts.init_options = {
+        extendedClientCapabilities = {
+          classFileContentsSupport = true,
+        },
+      }
+
+      return require("aosp-dev").java.configure(opts)
+    end,
+  },
+}
 ```
 
 ## 命令
