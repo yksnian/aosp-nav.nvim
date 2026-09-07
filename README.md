@@ -120,20 +120,20 @@ require("aosp-dev").setup({
 | java.inlay_hints_mode | auto | auto=有jar强制off/无jar all, 或 off/all |
 | clang.enabled | false | 占位, 未来 clangd 支持 |
 
-## 创建 .project 文件 (重要)
+## 创建 .project 文件 
 
-AOSP 源码中存在 `build.gradle` (如 `frameworks/base/tests/UiBench/` 等), jdtls 检测到后会认为是 Gradle 项目, 即使禁用 Gradle 导入, 项目也处于空状态, **无法跳转**.
+AOSP 源码中存在 `build.gradle` (如 `frameworks/base/tests/UiBench/` 等), jdtls 检测到后会认为是 Gradle 项目, 会进行同步，而同步失败将导致 **无法跳转**.
 
-**解决方法**: 在打开的文件所属的模块根目录创建空的 `.project` 文件, jdtls 会识别为 Eclipse 项目 (优先级高于 gradle), 跳过 gradle 检测, 正常建立索引.
+插件默认禁用了Gradle 导入，最新版本会自动索引打开文件所在根（.git/.project）下的文件，由于frameworks/base下的文件太多，第一次打开时会需要较长时间（约半小时进行索引），之后就快了。
 
+若只是关注某个子目录下的代码，并且对跳转frameworks源码还是跳到编译好的framework lib中不关心，则可以：
 
+在打开的文件所属的模块根目录创建空的 `.project` 文件，这样便只索引当前.project所在模块的源码，其他依赖由编译好的lib来补充（适合写代码，补全快）.
 
-**判断模块根**: 从打开的 java 文件路径向上找, 直到父目录含 `.git` (AOSP 子模块根). 例如:
+例如:
 - `frameworks/base/services/core/java/...` → 模块根 `frameworks/base/services/`
-- `packages/modules/Connectivity/service/src/...` → 模块根 `packages/modules/Connectivity/`
 
 **注意**: `.project` 不需要任何内容, 空文件即可.
-
 
 
 ## FAQ
