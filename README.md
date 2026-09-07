@@ -1,15 +1,23 @@
 # aosp-dev.nvim
 
-为 Android 源码阅读提供语言服务配置集合。
+适合Android系统开发者。
 
-实现了针对Android的jdtls配置（会从编译环境获取依赖的jar包并导入jdtls），支持Android所有Java模块代码自动补全和跳转。
+通常，nvim使能jdtls插件后，打开Android项目，仅仅能跳转和补全Java文件内部和JDK自带的符号，一旦涉及到Andorid相关的类就显示无定义。
+
+本插件解决的问题是让所有Android的类都能被jdtls解析，从而所有代码都能跳转和补全。
+
+打开java文件后，插件自动从Android编译产出物获取依赖的jar，从文件位置获取Java源码路径并配置给jdtls。
+
+c/cpp代码跳转和补全依赖clang，插件未做配置，详情查看FAQ章节。
+
+## 演示
 
 Android Java代码跳转
 <img width="2560" height="1380" alt="2026-09-01-10-04-53" src="https://github.com/user-attachments/assets/3a9ed67a-55fc-41e3-aca6-41554897a619" />
 Android Java代码补全
 <img width="2560" height="1380" alt="2026-09-01-10-05-58" src="https://github.com/user-attachments/assets/d64d173f-4483-44dd-bd6c-3fbda535d5e6" />
 
-Android cpp代码演示（c/cpp代码跳转和补全请查看FAQ章节）。
+Android cpp代码演示。
 <img width="1800" height="995" alt="cpp_demo" src="https://github.com/user-attachments/assets/8847ce0d-df1c-43b6-af34-2efd76b1e659" />
 
 ## 功能
@@ -139,6 +147,10 @@ return {
 
 ## 命令
 
+对于已编译成功的项目，直接打开项目相关java文件即可，插件已做好相关jar包加载的配置。
+
+对于未编译项目，比如有多个Android项目，有些已编另一些没编译，可以通过以下命令在已编译项目中将通用的jar导出提供给未编译项目使用。
+
 ### :AospCollectJars
 
 用于从已编译项目out收集jar包存放到`~/.usr/android_jars/`。
@@ -222,7 +234,7 @@ rm ~/.cache/nvim/aosp_dev/*.txt
 
 或在 nvim 中重新打开 java 文件时会自动重新扫描.
 
-### 拓展：如何查看Android Native代码（在c/cpp中跳转和自动补全）
+### 如何查看Android Native代码（在c/cpp中跳转和自动补全）
 安装LSP和clangd插件并配置好。
 若使用的LazyVim，在extra中勾选了lang.clangd即可。
 
