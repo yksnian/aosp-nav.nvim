@@ -278,31 +278,21 @@ ln -sf out/soong/development/ide/compdb/compile_commands.json .
 
 **备注**
 
-可以将 
-`SOONG_GEN_COMPDB=1` 和 `ln -sf out/soong/development/ide/compdb/compile_commands.json .` 
-封装为lunch和make的拓展函数放到~/.bashrc文件中.
+可以将
+`SOONG_GEN_COMPDB=1` 和 `ln -sf out/soong/development/ide/compdb/compile_commands.json .`
+封装为make的拓展函数放到~/.bashrc文件中.
 ```
-function lunch_ex() {
-    lunch "$@"
-    if [ $? -eq 0 ]; then
-        export SOONG_GEN_COMPDB=1
-        export SOONG_GEN_COMPDB_DEBUG=1
-        echo "✅ SOONG_GEN_COMPDB=1"
-    fi
-}
-
 function make_ex() {
-    make "$@"
+    SOONG_GEN_COMPDB=1 SOONG_GEN_COMPDB_DEBUG=1 make "$@"
     if [ -f "out/soong/development/ide/compdb/compile_commands.json" ]; then
         ln -sf out/soong/development/ide/compdb/compile_commands.json .
         echo "🔗 compile_commands.json is created"
     fi
 }
 ```
-想生成compile_commands.json时用这俩替代lunch和make来编译项目。
+想生成compile_commands.json时用 make_ex 替代 make 编译项目（lunch 照常使用）。
 ```
 source ~/.bashrc
-lunch_ex <build_target>   # 代替 lunch
 make_ex -j8               # 代替 make
 ```
 

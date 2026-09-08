@@ -284,29 +284,19 @@ Then open any cpp file in nvim.
 
 You can wrap
 `SOONG_GEN_COMPDB=1` and `ln -sf out/soong/development/ide/compdb/compile_commands.json .`
-into extended `lunch`/`make` functions in your `~/.bashrc`:
+into an extended `make` function in your `~/.bashrc`:
 ```
-function lunch_ex() {
-    lunch "$@"
-    if [ $? -eq 0 ]; then
-        export SOONG_GEN_COMPDB=1
-        export SOONG_GEN_COMPDB_DEBUG=1
-        echo "✅ SOONG_GEN_COMPDB=1"
-    fi
-}
-
 function make_ex() {
-    make "$@"
+    SOONG_GEN_COMPDB=1 SOONG_GEN_COMPDB_DEBUG=1 make "$@"
     if [ -f "out/soong/development/ide/compdb/compile_commands.json" ]; then
         ln -sf out/soong/development/ide/compdb/compile_commands.json .
         echo "🔗 compile_commands.json is created"
     fi
 }
 ```
-Use these instead of `lunch`/`make` when you want compile_commands.json generated.
+Use `make_ex` instead of `make` when you want compile_commands.json generated (`lunch` stays the same).
 ```
 source ~/.bashrc
-lunch_ex <build_target>   # instead of lunch
 make_ex -j8               # instead of make
 ```
 
