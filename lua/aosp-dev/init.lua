@@ -34,7 +34,7 @@ end
 -- 访问 M.java / M.clang 时自动 ensure setup, 然后 require 并缓存到表上
 setmetatable(M, {
   __index = function(t, key)
-    if key == "java" or key == "clang" then
+    if key == "java" or key == "clang" or key == "kotlin" then
       -- 未 setup 时用默认配置自动初始化
       if not M._state.setup_done then
         M.setup()

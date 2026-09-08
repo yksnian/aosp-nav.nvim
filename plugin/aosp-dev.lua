@@ -7,4 +7,13 @@ end, {
   desc = "Collect AOSP jars for jdtls fallback",
 })
 
+vim.api.nvim_create_user_command("AospKlsClasspath", function(args)
+  require("aosp-dev").setup()  -- ensure initialized
+  require("aosp-dev").kotlin.preview_classpath(args.fargs[1] ~= "" and args.fargs[1] or nil)
+end, {
+  nargs = "?",
+  complete = function() return { "curated", "all" } end,
+  desc = "Regenerate classpath script and dry-run preview",
+})
+
 return {}

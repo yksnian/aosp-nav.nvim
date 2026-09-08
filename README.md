@@ -1,16 +1,15 @@
 # aosp-dev.nvim
 
-适合Android系统开发者。
-
-通常，nvim使能jdtls插件后，打开Android项目，仅仅能跳转和补全Java文件内部和JDK自带的符号，一旦涉及到Andorid相关的类就显示无定义。
-
-本插件解决的问题是让所有Android的类都能被jdtls解析，从而所有代码都能跳转和补全。
-
-打开java文件后，插件自动从Android编译产出物获取依赖的jar，从文件位置获取Java源码路径并配置给jdtls。
-
-c/cpp代码跳转和补全依赖clang，插件未做配置，详情查看FAQ章节。
+适合阅读/修改Android系统源码。
 
 ## 演示
+通常，nvim启用jdtls/kotlin-language-server插件后，打开Android项目，仅能跳转和补全Java/kt文件内部和JDK自带的符号，一旦涉及到Andorid相关的类就显示无定义。
+
+本插件利用 jdtls、kotlin-language-server 和 clangd 的能力，支持 Android framework/native (Java/Kotlin/cpp) 代码跳转和自动补全：
+
+- Java: 针对 Android 的 jdtls 配置（自动从编译环境收集依赖 jar 并导入），支持所有 Java 模块的补全和跳转
+- Kotlin: 针对 kotlin-language-server (KLS) 的 AOSP classpath 配置，Kotlin 代码可跳转到 framework Java 源码
+- c/cpp代码跳转和补全依赖clang和Android编译环境配置，插件未做特殊配置，详情查看FAQ章节。
 
 Android Java代码跳转
 <img width="2560" height="1380" alt="2026-09-01-10-04-53" src="https://github.com/user-attachments/assets/3a9ed67a-55fc-41e3-aca6-41554897a619" />
@@ -23,13 +22,18 @@ Android cpp代码演示。
 ## 功能
 
 - **android_root 自动检测**: 支持多子项目结构
-- **Soong intermediates jar 加载**: Android 15+ 的 out/soong/.intermediates/ 目录扫描, fd 优先 find 备选
+- **Soong intermediates jar 加载**: out/soong/.intermediates/ 目录扫描, fd 优先 find 备选
 - **文件缓存**: jar 列表缓存到 ~/.cache/nvim/aosp_dev/, 避免每次打开都全盘扫描
 - **深层嵌套源码根推断**: 根据打开文件的 package 声明反推源码根, 解决同级类跳转失败
 - **AOSP 兼容性修复**:
   - 禁用 foldingRange 避免 jdtls -32603 NegativeArraySizeException
   - 禁用 Gradle/Maven 导入避免无网工作站下载 checksums
   - inlayHints 自动切换 (有 AOSP jar 时强制 off 避签名损坏 NPE, 纯 Java all)
+- **Kotlin (kotlin-language-server) 支持**:
+  - 自动生成 `~/.config/kotlin-language-server/classpath` 脚本 (KLS ShellClassPathResolver 机制), 从 soong intermediates 加载 AOSP framework jar
+  - root_markers 追加 `.git` 兜底: AOSP 无 gradle/maven 根文件, 默认 root_dir=nil 会导致 KLS classpath 永不解析
+  - 跳转优先落点为 AOSP 真实源码 (如 `core/java/android/os/Build.java`), 外部依赖 (dagger 等) 落点为 jar 反编译
+  - 禁用 documentHighlight 避免 KLS NoTopLevelDescriptorProvider -32603
 
 ## 安装
 
@@ -37,6 +41,7 @@ Android cpp代码演示。
 
 - Neovim >= 0.10
 - [mfussenegger/nvim-jdtls](https://github.com/mfussenegger/nvim-jdtls)
+- [fwcd/kotlin-language-server](https://github.com/fwcd/kotlin-language-server) >= 1.3.13 (Kotlin 支持, 可用 mason 安装)
 - `fd` (推荐, 扫描快 3-10x) 或 `find` (备选)
 
 ### lazy.nvim
@@ -44,6 +49,7 @@ Android cpp代码演示。
 ```lua
 {
   "yksnian/aosp-dev.nvim",
+  version = "*",  -- 跟踪最新稳定 tag (v1.1.0 起); 省略则跟踪 main 分支
   dependencies = "mfussenegger/nvim-jdtls",
   ft = "java",
 }
@@ -64,7 +70,13 @@ return {
     ft = "java",
     opts = function(_, opts)
       -- 你的 jdtls 配置 (cmd, root_dir, on_attach 等)
-      opts.cmd = { "jdtls", "-Xmx8G" }
+      -- 注意: JVM 参数必须用 --jvm-arg= 前缀, 裸 -Xmx8G 会被 jdtls python wrapper
+      -- 放到 -jar 之后 (equinox 应用参数), JVM 完全忽略, 实际仍是默认 ~3.8G 堆
+      opts.cmd = {
+        "jdtls",
+        "--jvm-arg=-Xmx8G",
+        "--jvm-arg=-Xms2G",
+      }
       opts.root_dir = require("lspconfig.util").root_pattern(".git", ".project")
 
       -- 注入 AOSP 特化配置 (jar, sourcePaths, foldingRange, gradle 等)
@@ -88,62 +100,29 @@ require("aosp-dev").setup({
 })
 ```
 
-### 本人配置
-LazyVim，开启java extra的支持
-.config/nvim/jdtls.lua
-```
+### Kotlin (kotlin-language-server) 接线
+
+在 lspconfig 的 opts 中注入 KLS 配置 (以 LazyVim 为例):
+
+```lua
+-- lua/plugins/lsp.lua
 return {
   {
-    "mfussenegger/nvim-jdtls",
-    dependencies = { "aosp-dev" },
-    ft = "java",
+    "neovim/nvim-lspconfig",
     opts = function(_, opts)
-      -- Initialize aosp-dev plugin (lazy.nvim has loaded deps before opts runs)
-      require("aosp-dev").setup()
-
-      -- 配置 JDTLS 启动命令
-      -- 注意: jdtls python wrapper 会把无法识别的裸参数放到 -jar equinox.launcher.jar
-      -- 之后 (equinox 应用参数, JVM 不识别), 因此所有 JVM 参数必须用 --jvm-arg= 前缀,
-      -- 否则实际生效的是 JVM 默认值 (G1GC + ~3.8G 堆), 导致大项目 GC 抖动/OOM
-      opts.cmd = {
-        "jdtls",
-        "--jvm-arg=-XX:+UseParallelGC",
-        "--jvm-arg=-XX:GCTimeRatio=4",
-        "--jvm-arg=-Xmx8G",  -- 最大堆内存 8GB
-        "--jvm-arg=-Xms2G",  -- 初始堆内存 2GB
-        "--jvm-arg=--add-modules=ALL-SYSTEM",
-        "--jvm-arg=--add-opens=java.base/java.util=ALL-UNNAMED",
-        "--jvm-arg=-javaagent:" .. vim.fn.expand("~/.local/share/nvim/mason/packages/jdtls/lombok.jar"),
-      }
-
-      -- 项目根目录检测 (复用已有 jdtls 实例避免为巨型 .git 目录启动新 workspace)
-      local root_pattern = require("lspconfig.util").root_pattern
-      opts.root_dir = function(fname)
-        local detected = root_pattern(".project", ".git")(fname)
-        if detected then
-          local clients = vim.lsp.get_clients({ name = "jdtls" })
-          for _, c in ipairs(clients) do
-            local existing = c.root_dir or (c.config and c.config.root_dir)
-            if existing and existing ~= detected then
-              return existing
-            end
-          end
-        end
-        return detected
-      end
-
-      -- init options
-      opts.init_options = {
-        extendedClientCapabilities = {
-          classFileContentsSupport = true,
-        },
-      }
-
-      return require("aosp-dev").java.configure(opts)
+      opts.servers = opts.servers or {}
+      opts.servers.kotlin_language_server =
+        require("aosp-dev").kotlin.configure(opts.servers.kotlin_language_server or {})
     end,
   },
 }
 ```
+
+`configure` 会:
+- 注入 `init_options.storagePath` (空 init_options 会让 KLS JSON 解析报错)
+- 禁用 `documentHighlight` handler (AOSP 无 gradle 时 KLS 降级模式会 -32603)
+- 补全 `root_markers` (追加 `.git`, 否则 AOSP 下 root_dir=nil, KLS 不加载 classpath)
+- 生成 `~/.config/kotlin-language-server/classpath` 脚本: KLS 启动时执行, 从 soong intermediates 输出 AOSP framework jar 列表 (Kotlin -> Java 跳转的依赖来源)
 
 ## 命令
 
@@ -170,6 +149,13 @@ return {
 - 无参数: 自动检测 android_root, 输出到 java.jar_fallback_dir
 - 指定参数: :AospCollectJars ~/aosp ~/downloads/aosp_jars
 
+### :AospKlsClasspath [curated|all]
+
+重新生成 KLS classpath 脚本并 dry-run 预览输出的 jar 列表:
+
+- `curated` (默认): 只加载精选核心模块 (framework, core-oj, SystemUI, dagger 等), 首次索引快
+- `all`: 全量 jar (数据源为 java 模块的 jar 缓存), 覆盖面广但首次索引慢/内存高, 实验性
+
 ## 配置项
 
 | 项 | 默认 | 说明 |
@@ -187,6 +173,11 @@ return {
 | java.disable_folding_range | true | 禁用 foldingRange (避 -32603) |
 | java.disable_gradle_import | true | 禁用 Gradle/Maven 导入 |
 | java.inlay_hints_mode | auto | auto=有jar强制off/无jar all, 或 off/all |
+| kotlin.enabled | true | 启用 kotlin 子模块 (KLS) |
+| kotlin.jar_mode | curated | curated=精选核心模块, all=全量 (实验性) |
+| kotlin.curated_modules | {framework, core-oj, SystemUI, dagger...} | curated 模式加载的 soong 模块列表 |
+| kotlin.disable_document_highlight | true | 禁用 documentHighlight (避 KLS -32603) |
+| kotlin.storage_path | ~/.cache/kotlin-language-server | KLS 缓存目录 (init_options.storagePath) |
 | clang.enabled | false | 占位, 未来 clangd 支持 |
 
 ## 创建 .project 文件 
@@ -234,7 +225,19 @@ rm ~/.cache/nvim/aosp_dev/*.txt
 
 或在 nvim 中重新打开 java 文件时会自动重新扫描.
 
-### 如何查看Android Native代码（在c/cpp中跳转和自动补全）
+### Kotlin 跳转到测试 stub 文件
+
+KLS 会把 workspace 内所有 .java 文件加入 source path, AOSP 中存在与 framework 类同包同名的测试 stub (如 `tools/systemfeatures/tests/.../Context.java`), 跳转 `Context` 时可能落到 stub 而非 `core/java/.../Context.java`. 这是 KLS 已知限制 (source path 扫描无排除配置), 大多数类不受影响, 遇到时可用 grep/搜索 定位真实源码.
+
+### Kotlin 补全/跳转全不工作
+
+按顺序检查:
+1. `:checkhealth` 或 `:LspInfo` 确认 KLS 已 attach 且 root_dir 非空 (为空说明 root_markers 未生效)
+2. `ls ~/.config/kotlin-language-server/classpath` 确认脚本已生成且可执行
+3. `cd <AOSP模块根> && bash ~/.config/kotlin-language-server/classpath` 手动运行, 确认输出非空 jar 列表
+4. KLS 首次打开大模块需建立索引, 等待 CPU 降下来后再试
+
+### 拓展：如何查看Android Native代码（在c/cpp中跳转和自动补全）
 安装LSP和clangd插件并配置好。
 若使用的LazyVim，在extra中勾选了lang.clangd即可。
 

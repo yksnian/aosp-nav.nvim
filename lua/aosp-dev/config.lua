@@ -45,6 +45,36 @@ M.defaults = {
   clang = {
     enabled = false,
   },
+  kotlin = {
+    enabled = true,
+    -- jar 选择模式: "curated"=精选核心模块(脚本直接 glob, 实时反映编译产物),
+    --   "all"=全量 jar(读 java 模块维护的缓存文件, 实验性: KLS 会为每个 jar
+    --   建符号索引, 首次索引慢/内存高, 且需先打开过 java 文件预热缓存)
+    jar_mode = "curated",
+    -- 精选模块 (glob, 匹配 soong intermediates 的模块路径; ** 跨目录层级)
+    -- make 树(Android 14-)取 pattern 最后一个无通配符分量作 <stem>*_intermediates 匹配
+    curated_modules = {
+      "frameworks/base/framework",                    -- Activity/Context/View
+      "frameworks/base/framework-minus-apex",
+      "libcore/core-all", "libcore/core-oj*",         -- java.* 核心库
+      "external/icu/android_icu4j/core-icu4j",
+      "external/icu/android_icu4j/core-repackaged-icu4j",
+      "frameworks/base/services/core/*",              -- system_server
+      "frameworks/base/ext",
+      "frameworks/base/packages/SystemUI/**",         -- 上游 SystemUI
+      "external/dagger2/dagger2", "external/dagger2/hilt*", -- SystemUI DI 依赖
+    },
+    -- KLS 专用 tag 优先级 (独立于 java): turbine-combined = soong 版 classes-header
+    -- (API 签名 jar, 小而干净); 想跳转看到方法体(配合 KLS 自带 fernflower 反编译)
+    -- 可改为 { "combined", "javac", "turbine-combined" }
+    soong_tag_priority = { "turbine-combined", "combined", "javac" },
+    make_jar_priority = { "classes-header.jar", "classes.jar", "javalib.jar" },
+    -- AOSP 无 gradle 时 NoTopLevelDescriptorProvider 触发 -32603
+    disable_document_highlight = true,
+    -- init_options 必须非空对象 (空表序列化成数组导致 gson 报错)
+    storage_path = vim.fn.expand("~/.cache/kotlin-language-server"),
+    -- jar 名/路径排除复用 java.exclude_jars / java.exclude_paths (单一来源)
+  },
 }
 
 --- 校验配置
@@ -65,6 +95,22 @@ function M.validate(cfg)
   if cfg.java and cfg.java.enabled then
     if not cfg.java.soong_tag_priority or #cfg.java.soong_tag_priority == 0 then
       return false, "java.soong_tag_priority must not be empty"
+    end
+  end
+
+  -- kotlin 段校验 (kotlin 启用时)
+  if cfg.kotlin and cfg.kotlin.enabled then
+    if cfg.kotlin.jar_mode ~= "curated" and cfg.kotlin.jar_mode ~= "all" then
+      return false, "kotlin.jar_mode must be 'curated' or 'all'"
+    end
+    if cfg.kotlin.jar_mode == "curated" and (not cfg.kotlin.curated_modules or #cfg.kotlin.curated_modules == 0) then
+      return false, "kotlin.curated_modules must not be empty in curated mode"
+    end
+    if not cfg.kotlin.soong_tag_priority or #cfg.kotlin.soong_tag_priority == 0 then
+      return false, "kotlin.soong_tag_priority must not be empty"
+    end
+    if not cfg.kotlin.storage_path or cfg.kotlin.storage_path == "" then
+      return false, "kotlin.storage_path must not be empty"
     end
   end
 
