@@ -24,9 +24,35 @@ local function add_jar(path, jars, seen_paths)
   end
 end
 
+--- 判断目录名是否为设备端 soong 变体, 返回去重优先级 (android_common 首选,
+--- android_common_apexNN 兜底); nil 表示非设备变体 (host linux_*/产品变体等, 排除)
+local function variant_rank(name)
+  if name == "android_common" then return 0 end
+  if name:match("^android_common_apex[%w_]*$") then return 1 end
+  return nil
+end
+
+-- [v3] soong 产物类型桶:
+--   own 桶 (javac/kotlinc): 模块自身源码产物。混合 Java/Kotlin 模块两个目录
+--     并存、各含一半类, 必须都保留, 只取其一会丢另一种语言的类
+--   fb  桶 (其余 tag): fat jar/签名 jar, 仅当模块无任何 own 产物时按
+--     soong_tag_priority 顺序兜底取一份 (如 service-connectivity 主目录只有
+--     combined; java_sdk_library 的真实编译在 <name>.impl 子模块)
+-- 去重键 = 归一化模块名 (剥 .impl 后缀): 使 xxx.impl/javac 与 xxx/combined
+--   竞争同一键, own 恒优先 → javac 胜出, combined 落选, 不再有双份类
+local OWN_SOURCE_TAGS = { javac = true, kotlinc = true }
+
 --- 扫描 Soong intermediates 目录 (Android 15+)
---- 路径结构: <base>/<source_path>/<module>/<variant>/<output_tag>/<jar>
---- 按 <source_path>/<module>/<variant> 去重, output_tag 优先级高的先处理
+--- jar 路径结构: <base>/<src...>/<module>[.impl]/<variant>[/<type>...]/<name>.jar
+---   变体: android_common (设备端标准, 首选) | android_common_apexNN (APEX 变体,
+---         同模块无 android_common 产物时兜底, 如 core-oj 只有 apex31); host
+---         (linux_glibc_common 等) 与产品变体一律排除
+---   类型: [v3] 分桶制 — javac/kotlinc (模块自身编译产物) 全保留; combined
+---         (impl+静态依赖 fat jar) / turbine* (API 签名无方法体) 仅作兜底, 当且
+---         仅当模块无任何自身产物时按 soong_tag_priority 取一份; java_sdk_library
+---         的真实编译在 <name>.impl 子模块, 剥后缀归一到主模块名参与去重
+---   排除: repackaged-jarjar/jarjar 类型链; exclude_jars 同时匹配 jar 名与
+---         模块名 (如 "stubs" 拦住 android-non-updatable.stubs.system 等签名桩)
 --- @param base_dir string soong intermediates 根目录
 --- @param jars table jar 列表 (追加)
 --- @param seen_paths table 已见路径集合
@@ -36,63 +62,93 @@ local function scan_soong_intermediates(base_dir, jars, seen_paths)
   local java_cfg = cfg.java
   if vim.fn.isdirectory(base_dir) ~= 1 then return false end
 
-  -- 构造 fd 正则和 find path glob
-  local tag_alt = table.concat(java_cfg.soong_tag_priority, "|")
-  -- fd: -p 全路径 regex; 前导 / 确保只匹配独立的 tag 目录 (不匹配 local-combined 等)
-  local fd_regex = "/(" .. tag_alt .. ")/[^/]+\\.jar$"
-  local find_globs = {}
-  for _, tag in ipairs(java_cfg.soong_tag_priority) do
-    find_globs[#find_globs + 1] = "*/" .. tag .. "/*.jar"
-  end
-
-  -- 调 util.fs.scan_files (fd 优先, find 备选)
+  -- 全量列出 jar (产物类型目录层级不固定, 统一扫出后在 Lua 侧解析;
+  -- 全树 ~2600 个路径, 成本可忽略), fd 优先 find 备选
   local fs = require("aosp-dev.util.fs")
-  local all_matches = fs.scan_files(base_dir, fd_regex, find_globs)
+  local all_matches = fs.scan_files(base_dir, "\\.jar$", { "*.jar" })
   if not all_matches or #all_matches == 0 then return false end
 
-  -- 按 tag 优先级排序: 高优先级 tag 的 jar 先处理, 同模块去重
-  local tag_order = {}
-  for i, tag in ipairs(java_cfg.soong_tag_priority) do
-    tag_order[tag] = i
+  -- [v3] type_rank 只决定兜底桶内部排序; own/fallback 的归属由 tag 名决定
+  local type_rank = {}
+  for i, t in ipairs(java_cfg.soong_tag_priority) do
+    type_rank[t] = i
   end
-  table.sort(all_matches, function(a, b)
-    local ta = a:match("/([^/]+)/[^/]+$") or ""
-    local tb = b:match("/([^/]+)/[^/]+$") or ""
-    return (tag_order[ta] or 999) < (tag_order[tb] or 999)
-  end)
+  local unknown_rank = #java_cfg.soong_tag_priority + 1
 
-  -- 按模块路径去重, 应用排除规则
-  local seen_modules = {}
-  local found_any = false
-
+  local own = {}  -- [mod] = { [tag] = {rank, path} }
+  local fb = {}   -- [mod] = {rank, path}
   for _, path in ipairs(all_matches) do
-    if path ~= "" then
-      local jar_name = vim.fn.fnamemodify(path, ":t")
-
-      -- 排除 jar 名 (Lua 模式匹配)
-      local excluded = false
-      for _, pat in ipairs(java_cfg.exclude_jars) do
-        if jar_name:match(pat) then excluded = true break end
-      end
-      -- 排除路径关键词 (普通字符串匹配)
-      if not excluded then
-        for _, kw in ipairs(java_cfg.exclude_paths) do
-          if path:find(kw, 1, true) then excluded = true break end
-        end
-      end
-
-      if not excluded then
-        local rel = path:sub(#base_dir + 2)
-        local module_path = rel:gsub("/[^/]+/[^/]+$", "")
-        if not seen_modules[module_path] then
-          seen_modules[module_path] = true
-          add_jar(path, jars, seen_paths)
-          found_any = true
-        end
+    if path == "" then goto continue end
+    local rel = path:sub(#base_dir + 2)
+    local comps = vim.split(rel, "/", { plain = true })
+    -- 从右往左找变体分量 (最后分量是 jar 文件)
+    local vi = nil
+    for i = #comps - 1, 1, -1 do
+      if variant_rank(comps[i]) then
+        vi = i
+        break
       end
     end
+    -- 需要变体前至少有模块分量 (vi >= 2, comps[1] 为首个 src 分量)
+    if not vi or vi < 2 then goto continue end
+
+    -- 变体与 jar 之间的分量构成类型链 (可能多层); jarjar/repackaged-jarjar
+    -- 均为改包名重打包产物, 直接排除
+    for i = vi + 1, #comps - 1 do
+      if comps[i] == "repackaged-jarjar" or comps[i] == "jarjar" then
+        goto continue
+      end
+    end
+    local typ = vi < #comps - 1 and comps[vi + 1] or ""
+
+    -- [v3] java_sdk_library 的真实编译产物在 <name>.impl 子模块, 剥后缀
+    -- 归一到主模块名, 使其与主目录的 combined 竞争同一去重键
+    local mod = comps[vi - 1]:gsub("%.impl$", "")
+
+    -- [v3] 排除规则同时匹配 jar 名与模块名: "stubs" 子串可拦住
+    -- android-non-updatable.stubs.system 等签名桩 (桩 jar 名 = 模块名 + .jar)
+    local jar_name = comps[#comps]
+    for _, pat in ipairs(java_cfg.exclude_jars) do
+      if jar_name:match(pat) or mod:match(pat) then goto continue end
+    end
+    -- 排除路径关键词 (普通字符串匹配)
+    for _, kw in ipairs(java_cfg.exclude_paths) do
+      if path:find(kw, 1, true) then goto continue end
+    end
+
+    local rank = variant_rank(comps[vi]) * 100 + (type_rank[typ] or unknown_rank)
+    if OWN_SOURCE_TAGS[typ] then
+      -- own 桶: 按 (模块, 类型) 各留最优变体一份; javac/kotlinc 并存时都保留
+      own[mod] = own[mod] or {}
+      local b = own[mod][typ]
+      if not b or rank < b.rank then
+        own[mod][typ] = { rank = rank, path = path }
+      end
+    else
+      -- 兜底桶: 每模块只留 rank 最优一份 (combined/turbine/未知类型竞争)
+      local b = fb[mod]
+      if not b or rank < b.rank then
+        fb[mod] = { rank = rank, path = path }
+      end
+    end
+    ::continue::
   end
 
+  local found_any = false
+  -- own 桶全量收 (javac + kotlinc 各一份)
+  for _, per in pairs(own) do
+    for _, v in pairs(per) do
+      add_jar(v.path, jars, seen_paths)
+      found_any = true
+    end
+  end
+  -- 兜底: 仅补没有任何自身产物的模块 (如 service-connectivity 主目录)
+  for mod, v in pairs(fb) do
+    if not own[mod] then
+      add_jar(v.path, jars, seen_paths)
+      found_any = true
+    end
+  end
   return found_any
 end
 
@@ -187,29 +243,33 @@ function M.find_android_jars()
   local source_parts = {}
 
   -- 文件缓存: 避免每次首次打开都重新 find + Lua 处理 3000+ 路径
-  -- 清除缓存: rm ~/.cache/nvim/aosp_dev/*.txt (AOSP 重新编译后需要)
+  -- 带版本标记: 过滤算法升级时旧缓存自动作废重扫
+  -- 手动清除: rm ~/.cache/nvim/aosp_dev/*.txt (AOSP 重新编译后需要)
   local cache_file = nil
   local from_cache = false
+  local CACHE_VERSION = 3  -- [v3] v3: own/fallback 双桶 + .impl 归一化 + stubs 排除 (旧缓存自动作废)
   if cfg.cache_dir and android_root then
     local cache_key = android_root:gsub("/", "-"):gsub("^-", "")
     cache_file = cfg.cache_dir .. "/" .. cache_key .. ".txt"
     if vim.fn.filereadable(cache_file) == 1 then
       local lines = vim.fn.readfile(cache_file)
-      for _, line in ipairs(lines) do
-        if line ~= "" and line:sub(1, 1) ~= "#" then
-          if vim.fn.filereadable(line) == 1 then
-            jars[#jars + 1] = line
-            seen_paths[line] = true
+      if lines[1] == "# version=" .. CACHE_VERSION then
+        for _, line in ipairs(lines) do
+          if line ~= "" and line:sub(1, 1) ~= "#" then
+            if vim.fn.filereadable(line) == 1 then
+              jars[#jars + 1] = line
+              seen_paths[line] = true
+            end
           end
         end
-      end
-      if #jars > 0 then
-        from_cache = true
-        _jars_cache = jars
-        _jars_cache_root = android_root
-        _jars_computed = true
-        vim.notify("[aosp-dev] JAR loaded from cache (" .. #jars .. " jars)", vim.log.levels.INFO)
-        return jars
+        if #jars > 0 then
+          from_cache = true
+          _jars_cache = jars
+          _jars_cache_root = android_root
+          _jars_computed = true
+          vim.notify("[aosp-dev] JAR loaded from cache (" .. #jars .. " jars)", vim.log.levels.INFO)
+          return jars
+        end
       end
     end
   end
@@ -252,6 +312,7 @@ function M.find_android_jars()
   -- 写文件缓存 (仅扫描到 jar 且非缓存加载时)
   if #jars > 0 and not from_cache and cache_file then
     local cache_lines = {
+      "# version=" .. CACHE_VERSION,
       "# android_root=" .. android_root,
       "# generated=" .. os.date("%Y-%m-%d %H:%M"),
       "# count=" .. #jars,

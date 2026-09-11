@@ -23,17 +23,55 @@ function M.configure(opts)
   local jars_mod = require("aosp-dev.java.jars")
   local jars = jars_mod.find_android_jars()
 
-  -- 2. 源码根推断 (root_dir 可能是 function, 需调用)
   local bufname = vim.api.nvim_buf_get_name(0)
+
+  -- 2. workspace root (root_dir 可能是 function, 需调用) — 必须先于自排除:
+  --    自排除与 sourcePaths 必须使用同一个 root
   local root_path = opts.root_dir
   if type(root_path) == "function" then
     root_path = root_path(bufname)
   end
+  -- 用户未配 root_dir 时兜底 (镜像 root_pattern(".project", ".git") 语义)
+  root_path = root_path or vim.fs.root(bufname, { ".project", ".git" })
 
+  -- 3. self jar 排除: 以源码打开的工程, 其自身产物的 jar 从 classpath 剔除 —
+  --    源码已注册 (jdtls invisible project), jar 与源码双份定义会让 jdtls 解析
+  --    歧义 (读 frameworks/base 时不加载 framework.jar/services.jar 等, 其余
+  --    仓库的 jar 保留)。jar 路径含 .intermediates/<源码目录>/... 按仓库相对
+  --    路径过滤。
+  --    过滤基准 = jdtls workspace root (root_dir), 而非 .git 仓库根:
+  --    .project 放在子模块 (如 frameworks/base/services/) 时 root_dir 是子模块,
+  --    子模块范围外的 framework.jar 必须保留 (.project 提速技巧依赖它提供
+  --    android.* 解析); 只有 root_dir 覆盖范围内的 jar 才与源码重复。
+  --    常规无 .project 场景 root_dir == .git 根, 行为不变。
+  if java_cfg.exclude_self_jars and #jars > 0 and root_path and root_path ~= "" then
+    local android_root = require("aosp-dev.android_root").find_android_platform_root(bufname)
+    local rel = android_root
+      and root_path:sub(1, #android_root + 1) == android_root .. "/"
+      and root_path:sub(#android_root + 2)
+    if rel then
+      local marker = "/.intermediates/" .. rel .. "/"
+      local filtered, removed = {}, 0
+      for _, j in ipairs(jars) do
+        if j:find(marker, 1, true) then
+          removed = removed + 1
+        else
+          filtered[#filtered + 1] = j
+        end
+      end
+      if removed > 0 then
+        vim.notify(("[aosp-dev] self-exclude %s: -%d jars, %d remain")
+          :format(rel, removed, #filtered), vim.log.levels.INFO)
+      end
+      jars = filtered
+    end
+  end
+
+  -- 4. 源码根推断
   local source_paths_mod = require("aosp-dev.java.source_paths")
   local source_paths = source_paths_mod.find_source_paths(root_path, bufname)
 
-  -- 3. inlay hints: android 项目 -> off (避签名损坏 NPE), 非 android -> all
+  -- 5. inlay hints: android 项目 -> off (避签名损坏 NPE), 非 android -> all
   local cache = jars_mod.cache_status()
   local is_android = cache.root ~= nil
   local inlay_mode
@@ -43,7 +81,7 @@ function M.configure(opts)
     inlay_mode = java_cfg.inlay_hints_mode
   end
 
-  -- 4. 禁用 foldingRange (服务端 FoldingRangeHandler 在特定 token 上抛
+  -- 6. 禁用 foldingRange (服务端 FoldingRangeHandler 在特定 token 上抛
   --    NegativeArraySizeException -> jdtls -32603 Internal error)
   --    注意: capabilities.textDocument.foldingRange 不能设为 false —
   --    LSP 规范要求该字段为 object, 设 false 会让 jdt.ls JSON 解析
@@ -78,7 +116,7 @@ function M.configure(opts)
     })
   end
 
-  -- 5. 构造 AOSP 特化 settings
+  -- 7. 构造 AOSP 特化 settings
   local aosp_settings = {
     java = {
       project = {
@@ -127,7 +165,7 @@ function M.configure(opts)
       opts.init_options.settings or {}, import_settings)
   end
 
-  -- 6. 深度合并: AOSP 字段优先, 但不覆盖用户其他 settings (如 completion, signatureHelp 等)
+  -- 8. 深度合并: AOSP 字段优先, 但不覆盖用户其他 settings (如 completion, signatureHelp 等)
   opts.settings = vim.tbl_deep_extend("force", opts.settings, aosp_settings)
 
   return opts

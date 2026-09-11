@@ -31,7 +31,7 @@ function M.setup(opts)
 end
 
 -- 子模块 lazy 导出 (metatable: 首次访问才 require, 避免非 java 文件也加载 java 模块)
--- 访问 M.java / M.clang 时自动 ensure setup, 然后 require 并缓存到表上
+-- 访问 M.java / M.clang / M.kotlin 时自动 ensure setup, 然后 require 并缓存到表上
 setmetatable(M, {
   __index = function(t, key)
     if key == "java" or key == "clang" or key == "kotlin" then
