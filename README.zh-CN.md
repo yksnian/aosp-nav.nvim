@@ -94,7 +94,15 @@ return {
 ### 自定义配置
 
 ```lua
-require("aosp-dev").setup({  cache_dir = "~/.cache/nvim/aosp_dev",  java = {    jar_fallback_dir = "~/.usr/android_jars",    disable_folding_range = true,    inlay_hints_mode = "auto",  -- "auto" | "off" | "all"  },})
+require("aosp-dev").setup({
+  cache_dir = "~/.cache/nvim/aosp_dev",
+  java = {
+    jar_fallback_dir = "~/.usr/android_jars",
+    exclude_paths = { "linux_glibc_common", "android_common_apex" },
+    disable_folding_range = true,
+    inlay_hints_mode = "auto",  -- "auto" | "off" | "all"
+  },
+})
 ```
 
 ### Kotlin (kotlin-language-server) 接线
