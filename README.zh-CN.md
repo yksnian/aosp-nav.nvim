@@ -2,11 +2,13 @@
 
 [English](README.md) | 简体中文
 
-适合阅读/修改Android系统源码。
+适合阅读/修改Android系统源码(适合Android系统开发者，应用开发不推荐)。
 
-## 演示
+和的ctags，sourceinsight等静态分析工具不一样，也不像AndroidStudio那么重，无需idegen然后导ipr文件。
 
-通常，nvim启用jdtls/kotlin-language-server插件后，打开Android项目，仅能跳转和补全Java/kt文件内部和JDK自带的符号，一旦涉及到Android相关的类就显示无定义。
+使用此插件以后就能在AOSP代码里翱翔了!
+
+通常，nvim启用LSP插件后，打开Android项目，仅能跳转和补全基础的Java/kt文件内部和JDK符号，一旦涉及到Android相关的类就显示无定义。
 
 本插件利用 jdtls、kotlin-language-server 和 clangd 的能力，支持 Android framework/native (Java/Kotlin/cpp) 代码跳转和自动补全：
 
@@ -14,7 +16,11 @@
 - Kotlin: 针对 kotlin-language-server (KLS) 的 AOSP classpath 配置，Kotlin 代码可跳转到 framework Java 源码（combined jar 优先，可跳到方法体反编译视图）
 - c/cpp代码跳转和补全依赖clang和Android编译环境配置，插件未做特殊配置，详情查看FAQ章节。
 
-Android Java代码跳转![2026-09-01-10-04-53](https://github.com/user-attachments/assets/3a9ed67a-55fc-41e3-aca6-41554897a619)Android Java代码补全![2026-09-01-10-05-58](https://github.com/user-attachments/assets/d64d173f-4483-44dd-bd6c-3fbda535d5e6)
+## 演示
+
+Android Java代码跳转![2026-09-01-10-04-53](https://github.com/user-attachments/assets/3a9ed67a-55fc-41e3-aca6-41554897a619)
+
+Android Java代码补全![2026-09-01-10-05-58](https://github.com/user-attachments/assets/d64d173f-4483-44dd-bd6c-3fbda535d5e6)
 
 Android cpp代码演示。![cpp_demo](https://github.com/user-attachments/assets/8847ce0d-df1c-43b6-af34-2efd76b1e659)
 
@@ -130,9 +136,7 @@ require("aosp-dev").setup({
 
 ## 命令
 
-对于已编译成功的项目，直接打开项目相关java文件即可，插件已做好相关jar包加载的配置。
-
-对于未编译项目，比如有多个Android项目，有些已编另一些没编译，可以通过以下命令在已编译项目中将通用的jar导出提供给未编译项目使用。
+做过手机或平板等项目的同学都应该了解，我们工作站上通常不止一套Android代码，有些编译过而有些未编译，为了让未编译项目也能获得一致的体验,我们可通过此命令将已编译项目的jar包备份到一个通用位置作为jar包的fallback,这样，即使以后随便打开哪个android项目，都有jar包兜底了。
 
 ### :AospCollectJars
 

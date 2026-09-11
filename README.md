@@ -4,8 +4,6 @@ English | [简体中文](README.zh-CN.md)
 
 Neovim plugin for reading and editing Android (AOSP) source code.
 
-## Demo
-
 Normally, with jdtls / kotlin-language-server set up in Neovim, opening an Android project only lets you jump to and complete symbols within the project's own Java/Kotlin files and the JDK. As soon as an Android framework class is involved, you get "no definition".
 
 This plugin leverages jdtls, kotlin-language-server and clangd to support go-to-definition and completion for Android framework/native code (Java/Kotlin/cpp):
@@ -13,6 +11,8 @@ This plugin leverages jdtls, kotlin-language-server and clangd to support go-to-
 - **Java**: Android-specific jdtls configuration — automatically collects dependency jars from the build environment and feeds them to jdtls, enabling completion and navigation across all Java modules
 - **Kotlin**: AOSP classpath configuration for kotlin-language-server (KLS) — Kotlin code can jump to framework Java sources (combined jars preferred, so navigation lands in decompiled method bodies)
 - **c/cpp**: navigation and completion rely on clangd plus the Android build environment configuration; the plugin does not modify clangd behavior (see the FAQ section)
+
+## Demo
 
 Android Java go-to-definition:![2026-09-01-10-04-53](https://github.com/user-attachments/assets/3a9ed67a-55fc-41e3-aca6-41554897a619)
 
