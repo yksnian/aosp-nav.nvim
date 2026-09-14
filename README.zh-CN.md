@@ -184,7 +184,8 @@ require("aosp-dev").setup({
 | java.jar_fallback_dir             | ~/.usr/android_jars                                          | 无编译产物时 fallback jar 目录                               |
 | java.soong_tag_priority           | {combined, turbine-combined, turbine}                        | 兜底桶内部顺序; javac/kotlinc 属自身产物桶, 恒全保留         |
 | java.exclude_jars                 | {R.jar, stubs.jar, lint.jar, dex.jar, srcjarsN.jar, kapt-*.jar, *stubs*} | 排除规则 (Lua 模式), 同时匹配 jar 名与模块名                 |
-| java.exclude_paths                | {linux_glibc_common}                                         | 排除的路径关键词; 勿加 android_common_apex (会误杀只有 apex 变体的 core-oj 等模块) |
+| java.exclude_paths | {linux_glibc_common, development/} | 排除的路径关键词 (子串匹配); 勿加 android_common_apex (会误杀只有 apex 变体的 core-oj 等模块) |
+| java.exclude_globs | {^prebuilts/sdk/sdk_} | Lua 模式排除: 匹配 .intermediates/ 之后的相对路径。锚定 ^ 可精确到顶层目录, 如 { "^external/cronet/", "^vendor/xxx/packages/apps/" } 剔除 cronet 网络库与厂商定制 app |
 | java.exclude_self_jars            | false                                                        | 剔除 jdtls root_dir 覆盖范围内模块自身的 jar。默认关闭: AIDL/proto/aconfig 生成类源码树内无 .java, jar 是唯一来源; 且 JDT 对同名类源码优先于 jar, 保留 jar 不影响跳转落点 |
 | java.make_jar_priority            | {classes.jar, classes-header.jar, javalib.jar}               | Make 构建系统 jar 优先级                                     |
 | java.make_blacklist               | {android_stubs_current_intermediates}                        | Make 构建排除目录                                            |

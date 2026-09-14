@@ -34,6 +34,16 @@ M.defaults = {
     -- 勿加 "android_common_apex": 会误杀只有 apex 变体的模块 (core-oj 等)
     exclude_paths = {
       "linux_glibc_common",   -- host (编译机) 变体, 另有变体规则兜底
+      "development/",         -- 开发工具 (monkey 等), 无生产代码引用
+    },
+    -- [v4] Lua 模式排除: 匹配 .intermediates/ 之后的相对路径 (锚定 ^ 可精确
+    -- 到顶层目录, 子串式的 exclude_paths 做不到)。用于用户自助裁剪, 如:
+    exclude_globs = {
+      -- prebuilts/sdk 导出的预构建 module SDK 桩 (sdk_public_*/sdk_system_*/
+      -- sdk_module-lib_*) 及其 system_modules 里的 jrt-fs.jar: 仅 API 签名
+      -- 无方法体, 与 packages/modules 下源码构建的真实实现 (framework-*.impl)
+      -- 同 FQN, 会抢占跳转。androidx 等预构建 AAR 不在此列, 保持保留
+      "^prebuilts/sdk/sdk_",
     },
     -- 是否剔除 root_dir 覆盖范围内模块自身的 jar。默认 false:
     --   - JDT 对同 FQN 源码优先于 jar, 保留 jar 不会把跳转劫持到反编译视图;

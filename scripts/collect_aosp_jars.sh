@@ -70,6 +70,7 @@ emit_jar() {
 soong_scan_stdin() {
   local base="$1"
   local -A OWN_RANK=() OWN_PATH=() OWN_DEST=() FB_RANK=() FB_PATH=() FB_DEST=() OWN_MODS=()
+  local -A PREJARJAR_PATH=() PREJARJAR_DEST=() PREJARJAR_MOD=()
   local abs rel c mod typ key rank vr
   local parts=()
   local n j
@@ -77,6 +78,7 @@ soong_scan_stdin() {
     [ -n "$abs" ] || continue
     case "$abs" in */repackaged-jarjar/*|*/jarjar/*) continue ;; esac
     case "$abs" in "$base"/*) rel="${abs#"$base"/}" ;; *) continue ;; esac
+    case "$rel" in development/*) continue ;; esac
 
     c="${abs##*/}"
     if echo "$c" | grep -qE "$SOONG_EXCLUDE_JARS"; then
@@ -124,6 +126,17 @@ soong_scan_stdin() {
       continue
     fi
 
+    # [v4] pre-jarjar: defer to base module if it also has an artifact
+    case "$mod" in
+      *-pre-jarjar)
+        local bmod=${mod%-pre-jarjar}
+        PREJARJAR_PATH[$mod]="$abs"
+        PREJARJAR_DEST[$mod]="soong/.intermediates/$rel"
+        PREJARJAR_MOD[$mod]=$bmod
+        continue
+        ;;
+    esac
+
     if is_own_tag "$typ"; then
       # own bucket: best variant per (module, tag); android_common preferred
       key="$mod|$typ"
@@ -157,6 +170,15 @@ soong_scan_stdin() {
       [ -n "${OWN_MODS[$m]:-}" ] || emit_jar "${FB_PATH[$m]}" "${FB_DEST[$m]}"
     done
   fi
+
+  local pm pmod
+  for pm in "${!PREJARJAR_PATH[@]}"; do
+    pmod=${PREJARJAR_MOD[$pm]}
+    if [ -z "${OWN_RANK[${pmod}|javac]:-}" ] && [ -z "${OWN_RANK[${pmod}|kotlinc]:-}" ] \
+       && [ -z "${FB_RANK[$pmod]:-}" ]; then
+      emit_jar "${PREJARJAR_PATH[$pm]}" "${PREJARJAR_DEST[$pm]}"
+    fi
+  done
 }
 
 collect_from_list() {

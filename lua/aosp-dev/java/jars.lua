@@ -57,6 +57,7 @@ local OWN_SOURCE_TAGS = { javac = true, kotlinc = true }
 --- @param jars table jar 列表 (追加)
 --- @param seen_paths table 已见路径集合
 --- @return boolean found_any
+--- @return table|nil selected mod_name -> jar_path (v4: 供调用方做 pre-jarjar 后处理)
 local function scan_soong_intermediates(base_dir, jars, seen_paths)
   local cfg = get_cfg()
   local java_cfg = cfg.java
@@ -115,6 +116,10 @@ local function scan_soong_intermediates(base_dir, jars, seen_paths)
     for _, kw in ipairs(java_cfg.exclude_paths) do
       if path:find(kw, 1, true) then goto continue end
     end
+    -- [v4] Lua 模式排除: 匹配 intermediates 之后的相对路径
+    for _, pat in ipairs(java_cfg.exclude_globs or {}) do
+      if rel:match(pat) then goto continue end
+    end
 
     local rank = variant_rank(comps[vi]) * 100 + (type_rank[typ] or unknown_rank)
     if OWN_SOURCE_TAGS[typ] then
@@ -135,9 +140,11 @@ local function scan_soong_intermediates(base_dir, jars, seen_paths)
   end
 
   local found_any = false
+  local selected = {}  -- [mod] = path (v4: 供 pre-jarjar 后处理)
   -- own 桶全量收 (javac + kotlinc 各一份)
-  for _, per in pairs(own) do
+  for mod, per in pairs(own) do
     for _, v in pairs(per) do
+      selected[mod] = v.path
       add_jar(v.path, jars, seen_paths)
       found_any = true
     end
@@ -145,11 +152,12 @@ local function scan_soong_intermediates(base_dir, jars, seen_paths)
   -- 兜底: 仅补没有任何自身产物的模块 (如 service-connectivity 主目录)
   for mod, v in pairs(fb) do
     if not own[mod] then
+      selected[mod] = v.path
       add_jar(v.path, jars, seen_paths)
       found_any = true
     end
   end
-  return found_any
+  return found_any, selected
 end
 
 --- 扫描 Make 构建系统 intermediates 目录 (Android 14 及更早)
@@ -247,7 +255,7 @@ function M.find_android_jars()
   -- 手动清除: rm ~/.cache/nvim/aosp_dev/*.txt (AOSP 重新编译后需要)
   local cache_file = nil
   local from_cache = false
-  local CACHE_VERSION = 3  -- [v3] v3: own/fallback 双桶 + .impl 归一化 + stubs 排除 (旧缓存自动作废)
+  local CACHE_VERSION = 4  -- v4: development/ 默认排除 + exclude_globs + pre-jarjar 跨模块去重
   if cfg.cache_dir and android_root then
     local cache_key = android_root:gsub("/", "-"):gsub("^-", "")
     cache_file = cfg.cache_dir .. "/" .. cache_key .. ".txt"
@@ -276,7 +284,33 @@ function M.find_android_jars()
 
   -- 尝试 1: soong intermediates (Android 15+, out/soong/.intermediates/)
   for _, soong_sub in ipairs({ "/out/soong/.intermediates", "/out/.soong/.intermediates" }) do
-    if scan_soong_intermediates(android_root .. soong_sub, jars, seen_paths) then
+    local found, selected = scan_soong_intermediates(android_root .. soong_sub, jars, seen_paths)
+    if found then
+      -- [v4] pre-jarjar 跨模块去重: soong 对带 jarjar_rules 的模块会导出
+      -- <name>-pre-jarjar 独立模块 (改包名前的原包名类), 与基模块产物同 FQN
+      -- 重复 (如 framework-wifi-pre-jarjar vs framework-wifi.impl/javac)。
+      -- 基模块已入选时丢弃 pre-jarjar 版; 孤立模块 (基模块无其它产物,
+      -- 如 service-connectivity-tiramisu-pre-jarjar) 保留兜底。
+      -- 注意 fallback 目录场景 (尝试 3) 不做此处理: 目录布局镜像自收集脚本,
+      -- 脚本侧已应用同样规则, 且 fallback 下模块名键完整
+      local dropped = {}
+      for mod, path in pairs(selected) do
+        local base = mod:match("^(.-)%-pre%-jarjar$")
+        if base and selected[base] then
+          dropped[#dropped + 1] = mod
+          seen_paths[path] = nil
+          for i, j in ipairs(jars) do
+            if j == path then
+              table.remove(jars, i)
+              break
+            end
+          end
+        end
+      end
+      if #dropped > 0 then
+        vim.notify(("[aosp-dev] dropped %d pre-jarjar duplicates"):format(#dropped),
+          vim.log.levels.INFO)
+      end
       table.insert(source_parts, "soong")
       break
     end
