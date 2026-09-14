@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-# 从 AOSP out 目录收集可用于 jdtls 索引的 jar
-# 过滤规则 (与 lua/aosp-dev/java/jars.lua v3 一致):
-#   变体  : android_common 首选, android_common_apexNN 兜底, host/产品变体排除
-#   类型桶: javac/kotlinc = 模块自身源码产物, 全保留 (混合 Java/Kotlin 模块
-#           两个目录并存, 只取其一会丢另一种语言的类);
-#           combined/turbine* = 兜底桶, 仅当模块无自身产物时按
-#           SOONG_TAG_PRIORITY 取一份 (如 java_sdk_library 主目录只有 combined)
-#   归一化: <name>.impl 剥后缀归到 <name> 参与去重
-#   排除  : */repackaged-jarjar/*, */jarjar/*, 模块名含 stubs,
-#           R/lint/dex/srcjars/kapt jar
-#   Make  : classes.jar > classes-header.jar > javalib.jar,
-#           排除 android_stubs_current_intermediates
+# collect_aosp_jars.sh - collect jars from AOSP out/ for jdtls indexing
+# Filtering rules (aligned with lua/aosp-dev/java/jars.lua v3):
+#   variant : android_common preferred, android_common_apexNN fallback,
+#             host/product variants excluded
+#   buckets : javac/kotlinc = own-source artifacts, always kept (mixed
+#             Java/Kotlin modules keep both); combined/turbine* = fallback
+#             bucket, one per module only when no own-source artifact
+#   norm    : <name>.impl stripped to <name> for dedup
+#   exclude : */repackaged-jarjar/*, */jarjar/*, module names with stubs,
+#             R/lint/dex/srcjars/kapt jars
+#   make    : classes.jar > classes-header.jar > javalib.jar,
+#             exclude android_stubs_current_intermediates
 #
-# 用法:
-#   模式 1: $0 --list <jar列表文件> <out根目录> [目标目录]
-#           列表行形如 ./soong/.intermediates/....jar (相对 out 根)
-#   模式 2: $0 [AOSP_ROOT] [目标目录]
+# Usage:
+#   mode 1: $0 --list <jar-list-file> <out-root> [dest-dir]
+#           list lines look like ./soong/.intermediates/....jar
+#   mode 2: $0 [AOSP_ROOT] [dest-dir]
 
 SOONG_EXCLUDE_JARS='(R\.jar$|stubs\.jar$|lint\.jar$|dex\.jar$|srcjars[0-9]+\.jar$|kapt-.*\.jar$)'
 SOONG_OWN_TAGS=("javac" "kotlinc")
@@ -32,7 +30,7 @@ total_skip=0
 total_miss=0
 DEST_DIR=""
 
-# 兜底桶内 tag 优先级 (不在链中的类型排最后)
+# fallback-bucket tag rank (unknown tags sort last)
 fb_rank() {
   local i=1 t
   for t in "${SOONG_TAG_PRIORITY[@]}"; do
@@ -53,7 +51,8 @@ is_own_tag() {
   return 1
 }
 
-emit_jar() {  # $1=绝对路径 $2=dest 内相对路径
+# $1 = absolute jar path, $2 = dest-relative path
+emit_jar() {
   local target="$DEST_DIR/$2"
   mkdir -p "$(dirname "$target")"
   cp -f "$1" "$target"
@@ -64,10 +63,10 @@ emit_jar() {  # $1=绝对路径 $2=dest 内相对路径
   fi
 }
 
-# stdin: intermediates 下的 jar 绝对路径; $1 = intermediates 基目录
-# own/fallback 双桶去重后落盘 (dest 布局镜像原目录结构, 与 lua 侧 fallback 兼容)
-# 注意: 调用方必须用 `< <(...)` 喂入 (本函数在当前 shell 执行以保留计数器),
-#       不能用管道 (管道会把函数放进子 shell, 统计全部归零)
+# stdin: absolute jar paths under intermediates; $1 = intermediates base dir
+# own/fallback two-bucket dedup, then write out (dest mirrors source layout)
+# NOTE: caller must feed via process substitution: this function runs in
+# the current shell to keep counters; a pipe would zero them.
 soong_scan_stdin() {
   local base="$1"
   local -A OWN_RANK=() OWN_PATH=() OWN_DEST=() FB_RANK=() FB_PATH=() FB_DEST=() OWN_MODS=()
@@ -77,7 +76,7 @@ soong_scan_stdin() {
   while IFS= read -r abs; do
     [ -n "$abs" ] || continue
     case "$abs" in */repackaged-jarjar/*|*/jarjar/*) continue ;; esac
-    case "$abs" in "$base"/*) rel="${abs#"$base"/"}" ;; *) continue ;; esac
+    case "$abs" in "$base"/*) rel="${abs#"$base"/}" ;; *) continue ;; esac
 
     c="${abs##*/}"
     if echo "$c" | grep -qE "$SOONG_EXCLUDE_JARS"; then
@@ -126,7 +125,7 @@ soong_scan_stdin() {
     fi
 
     if is_own_tag "$typ"; then
-      # own 桶: (模块, 类型) 各留一份 (android_common 优先)
+      # own bucket: best variant per (module, tag); android_common preferred
       key="$mod|$typ"
       rank=$((vr*100))
       if [ -z "${OWN_RANK[$key]:-}" ] || [ "$rank" -lt "${OWN_RANK[$key]}" ]; then
@@ -136,7 +135,7 @@ soong_scan_stdin() {
         OWN_MODS[$mod]=1
       fi
     else
-      # 兜底桶: 每模块一份 (变体*100 + tag 优先级)
+      # fallback bucket: one per module (variant*100 + tag rank)
       rank=$((vr*100 + $(fb_rank "$typ")))
       if [ -z "${FB_RANK[$mod]:-}" ] || [ "$rank" -lt "${FB_RANK[$mod]}" ]; then
         FB_RANK[$mod]=$rank
@@ -146,22 +145,27 @@ soong_scan_stdin() {
     fi
   done
 
-  local k m
-  for k in "${!OWN_PATH[@]}"; do
-    emit_jar "${OWN_PATH[$k]}" "${OWN_DEST[$k]}"
-  done
-  for m in "${!FB_PATH[@]}"; do
-    [ -n "${OWN_MODS[$m]:-}" ] || emit_jar "${FB_PATH[$m]}" "${FB_DEST[$m]}"
-  done
+  if [ ${#OWN_PATH[@]} -gt 0 ]; then
+    local k
+    for k in "${!OWN_PATH[@]}"; do
+      emit_jar "${OWN_PATH[$k]}" "${OWN_DEST[$k]}"
+    done
+  fi
+  if [ ${#FB_PATH[@]} -gt 0 ]; then
+    local m
+    for m in "${!FB_PATH[@]}"; do
+      [ -n "${OWN_MODS[$m]:-}" ] || emit_jar "${FB_PATH[$m]}" "${FB_DEST[$m]}"
+    done
+  fi
 }
 
 collect_from_list() {
   local list_file="$1" out_root="$2" dest="$3"
-  [ -f "$list_file" ] || { echo "错误: 列表文件不存在: $list_file" >&2; exit 1; }
-  [ -d "$out_root" ]  || { echo "错误: out 根目录不存在: $out_root" >&2; exit 1; }
+  [ -f "$list_file" ] || { echo "ERROR: list file not found: $list_file" >&2; exit 1; }
+  [ -d "$out_root" ]  || { echo "ERROR: out root not found: $out_root" >&2; exit 1; }
   local base="$out_root/soong/.intermediates"
 
-  echo "  Soong: 解析列表 + own/fallback 双桶去重..."
+  echo "  Soong: parse list + own/fallback dedup..."
   soong_scan_stdin "$base" < <(
     while IFS= read -r line; do
       [ -n "$line" ] || continue
@@ -179,8 +183,11 @@ collect_from_list() {
   while IFS= read -r relpath; do
     [ -z "$relpath" ] && continue
     relpath="${relpath#./}"
-    [[ "$relpath" == target/common/obj/JAVA_LIBRARIES/* ]] || \
-    [[ "$relpath" == target/product/*/obj/JAVA_LIBRARIES/* ]] || continue
+    case "$relpath" in
+      target/common/obj/JAVA_LIBRARIES/*) ;;
+      target/product/*/obj/JAVA_LIBRARIES/*) ;;
+      *) continue ;;
+    esac
 
     jar_name="$(basename "$relpath")"
     is_make_jar=false
@@ -215,7 +222,7 @@ collect_from_list() {
 
 collect_from_fs() {
   local aosp_root="$1" dest="$2"
-  [ -d "$aosp_root/out" ] || { echo "错误: $aosp_root/out 不存在" >&2; exit 1; }
+  [ -d "$aosp_root/out" ] || { echo "ERROR: no out/ under: $aosp_root" >&2; exit 1; }
 
   local soong_dir="" d
   for d in "$aosp_root/out/soong/.intermediates" "$aosp_root/out/.soong/.intermediates"; do
@@ -225,11 +232,11 @@ collect_from_fs() {
     fi
   done
   if [ -n "$soong_dir" ]; then
-    echo "  扫描 Soong: $soong_dir"
+    echo "  Scanning Soong: $soong_dir"
     soong_scan_stdin "$soong_dir" < <(find "$soong_dir" -type f -name '*.jar' 2>/dev/null | sort)
   fi
 
-  echo "  扫描 Make (common)..."
+  echo "  Scanning Make (common)..."
   declare -A seen_make=()
   local jar_name path dir dirname target
   for jar_name in "${MAKE_JAR_PRIORITY[@]}"; do
@@ -253,7 +260,7 @@ collect_from_fs() {
 
   for pbase in "$aosp_root"/out/target/product/*/obj/JAVA_LIBRARIES; do
     [ -d "$pbase" ] || continue
-    echo "  扫描 Make (product: $(basename "$(dirname "$(dirname "$pbase")")"))..."
+    echo "  Scanning Make (product): $pbase"
     for jar_name in "${MAKE_JAR_PRIORITY[@]}"; do
       for path in "$pbase"/*_intermediates/"$jar_name"; do
         [ -f "$path" ] || continue
@@ -272,43 +279,35 @@ collect_from_fs() {
   done
 }
 
-echo "=== AOSP jar 收集脚本 ==="
+echo "=== AOSP jar collect ==="
 
 if [ "${1:-}" = "--list" ]; then
-  LIST_FILE="${2:?用法: $0 --list <jar列表文件> <out根目录> [目标目录]}"
-  OUT_ROOT="${3:?用法: $0 --list <jar列表文件> <out根目录> [目标目录]}"
+  LIST_FILE="${2:?usage: $0 --list <jar-list> <out-root> [dest]}"
+  OUT_ROOT="${3:?usage: $0 --list <jar-list> <out-root> [dest]}"
   DEST="${4:-$HOME/downloads/aosp_libs}"
-  echo "  模式      : 基于列表文件"
-  echo "  列表文件  : $LIST_FILE"
-  echo "  out 根目录: $OUT_ROOT"
-  echo "  目标目录  : $DEST"
-  echo ""
-  echo "清空目标目录..."
+  echo "  mode : list file"
+  echo "  list : $LIST_FILE"
+  echo "  out  : $OUT_ROOT"
+  echo "  dest : $DEST"
   rm -rf "$DEST"
   mkdir -p "$DEST"
   DEST_DIR="$DEST"
-  echo ""
-  echo "开始收集..."
   collect_from_list "$LIST_FILE" "$OUT_ROOT" "$DEST"
 else
   AOSP_ROOT="${1:-$HOME/project/aosp}"
   DEST="${2:-$HOME/downloads/aosp_libs}"
-  echo "  模式     : 扫描文件系统"
-  echo "  AOSP root: $AOSP_ROOT"
-  echo "  目标目录 : $DEST"
-  echo ""
-  echo "清空目标目录..."
+  echo "  mode : filesystem scan"
+  echo "  root : $AOSP_ROOT"
+  echo "  dest : $DEST"
   rm -rf "$DEST"
   mkdir -p "$DEST"
   DEST_DIR="$DEST"
-  echo ""
-  echo "开始收集..."
   collect_from_fs "$AOSP_ROOT" "$DEST"
 fi
 
 echo ""
-echo "=== 完成 ==="
-echo "  收集 jar 数: $count (soong: $total_soong, make: $total_make)"
-echo "  排除       : $total_skip"
-echo "  缺失文件   : $total_miss"
-echo "  总大小     : $(du -sh "$DEST" | cut -f1)"
+echo "=== done ==="
+echo "  collected : $count (soong: $total_soong, make: $total_make)"
+echo "  skipped   : $total_skip"
+echo "  missing   : $total_miss"
+echo "  size      : $(du -sh "$DEST" | cut -f1)"
