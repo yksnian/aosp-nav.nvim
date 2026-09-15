@@ -301,12 +301,12 @@ function M.ensure_script()
   if not content then
     return nil, err
   end
-  local marker = content:match("# aosp%-dev%.nvim classpath v1 hash=%S+")
+  local marker = content:match("# aosp%-nav%.nvim classpath v1 hash=%S+")
 
   local exists = vim.fn.filereadable(path) == 1
   if exists then
     local first = vim.fn.readfile(path, "", 2)
-    local existing_marker = (first and first[2] or ""):match("^# aosp%-dev%.nvim classpath v1 hash=%S+")
+    local existing_marker = (first and first[2] or ""):match("^# aosp%-nav%.nvim classpath v1 hash=%S+")
     if existing_marker and existing_marker == marker then
       return path, nil -- up to date
     end

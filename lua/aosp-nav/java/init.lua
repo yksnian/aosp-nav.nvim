@@ -102,7 +102,7 @@ function M.configure(opts)
     table.insert(strip_caps, "inlayHintProvider")
   end
   if #strip_caps > 0 then
-    local group = vim.api.nvim_create_augroup("aosp_dev_jdtls_caps", { clear = true })
+    local group = vim.api.nvim_create_augroup("aosp_nav_jdtls_caps", { clear = true })
     vim.api.nvim_create_autocmd("LspAttach", {
       group = group,
       callback = function(args)

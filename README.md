@@ -24,7 +24,7 @@ Android cpp demo:![cpp_demo](https://github.com/user-attachments/assets/8847ce0d
 
 - **Automatic android_root detection**: supports multi-checkout workspace layouts
 - **Soong intermediates jar loading**: scans `out/soong/.intermediates/`, preferring `fd` over `find`; module-level dedup (own-source javac/kotlinc jars always kept, fat jars only as fallback; `.impl` normalization; stubs/repackaged artifacts excluded) — see [Soong jar selection rules](#soong-jar-selection-rules)
-- **File-based caching**: jar lists are cached under `~/.cache/nvim/aosp_dev/` (tagged with the algorithm version; stale caches are automatically invalidated after upgrades) to avoid full scans on every open
+- **File-based caching**: jar lists are cached under `~/.cache/nvim/aosp_nav/` (tagged with the algorithm version; stale caches are automatically invalidated after upgrades) to avoid full scans on every open
 - **Deeply nested source root inference**: infers source roots from the `package` declaration of the opened file, fixing navigation between sibling classes
 - AOSP compatibility fixes
   - Disables foldingRange to avoid a jdtls -32603 NegativeArraySizeException
@@ -93,7 +93,7 @@ return {
 
 ```lua
 require("aosp-nav").setup({
-  cache_dir = "~/.cache/nvim/aosp_dev",
+  cache_dir = "~/.cache/nvim/aosp_nav",
   java = {
     jar_fallback_dir = "~/.usr/android_jars",
     exclude_paths = { "linux_glibc_common", "android_common_apex" },
@@ -181,7 +181,7 @@ Regenerates the KLS classpath script and dry-runs it to preview the resulting ja
 | Option                            | Default                                                      | Description                                                  |
 | --------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
 | android_root                      | nil                                                          | nil = auto-detect, or an explicit AOSP root path             |
-| cache_dir                         | ~/.cache/nvim/aosp_dev                                       | jar list cache directory                                     |
+| cache_dir                         | ~/.cache/nvim/aosp_nav                                       | jar list cache directory                                     |
 | java.enabled                      | true                                                         | Enable the java sub-module                                   |
 | java.jar_fallback_dir             | ~/.usr/android_jars                                          | Fallback jar directory when no build outputs exist           |
 | java.soong_tag_priority           | {combined, turbine-combined, turbine}                        | Order within the fallback bucket; javac/kotlinc belong to the own-source bucket and are always kept |
@@ -259,7 +259,7 @@ rm -rf ~/.cache/nvim/jdtls
 After rebuilding AOSP, delete the jar list cache:
 
 ```
-rm ~/.cache/nvim/aosp_dev/*.txt
+rm ~/.cache/nvim/aosp_nav/*.txt
 ```
 
 Or just reopen a Java file in nvim — it re-scans automatically.

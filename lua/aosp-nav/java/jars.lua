@@ -304,7 +304,7 @@ function M.find_android_jars()
 
   -- 文件缓存: 避免每次首次打开都重新 find + Lua 处理 3000+ 路径
   -- 带版本标记: 过滤算法升级时旧缓存自动作废重扫
-  -- 手动清除: rm ~/.cache/nvim/aosp_dev/*.txt (AOSP 重新编译后需要)
+  -- 手动清除: rm ~/.cache/nvim/aosp_nav/*.txt (AOSP 重新编译后需要)
   local cache_file = nil
   local from_cache = false
   local CACHE_VERSION = 6  -- v6: filters 指纹进缓存头 + 目录优先级排序

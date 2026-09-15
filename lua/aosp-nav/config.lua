@@ -8,7 +8,7 @@ M.defaults = {
   -- nil = 自动检测 (从打开文件路径向上找含 out 产物的目录)
   android_root = nil,
   -- jar 列表缓存目录 (避免每次打开 java 文件都全盘扫描)
-  cache_dir = vim.fn.expand("~/.cache/nvim/aosp_dev"),
+  cache_dir = vim.fn.expand("~/.cache/nvim/aosp_nav"),
   java = {
     enabled = true,
     -- 无编译产物时 fallback 的 jar 目录 (由 :AospCollectJars 收集)

@@ -28,7 +28,7 @@ Android cpp代码演示。![cpp_demo](https://github.com/user-attachments/assets
 
 - **android_root 自动检测**: 支持多子项目结构
 - **Soong intermediates jar 加载**: out/soong/.intermediates/ 目录扫描, fd 优先 find 备选; 模块级去重 (自身产物 javac/kotlinc 全保留, fat jar 仅兜底; `.impl` 归一化; stubs/重打包产物排除), 详见 [Soong jar 选择规则](#soong-jar-选择规则)
-- **文件缓存**: jar 列表缓存到 ~/.cache/nvim/aosp_dev/ (带算法版本号, 升级后旧缓存自动作废重扫), 避免每次打开都全盘扫描
+- **文件缓存**: jar 列表缓存到 ~/.cache/nvim/aosp-nav/ (带算法版本号, 升级后旧缓存自动作废重扫), 避免每次打开都全盘扫描
 - **深层嵌套源码根推断**: 根据打开文件的 package 声明反推源码根, 解决同级类跳转失败
 - AOSP 兼容性修复
   - 禁用 foldingRange 避免 jdtls -32603 NegativeArraySizeException
@@ -95,7 +95,7 @@ return {
 
 ```lua
 require("aosp-nav").setup({
-  cache_dir = "~/.cache/nvim/aosp_dev",
+  cache_dir = "~/.cache/nvim/aosp_nav",
   java = {
     jar_fallback_dir = "~/.usr/android_jars",
     exclude_paths = { "linux_glibc_common", "android_common_apex" },
@@ -111,7 +111,7 @@ require("aosp-nav").setup({
 
 ```lua
 require("aosp-nav").setup({
-  cache_dir = "~/.cache/nvim/aosp_dev",
+  cache_dir = "~/.cache/nvim/aosp_nav",
   java = {
     jar_fallback_dir = "~/.usr/android_jars",
     exclude_paths = { "linux_glibc_common", "android_common_apex" },
@@ -179,7 +179,7 @@ require("aosp-nav").setup({
 | 项                                | 默认                                                         | 说明                                                         |
 | --------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
 | android_root                      | nil                                                          | nil=自动检测, 或指定 AOSP 根目录                             |
-| cache_dir                         | ~/.cache/nvim/aosp_dev                                       | jar 列表缓存目录                                             |
+| cache_dir                         | ~/.cache/nvim/aosp_nav                                       | jar 列表缓存目录                                             |
 | java.enabled                      | true                                                         | 启用 java 子模块                                             |
 | java.jar_fallback_dir             | ~/.usr/android_jars                                          | 无编译产物时 fallback jar 目录                               |
 | java.soong_tag_priority           | {combined, turbine-combined, turbine}                        | 兜底桶内部顺序; javac/kotlinc 属自身产物桶, 恒全保留         |
@@ -255,7 +255,7 @@ rm -rf ~/.cache/nvim/jdtls
 AOSP 重新编译后, 删除 jar 列表缓存:
 
 ```
-rm ~/.cache/nvim/aosp_dev/*.txt
+rm ~/.cache/nvim/aosp_nav/*.txt
 ```
 
 或在 nvim 中重新打开 java 文件时会自动重新扫描。
