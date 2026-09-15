@@ -108,6 +108,12 @@ M.defaults = {
       "frameworks/base/ext",
       "frameworks/base/packages/SystemUI/**",         -- 上游 SystemUI
       "external/dagger2/dagger2", "external/dagger2/hilt*", -- SystemUI DI 依赖
+      -- Kotlin 运行时 (AOSP framework/SystemUI Kotlin 代码的依赖):
+      -- kotlin-stdlib 不加: mason KLS 自带 stdlib 已前置 classpath 首位, 同 FQN 必胜
+      "external/kotlinc/kotlin-parcelize-runtime",  -- @Parcelize (kotlinx.parcelize.*)
+      "external/kotlinc/kotlin-reflect",            -- kotlin.reflect.*
+      -- 设备变体只有 turbine-combined (API 签名无方法体), 补全/跳转签名可用
+      "external/kotlinx.coroutines/kotlinx_coroutines",
     },
     -- KLS 专用 tag 优先级 (独立于 java): 默认 combined 优先 = 跳转能看到方法体
     -- (KLS 自带 fernflower 反编译); 若补全优先/内存敏感, 可改回
