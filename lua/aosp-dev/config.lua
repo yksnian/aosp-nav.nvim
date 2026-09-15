@@ -1,5 +1,5 @@
 -- config.lua: 默认配置 + 校验 + 合并
--- 提供 M.defaults, M.validate, M.merge
+-- 提供 M.defaults, M.validate, M.merge, M.merge_lists
 
 local M = {}
 
@@ -28,7 +28,15 @@ M.defaults = {
       "^dex%.jar$",
       "^srcjars%d+%.jar$",
       "^kapt%-%w+%.jar$",
-      "stubs",  -- API 签名 jar 家族 (android-non-updatable.stubs.* 等, 无方法体)
+      "stubs",   -- API 签名 jar 家族 (android-non-updatable.stubs.* 等, 无方法体)
+      "%-stub",  -- [v5] 桩实现模块 (sysprop-library-stub-<name> 等): getter 返回
+                 -- 默认值, 无真实逻辑, 真实实现由同名不带 -stub 段的模块提供
+      "^jrt%-fs%.jar$",  -- [v6] JDK 模块系统工具 jar (libcore/prebuilts 的
+                         -- system_modules 产物), 与代码阅读无关
+      "%-headers",  -- [v6] API 桩家族 (framework-minus-apex-headers 等):
+                    -- turbine 头文件 jar, 与主模块产物同 FQN; 真身由主模块提供。
+                    -- 上线前验证: find out/soong/.intermediates -maxdepth 4 \
+                    --   -type d -name '*-headers*' 确认无误伤
     },
     -- 排除的路径关键词 (包含该片段的 jar 路径会被排除, 普通字符串匹配)
     -- 勿加 "android_common_apex": 会误杀只有 apex 变体的模块 (core-oj 等)
@@ -38,13 +46,20 @@ M.defaults = {
     },
     -- [v4] Lua 模式排除: 匹配 .intermediates/ 之后的相对路径 (锚定 ^ 可精确
     -- 到顶层目录, 子串式的 exclude_paths 做不到)。用于用户自助裁剪, 如:
+    --   exclude_globs = { "^external/cronet/", "^vendor/xxx/packages/apps/" }
+    -- [v6] 默认排除 prebuilts/sdk 的预构建 module SDK 桩 (sdk_public_* /
+    -- sdk_system_* / sdk_module-lib_*) 及其 jrt-fs.jar: 仅 API 签名无方法体,
+    -- 与 packages/modules 下源码构建的真实实现同 FQN, 会抢占跳转。
+    -- androidx 等预构建 AAR 不在此列, 保持保留
     exclude_globs = {
-      -- prebuilts/sdk 导出的预构建 module SDK 桩 (sdk_public_*/sdk_system_*/
-      -- sdk_module-lib_*) 及其 system_modules 里的 jrt-fs.jar: 仅 API 签名
-      -- 无方法体, 与 packages/modules 下源码构建的真实实现 (framework-*.impl)
-      -- 同 FQN, 会抢占跳转。androidx 等预构建 AAR 不在此列, 保持保留
       "^prebuilts/sdk/sdk_",
     },
+    -- [v6] 排除类列表合并语义: "append" = 用户 exclude_jars/paths/globs 追加到
+    -- 默认值之后 (不覆盖默认项); "replace" = 整体替换默认值 (旧行为, 需自行
+    -- 带上默认项)。排除类配置用户几乎总是想追加而非推翻, 默认 append。
+    -- (教训: 旧的整体替换语义曾让用户自定义 exclude_globs 静默挤掉默认
+    -- SDK 桩排除, 导致桩进入 classpath 抢占跳转)
+    exclude_merge = "append",
     -- 是否剔除 root_dir 覆盖范围内模块自身的 jar。默认 false:
     --   - JDT 对同 FQN 源码优先于 jar, 保留 jar 不会把跳转劫持到反编译视图;
     --   - AIDL/proto/aconfig 生成类 (如 INetworkOfferCallback) 源码树里没有
@@ -128,6 +143,12 @@ function M.validate(cfg)
     end
   end
 
+  -- exclude_merge 合法值
+  if cfg.java and cfg.java.exclude_merge
+      and cfg.java.exclude_merge ~= "append" and cfg.java.exclude_merge ~= "replace" then
+    return false, "java.exclude_merge must be 'append' or 'replace'"
+  end
+
   -- kotlin 段校验 (kotlin 启用时)
   if cfg.kotlin and cfg.kotlin.enabled then
     if cfg.kotlin.jar_mode ~= "curated" and cfg.kotlin.jar_mode ~= "all" then
@@ -147,11 +168,84 @@ function M.validate(cfg)
   return true
 end
 
+--- 排除类列表拼接内核 (默认 + 用户, 去重)
+--- 输出 = 默认项全保留 + 用户项中默认未出现的追加在后;
+--- 与默认值相同的用户项只保留默认段一份 (去重), 排除列表顺序不影响语义
+--- @param defaults_list table 默认列表
+--- @param user_list table|nil 用户列表
+--- @return table|nil out 无用户列表时返回 nil, 调用方跳过
+local function append_list(defaults_list, user_list)
+  if not user_list or #user_list == 0 then
+    return nil
+  end
+  local out = {}
+  local seen = {}
+  for _, v in ipairs(defaults_list) do
+    seen[v] = true
+    out[#out + 1] = v
+  end
+  for _, v in ipairs(user_list) do
+    if not seen[v] then
+      out[#out + 1] = v
+    end
+  end
+  return out
+end
+
+--- [v6] 两次 setup 的配置合并: 已生效配置与新用户 opts 中, 排除类列表按
+--- append 拼接 (两批用户项都不丢), 其余字段新值优先。
+--- 供顶层 setup 在重复 setup 时使用
+--- @param base table 已生效配置 (M.config)
+--- @param opts table 新的用户 opts
+--- @return table opts 合并后的用户 opts (供 merge 使用)
+function M.merge_lists(base, opts)
+  local j = base and base.java or nil
+  opts = vim.deepcopy(opts) or {}
+  opts.java = opts.java or {}
+  for _, key in ipairs({ "exclude_jars", "exclude_paths", "exclude_globs" }) do
+    local prev = j and j[key] or nil
+    local cur = opts.java[key]
+    if prev and #prev > 0 then
+      local out = {}
+      local seen = {}
+      for _, v in ipairs(prev) do
+        seen[v] = true
+        out[#out + 1] = v
+      end
+      for _, v in ipairs(cur or {}) do
+        if not seen[v] then out[#out + 1] = v end
+      end
+      opts.java[key] = out
+    end
+  end
+  return opts
+end
+
 --- 合并用户配置到默认配置
+--- 排除类列表 (exclude_jars/paths/globs) 按 java.exclude_merge 语义处理:
+---   append (默认) = 默认项 + 用户项拼接 (用户几乎总是想追加而非推翻默认
+---     排除项; 旧的 tbl_deep_extend 列表整体替换语义曾导致默认桩排除被
+---     用户列表静默挤掉)
+---   replace = 整体替换 (旧行为)
+--- 其余字段沿用 tbl_deep_extend force 语义
 --- @param user_opts table|nil 用户传入的配置
 --- @return table 合并后的配置
 function M.merge(user_opts)
-  return vim.tbl_deep_extend("force", M.defaults, user_opts or {})
+  user_opts = user_opts or {}
+  local merged = vim.tbl_deep_extend("force", M.defaults, user_opts)
+
+  local j = M.defaults.java
+  if merged.java and merged.java.exclude_merge == "append" then
+    for _, key in ipairs({ "exclude_jars", "exclude_paths", "exclude_globs" }) do
+      local user_list = user_opts.java and user_opts.java[key]
+      local out = append_list(j[key], user_list)
+      if out then
+        merged.java[key] = out
+      end
+    end
+  end
+
+  return merged
 end
 
 return M

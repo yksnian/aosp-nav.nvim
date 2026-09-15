@@ -42,6 +42,58 @@ end
 --   竞争同一键, own 恒优先 → javac 胜出, combined 落选, 不再有双份类
 local OWN_SOURCE_TAGS = { javac = true, kotlinc = true }
 
+-- [v6] filters 指纹: 排除类配置的 djb2 hash, 写进缓存头 (# filters=...)。
+-- 排除配置变化 → hash 变 → 缓存自动作废重扫, 不再依赖用户手动 rm 或 bump
+-- CACHE_VERSION (教训: exclude_globs 用户覆盖曾导致默认桩排除静默失效)
+local function filters_hash(java_cfg)
+  local subset = {
+    exclude_jars = java_cfg.exclude_jars,
+    exclude_paths = java_cfg.exclude_paths,
+    exclude_globs = java_cfg.exclude_globs,
+  }
+  local s = vim.inspect(subset)
+  local h = 5381
+  for i = 1, #s do
+    h = (h * 33 + s:byte(i)) % 4294967296
+  end
+  return string.format("%08x", h)
+end
+
+-- [v6] classpath 目录优先级排序: referencedLibraries 有序, JDT 按序取类。
+-- 桩家族持续演化 (stubs/turbine/sdk_ 前缀/-stub/-headers...), 去重规则难以
+-- 穷尽; 排序保证即使漏网桩与真身同 FQN, 真身 (源码构建模块) 永远排在
+-- 预构建/未知目录之前。顺序固化进缓存, 避免每次加载重排
+local DIR_PRIORITY = {
+  { "^frameworks/",       0 },
+  { "^libcore/",          1 },
+  { "^packages/modules/", 1 },
+  { "^art/",              1 },
+  { "^hardware/",         1 },
+  { "^system/",           1 },
+  { "^external/",         2 },
+  { "^tools/",            2 },
+  { "^libnativehelper/",  1 },
+}
+local function dir_rank(jar_path)
+  local rel = jar_path:match("%.intermediates/(.+)$") or jar_path
+  for _, pr in ipairs(DIR_PRIORITY) do
+    if rel:find(pr[1]) then
+      return pr[2]
+    end
+  end
+  return 3  -- prebuilts/ 与未知目录垫底
+end
+
+local function sort_by_dir_priority(jars)
+  table.sort(jars, function(a, b)
+    local ra, rb = dir_rank(a), dir_rank(b)
+    if ra ~= rb then
+      return ra < rb
+    end
+    return a < b  -- 同级按路径稳定排序 (缓存内容确定化)
+  end)
+end
+
 --- 扫描 Soong intermediates 目录 (Android 15+)
 --- jar 路径结构: <base>/<src...>/<module>[.impl]/<variant>[/<type>...]/<name>.jar
 ---   变体: android_common (设备端标准, 首选) | android_common_apexNN (APEX 变体,
@@ -255,13 +307,19 @@ function M.find_android_jars()
   -- 手动清除: rm ~/.cache/nvim/aosp_dev/*.txt (AOSP 重新编译后需要)
   local cache_file = nil
   local from_cache = false
-  local CACHE_VERSION = 4  -- v4: development/ 默认排除 + exclude_globs + pre-jarjar 跨模块去重
+  local CACHE_VERSION = 6  -- v6: filters 指纹进缓存头 + 目录优先级排序
+                           --      + %-headers 桩家族排除 (默认值在 config.lua)
+  local fhash = filters_hash(java_cfg)
   if cfg.cache_dir and android_root then
     local cache_key = android_root:gsub("/", "-"):gsub("^-", "")
     cache_file = cfg.cache_dir .. "/" .. cache_key .. ".txt"
     if vim.fn.filereadable(cache_file) == 1 then
       local lines = vim.fn.readfile(cache_file)
-      if lines[1] == "# version=" .. CACHE_VERSION then
+      -- version 与 filters 指纹都匹配才复用缓存:
+      --   version  = 算法变更 (插件升级)
+      --   filters  = 用户排除配置变更 (改 exclude_globs 等, 免手动 rm)
+      if lines[1] == "# version=" .. CACHE_VERSION
+          and lines[2] == "# filters=" .. fhash then
         for _, line in ipairs(lines) do
           if line ~= "" and line:sub(1, 1) ~= "#" then
             if vim.fn.filereadable(line) == 1 then
@@ -345,8 +403,11 @@ function M.find_android_jars()
 
   -- 写文件缓存 (仅扫描到 jar 且非缓存加载时)
   if #jars > 0 and not from_cache and cache_file then
+    -- [v6] 固化目录优先级顺序 (桩与真身同 FQN 时真身在前)
+    sort_by_dir_priority(jars)
     local cache_lines = {
       "# version=" .. CACHE_VERSION,
+      "# filters=" .. fhash,
       "# android_root=" .. android_root,
       "# generated=" .. os.date("%Y-%m-%d %H:%M"),
       "# count=" .. #jars,

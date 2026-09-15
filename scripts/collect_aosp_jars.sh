@@ -17,7 +17,7 @@
 #           list lines look like ./soong/.intermediates/....jar
 #   mode 2: $0 [AOSP_ROOT] [dest-dir]
 
-SOONG_EXCLUDE_JARS='(R\.jar$|stubs\.jar$|lint\.jar$|dex\.jar$|srcjars[0-9]+\.jar$|kapt-.*\.jar$)'
+SOONG_EXCLUDE_JARS='(R\.jar$|stubs\.jar$|lint\.jar$|dex\.jar$|srcjars[0-9]+\.jar$|kapt-.*\.jar$|jrt-fs\.jar$)'
 SOONG_OWN_TAGS=("javac" "kotlinc")
 SOONG_TAG_PRIORITY=("combined" "turbine-combined" "turbine")
 MAKE_BLACKLIST="android_stubs_current_intermediates"
@@ -109,7 +109,7 @@ soong_scan_stdin() {
     mod=${parts[$((j-1))]}
     mod=${mod%.impl}
     case "$mod" in
-      *stubs*)
+      *stubs*|*-stub|*-headers*)
         total_skip=$((total_skip+1))
         continue
         ;;

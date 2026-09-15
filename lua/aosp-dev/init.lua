@@ -18,6 +18,11 @@ M._state = {
 --- @return table M (self, 支持链式调用)
 function M.setup(opts)
   opts = opts or {}
+  -- 重复 setup 时 (如命令回调的 setup() 空参调用) 按拼接语义保留已生效的
+  -- 排除类列表: 直接 merge({}) 会把用户配置整体重置回默认值
+  if M._state.setup_done and M.config then
+    opts = config.merge_lists(M.config, opts)
+  end
   M.config = config.merge(opts)
   local ok, err = config.validate(M.config)
   if not ok then
