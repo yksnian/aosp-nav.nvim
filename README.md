@@ -1,4 +1,4 @@
-# aosp-dev.nvim
+# aosp-nav.nvim
 
 English | [简体中文](README.zh-CN.md)
 
@@ -49,7 +49,7 @@ Android cpp demo:![cpp_demo](https://github.com/user-attachments/assets/8847ce0d
 
 ```lua
 {
-  "yksnian/aosp-dev.nvim",
+  "yksnian/aosp-nav.nvim",
   version = "*",  -- track the latest stable tag (since v1.1.0); omit to follow the main branch
   dependencies = "mfussenegger/nvim-jdtls",
   ft = "java",
@@ -62,12 +62,12 @@ Call `setup()` before your jdtls configuration, then inject the AOSP-specific op
 
 ```lua
 -- lua/plugins/jdtls.lua
-require("aosp-dev").setup()
+require("aosp-nav").setup()
 
 return {
   {
     "mfussenegger/nvim-jdtls",
-    dependencies = "yksnian/aosp-dev.nvim",
+    dependencies = "yksnian/aosp-nav.nvim",
     ft = "java",
     opts = function(_, opts)
       -- Your jdtls config (cmd, root_dir, on_attach, ...)
@@ -83,7 +83,7 @@ return {
       opts.root_dir = require("lspconfig.util").root_pattern(".git", ".project")
 
       -- Inject AOSP-specific config (jars, sourcePaths, foldingRange, gradle, etc.)
-      return require("aosp-dev").java.configure(opts)
+      return require("aosp-nav").java.configure(opts)
     end,
   },
 }
@@ -92,7 +92,7 @@ return {
 ### Custom options
 
 ```lua
-require("aosp-dev").setup({
+require("aosp-nav").setup({
   cache_dir = "~/.cache/nvim/aosp_dev",
   java = {
     jar_fallback_dir = "~/.usr/android_jars",
@@ -115,7 +115,7 @@ return {
     opts = function(_, opts)
       opts.servers = opts.servers or {}
       opts.servers.kotlin_language_server =
-        require("aosp-dev").kotlin.configure(opts.servers.kotlin_language_server or {})
+        require("aosp-nav").kotlin.configure(opts.servers.kotlin_language_server or {})
     end,
   },
 }

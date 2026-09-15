@@ -10,7 +10,7 @@ local _jars_computed = false  -- 是否已计算过
 
 --- 获取当前配置 (setup 后有效, __index metatable 保证 setup 已调用)
 local function get_cfg()
-  return require("aosp-dev").config
+  return require("aosp-nav").config
 end
 
 --- 按完整路径去重添加 jar
@@ -117,7 +117,7 @@ local function scan_soong_intermediates(base_dir, jars, seen_paths)
 
   -- 全量列出 jar (产物类型目录层级不固定, 统一扫出后在 Lua 侧解析;
   -- 全树 ~2600 个路径, 成本可忽略), fd 优先 find 备选
-  local fs = require("aosp-dev.util.fs")
+  local fs = require("aosp-nav.util.fs")
   local all_matches = fs.scan_files(base_dir, "\\.jar$", { "*.jar" })
   if not all_matches or #all_matches == 0 then return false end
 
@@ -282,7 +282,7 @@ end
 function M.find_android_jars()
   local cfg = get_cfg()
   local java_cfg = cfg.java
-  local android_root_mod = require("aosp-dev.android_root")
+  local android_root_mod = require("aosp-nav.android_root")
 
   local bufname = vim.api.nvim_buf_get_name(0)
   local android_root = cfg.android_root or android_root_mod.find_android_platform_root(bufname)
@@ -333,7 +333,7 @@ function M.find_android_jars()
           _jars_cache = jars
           _jars_cache_root = android_root
           _jars_computed = true
-          vim.notify("[aosp-dev] JAR loaded from cache (" .. #jars .. " jars)", vim.log.levels.INFO)
+          vim.notify("[aosp-nav] JAR loaded from cache (" .. #jars .. " jars)", vim.log.levels.INFO)
           return jars
         end
       end
@@ -366,7 +366,7 @@ function M.find_android_jars()
         end
       end
       if #dropped > 0 then
-        vim.notify(("[aosp-dev] dropped %d pre-jarjar duplicates"):format(#dropped),
+        vim.notify(("[aosp-nav] dropped %d pre-jarjar duplicates"):format(#dropped),
           vim.log.levels.INFO)
       end
       table.insert(source_parts, "soong")
@@ -395,9 +395,9 @@ function M.find_android_jars()
   local source_label = #source_parts > 0 and table.concat(source_parts, " + ") or nil
   if not _jars_computed then
     if source_label then
-      vim.notify("[aosp-dev] JAR source -> " .. source_label .. " (" .. #jars .. " jars)", vim.log.levels.INFO)
+      vim.notify("[aosp-nav] JAR source -> " .. source_label .. " (" .. #jars .. " jars)", vim.log.levels.INFO)
     else
-      vim.notify("[aosp-dev] android project detected but no JAR source found", vim.log.levels.WARN)
+      vim.notify("[aosp-nav] android project detected but no JAR source found", vim.log.levels.WARN)
     end
   end
 

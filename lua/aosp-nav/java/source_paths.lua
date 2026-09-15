@@ -8,7 +8,7 @@ local M = {}
 
 --- 获取当前配置
 local function get_cfg()
-  return require("aosp-dev").config
+  return require("aosp-nav").config
 end
 
 --- 根据触发文件的 package 声明反推源码根目录

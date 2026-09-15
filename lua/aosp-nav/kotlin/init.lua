@@ -1,13 +1,13 @@
 -- kotlin/init.lua: configure(opts) 注入 KLS AOSP 特化配置 + kls-classpath 脚本管理
 -- 用法 (用户 lsp.lua):
 --   opts.servers.kotlin_language_server =
---     require("aosp-dev").kotlin.configure(opts.servers.kotlin_language_server or {})
+--     require("aosp-nav").kotlin.configure(opts.servers.kotlin_language_server or {})
 
 local M = {}
 
 --- 获取当前配置 (经 M.kotlin 访问时 metatable 已 ensure setup)
 local function get_cfg()
-  return require("aosp-dev").config
+  return require("aosp-nav").config
 end
 
 --- 注入 AOSP 特化配置到 lspconfig kotlin_language_server opts
@@ -52,19 +52,19 @@ function M.configure(opts)
   end
 
   -- 4. 生成/更新 classpath 脚本 (KLS 1.3.13 ShellClassPathResolver.global() 读取)
-  local path, err = require("aosp-dev.kotlin.classpath").ensure_script()
+  local path, err = require("aosp-nav.kotlin.classpath").ensure_script()
   if not path then
-    vim.notify("[aosp-dev] kls-classpath generate failed: " .. (err or "unknown"), vim.log.levels.WARN)
+    vim.notify("[aosp-nav] kls-classpath generate failed: " .. (err or "unknown"), vim.log.levels.WARN)
   end
 
   -- 5. all 模式: 预热 java 模块的 jar 缓存 (脚本 all 模式的数据源)
   --    尽力而为: 无 buffer 上下文时 jars.lua 内部用 getcwd() 兜底
   if k.jar_mode == "all" then
     local ok2, _ = pcall(function()
-      require("aosp-dev.java.jars").find_android_jars()
+      require("aosp-nav.java.jars").find_android_jars()
     end)
     if not ok2 then
-      vim.notify("[aosp-dev] jar cache warm-up failed, kls-classpath(all) may miss cache", vim.log.levels.WARN)
+      vim.notify("[aosp-nav] jar cache warm-up failed, kls-classpath(all) may miss cache", vim.log.levels.WARN)
     end
   end
 
@@ -77,27 +77,27 @@ function M.preview_classpath(mode)
   local cfg = get_cfg()
   if mode then
     if mode ~= "curated" and mode ~= "all" then
-      vim.notify("[aosp-dev] invalid mode: " .. mode .. " (curated|all)", vim.log.levels.ERROR)
+      vim.notify("[aosp-nav] invalid mode: " .. mode .. " (curated|all)", vim.log.levels.ERROR)
       return
     end
     cfg.kotlin.jar_mode = mode
   end
-  local classpath = require("aosp-dev.kotlin.classpath")
+  local classpath = require("aosp-nav.kotlin.classpath")
   local path, err = classpath.ensure_script()
   if not path then
-    vim.notify("[aosp-dev] generate failed: " .. (err or "unknown"), vim.log.levels.ERROR)
+    vim.notify("[aosp-nav] generate failed: " .. (err or "unknown"), vim.log.levels.ERROR)
     return
   end
   local jars = classpath.dry_run(vim.fn.getcwd())
   vim.notify(
-    "[aosp-dev] kls-classpath (" .. cfg.kotlin.jar_mode .. ") -> " .. #jars .. " jars from " .. vim.fn.getcwd(),
+    "[aosp-nav] kls-classpath (" .. cfg.kotlin.jar_mode .. ") -> " .. #jars .. " jars from " .. vim.fn.getcwd(),
     vim.log.levels.INFO
   )
   for i = math.min(#jars, 10), 1, -1 do
     vim.notify("  " .. jars[i], vim.log.levels.INFO)
   end
   if cfg.kotlin.jar_mode == "all" then
-    vim.notify("[aosp-dev] all 模式为实验性: KLS 首次索引慢/内存高; 切换模式后建议清理 "
+    vim.notify("[aosp-nav] all 模式为实验性: KLS 首次索引慢/内存高; 切换模式后建议清理 "
       .. cfg.kotlin.storage_path, vim.log.levels.WARN)
   end
 end

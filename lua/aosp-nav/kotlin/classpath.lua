@@ -12,7 +12,7 @@ local BS = string.char(92) -- backslash, 避免源码字符串中出现反斜杠
 
 --- 获取当前配置 (setup 后有效, 经 M.kotlin 访问时 metatable 已 ensure setup)
 local function get_cfg()
-  return require("aosp-dev").config
+  return require("aosp-nav").config
 end
 
 --- KLS config 目录 (XDG 感知, 与 KLS ShellClassPathResolver 的 globalConfigRoot 一致)
@@ -122,8 +122,8 @@ function M.render()
 
   local lines = {
     "#!/usr/bin/env bash",
-    "# aosp-dev.nvim classpath v1 hash=" .. config_hash(cfg),
-    "# Managed by aosp-dev.nvim, manual edits will be overwritten.",
+    "# aosp-nav.nvim classpath v1 hash=" .. config_hash(cfg),
+    "# Managed by aosp-nav.nvim, manual edits will be overwritten.",
     "# Called by kotlin-language-server ShellClassPathResolver, cwd = workspace root.",
     "# stdout: colon-separated jar list (File.pathSeparator).",
     "set -u",
@@ -272,7 +272,7 @@ else
       [ -f "$jf" ] && jars+=("$jf")
     done < "$f"
   else
-    echo "aosp-dev: jar cache missing: $f (open a .java file once, or :AospCollectJars)" >&2
+    echo "aosp-nav: jar cache missing: $f (open a .java file once, or :AospCollectJars)" >&2
   fi
 fi
 
@@ -313,7 +313,7 @@ function M.ensure_script()
     if not existing_marker then
       -- 非插件生成: 备份
       vim.fn.rename(path, path .. ".bak")
-      vim.notify("[aosp-dev] backed up existing classpath to classpath.bak", vim.log.levels.WARN)
+      vim.notify("[aosp-nav] backed up existing classpath to classpath.bak", vim.log.levels.WARN)
     end
   end
 

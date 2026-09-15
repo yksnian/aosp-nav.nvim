@@ -1,9 +1,9 @@
 -- init.lua: 顶层 setup(opts) + 状态管理 + 子模块 lazy 导出
 -- 用法:
---   require("aosp-dev").setup()
---   -- jdtls spec: opts = require("aosp-dev").java.configure
+--   require("aosp-nav").setup()
+--   -- jdtls spec: opts = require("aosp-nav").java.configure
 
-local config = require("aosp-dev.config")
+local config = require("aosp-nav.config")
 
 local M = {}
 
@@ -26,7 +26,7 @@ function M.setup(opts)
   M.config = config.merge(opts)
   local ok, err = config.validate(M.config)
   if not ok then
-    vim.notify("[aosp-dev] config invalid: " .. (err or "unknown"), vim.log.levels.ERROR)
+    vim.notify("[aosp-nav] config invalid: " .. (err or "unknown"), vim.log.levels.ERROR)
     return M
   end
   -- 创建缓存目录
@@ -44,7 +44,7 @@ setmetatable(M, {
       if not M._state.setup_done then
         M.setup()
       end
-      local mod = require("aosp-dev." .. key)
+      local mod = require("aosp-nav." .. key)
       rawset(t, key, mod)  -- 缓存到表上, 后续访问不再触发 __index
       return mod
     end

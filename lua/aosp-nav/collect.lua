@@ -14,7 +14,7 @@ local function get_plugin_root()
   if source:sub(1, 1) == "@" then
     source = source:sub(2)
   end
-  -- collect.lua 在 lua/aosp-dev/ 下, 向上 3 级到插件根
+  -- collect.lua 在 lua/aosp-nav/ 下, 向上 3 级到插件根
   return vim.fn.fnamemodify(source, ":h:h:h")
 end
 
@@ -23,18 +23,18 @@ end
 --- @param output_dir string|nil 输出目录 (nil=用配置的 jar_fallback_dir)
 function M.collect_jars(aosp_out, output_dir)
   if _running then
-    vim.notify("[aosp-dev] collect already running, please wait", vim.log.levels.WARN)
+    vim.notify("[aosp-nav] collect already running, please wait", vim.log.levels.WARN)
     return
   end
 
-  local aosp = require("aosp-dev")
+  local aosp = require("aosp-nav")
   local cfg = aosp.config
   if not cfg then
-    vim.notify("[aosp-dev] setup() not called", vim.log.levels.ERROR)
+    vim.notify("[aosp-nav] setup() not called", vim.log.levels.ERROR)
     return
   end
 
-  local android_root_mod = require("aosp-dev.android_root")
+  local android_root_mod = require("aosp-nav.android_root")
 
   -- 自动检测 android_root
   if not aosp_out then
@@ -60,13 +60,13 @@ function M.collect_jars(aosp_out, output_dir)
   end
 
   if not aosp_out then
-    vim.notify("[aosp-dev] cannot detect AOSP root, please specify: :AospCollectJars <aosp_root>", vim.log.levels.WARN)
+    vim.notify("[aosp-nav] cannot detect AOSP root, please specify: :AospCollectJars <aosp_root>", vim.log.levels.WARN)
     return
   end
 
   -- 检查 out 目录
   if vim.fn.isdirectory(aosp_out .. "/out") ~= 1 then
-    vim.notify("[aosp-dev] no out/ directory found in: " .. aosp_out, vim.log.levels.WARN)
+    vim.notify("[aosp-nav] no out/ directory found in: " .. aosp_out, vim.log.levels.WARN)
     return
   end
 
@@ -76,12 +76,12 @@ function M.collect_jars(aosp_out, output_dir)
   local plugin_root = get_plugin_root()
   local script = plugin_root .. "/scripts/collect_aosp_jars.sh"
   if vim.fn.filereadable(script) ~= 1 then
-    vim.notify("[aosp-dev] collect script not found: " .. script, vim.log.levels.ERROR)
+    vim.notify("[aosp-nav] collect script not found: " .. script, vim.log.levels.ERROR)
     return
   end
 
   _running = true
-  vim.notify(("[aosp-dev] collecting jars %s -> %s (async, continue working)")
+  vim.notify(("[aosp-nav] collecting jars %s -> %s (async, continue working)")
     :format(aosp_out, output_dir), vim.log.levels.INFO)
 
   local started_at = os.time()
@@ -103,7 +103,7 @@ function M.collect_jars(aosp_out, output_dir)
           tail_lines[#tail_lines + 1] = lines[i]
         end
       end
-      vim.notify("[aosp-dev] collect failed (exit " .. code .. ")\n"
+      vim.notify("[aosp-nav] collect failed (exit " .. code .. ")\n"
         .. table.concat(tail_lines, "\n"), vim.log.levels.ERROR, { timeout = 10000 })
       return
     end
@@ -118,14 +118,14 @@ function M.collect_jars(aosp_out, output_dir)
     end
 
     local elapsed = os.time() - started_at
-    vim.notify("[aosp-dev] collect finished in " .. elapsed .. "s\n"
+    vim.notify("[aosp-nav] collect finished in " .. elapsed .. "s\n"
       .. table.concat(summary, "\n"), vim.log.levels.INFO, { timeout = 10000 })
 
     -- 清除 jar 内存缓存 (收集后 fallback jar 可能变化)
     -- 注意: 文件缓存 keyed by android_root, 未编译项目本就无缓存; 已编译项目
     -- 优先命中自身 out, fallback 变化对其无影响, 因此只需清内存态
-    require("aosp-dev.java.jars").reset_cache()
-    vim.notify("[aosp-dev] jar cache cleared, reopen java files to reload fallback jars",
+    require("aosp-nav.java.jars").reset_cache()
+    vim.notify("[aosp-nav] jar cache cleared, reopen java files to reload fallback jars",
       vim.log.levels.INFO)
   end)
 end

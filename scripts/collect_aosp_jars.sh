@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # collect_aosp_jars.sh - collect jars from AOSP out/ for jdtls indexing
-# Filtering rules (aligned with lua/aosp-dev/java/jars.lua v3):
+# Filtering rules (aligned with lua/aosp-nav/java/jars.lua v3):
 #   variant : android_common preferred, android_common_apexNN fallback,
 #             host/product variants excluded
 #   buckets : javac/kotlinc = own-source artifacts, always kept (mixed

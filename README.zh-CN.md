@@ -1,4 +1,4 @@
-# aosp-dev.nvim
+# aosp-nav.nvim
 
 [English](README.md) | 简体中文
 
@@ -53,7 +53,7 @@ Android cpp代码演示。![cpp_demo](https://github.com/user-attachments/assets
 
 ```lua
 {
-  "yksnian/aosp-dev.nvim",
+  "yksnian/aosp-nav.nvim",
   version = "*",  -- 跟踪最新稳定 tag (v1.1.0 起); 省略则跟踪 main 分支
   dependencies = "mfussenegger/nvim-jdtls",
   ft = "java",
@@ -66,12 +66,12 @@ Android cpp代码演示。![cpp_demo](https://github.com/user-attachments/assets
 
 ```lua
 -- lua/plugins/jdtls.lua
-require("aosp-dev").setup()
+require("aosp-nav").setup()
 
 return {
   {
     "mfussenegger/nvim-jdtls",
-    dependencies = "yksnian/aosp-dev.nvim",
+    dependencies = "yksnian/aosp-nav.nvim",
     ft = "java",
     opts = function(_, opts)
       -- 你的 jdtls 配置 (cmd, root_dir, on_attach 等)
@@ -85,7 +85,7 @@ return {
       opts.root_dir = require("lspconfig.util").root_pattern(".git", ".project")
 
       -- 注入 AOSP 特化配置 (jar, sourcePaths, foldingRange, gradle 等)
-      return require("aosp-dev").java.configure(opts)
+      return require("aosp-nav").java.configure(opts)
     end,
   },
 }
@@ -94,7 +94,7 @@ return {
 ### 自定义配置
 
 ```lua
-require("aosp-dev").setup({
+require("aosp-nav").setup({
   cache_dir = "~/.cache/nvim/aosp_dev",
   java = {
     jar_fallback_dir = "~/.usr/android_jars",
@@ -110,7 +110,7 @@ require("aosp-dev").setup({
 在 lspconfig 的 opts 中注入 KLS 配置 (以 LazyVim 为例):
 
 ```lua
-require("aosp-dev").setup({
+require("aosp-nav").setup({
   cache_dir = "~/.cache/nvim/aosp_dev",
   java = {
     jar_fallback_dir = "~/.usr/android_jars",

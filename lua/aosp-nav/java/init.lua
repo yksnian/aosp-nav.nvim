@@ -1,6 +1,6 @@
 -- java/init.lua: configure(opts) 注入 AOSP 特化配置到 jdtls opts
 -- 用法 (用户 jdtls spec):
---   opts = function(_, opts) return require("aosp-dev").java.configure(opts) end
+--   opts = function(_, opts) return require("aosp-nav").java.configure(opts) end
 
 local M = {}
 
@@ -9,7 +9,7 @@ local M = {}
 --- @param opts table jdtls opts
 --- @return table opts 修改后的 opts
 function M.configure(opts)
-  local cfg = require("aosp-dev").config
+  local cfg = require("aosp-nav").config
   if not cfg or not cfg.java.enabled then
     return opts
   end
@@ -20,7 +20,7 @@ function M.configure(opts)
   opts.capabilities = opts.capabilities or vim.lsp.protocol.make_client_capabilities()
 
   -- 1. JAR 收集
-  local jars_mod = require("aosp-dev.java.jars")
+  local jars_mod = require("aosp-nav.java.jars")
   local jars = jars_mod.find_android_jars()
 
   local bufname = vim.api.nvim_buf_get_name(0)
@@ -45,7 +45,7 @@ function M.configure(opts)
   --    android.* 解析); 只有 root_dir 覆盖范围内的 jar 才与源码重复。
   --    常规无 .project 场景 root_dir == .git 根, 行为不变。
   if java_cfg.exclude_self_jars and #jars > 0 and root_path and root_path ~= "" then
-    local android_root = require("aosp-dev.android_root").find_android_platform_root(bufname)
+    local android_root = require("aosp-nav.android_root").find_android_platform_root(bufname)
     local rel = android_root
       and root_path:sub(1, #android_root + 1) == android_root .. "/"
       and root_path:sub(#android_root + 2)
@@ -60,7 +60,7 @@ function M.configure(opts)
         end
       end
       if removed > 0 then
-        vim.notify(("[aosp-dev] self-exclude %s: -%d jars, %d remain")
+        vim.notify(("[aosp-nav] self-exclude %s: -%d jars, %d remain")
           :format(rel, removed, #filtered), vim.log.levels.INFO)
       end
       jars = filtered
@@ -68,7 +68,7 @@ function M.configure(opts)
   end
 
   -- 4. 源码根推断
-  local source_paths_mod = require("aosp-dev.java.source_paths")
+  local source_paths_mod = require("aosp-nav.java.source_paths")
   local source_paths = source_paths_mod.find_source_paths(root_path, bufname)
 
   -- 5. inlay hints: android 项目 -> off (避签名损坏 NPE), 非 android -> all
