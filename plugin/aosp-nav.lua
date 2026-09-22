@@ -16,12 +16,12 @@ end, {
   desc = "Regenerate classpath script and dry-run preview",
 })
 
--- KLS 孤儿进程清理 (nvim 崩溃等 VimLeavePre 不触发的场景)
+-- KLS 孤儿/残留清理 (手动兜底)
 vim.api.nvim_create_user_command("AospKillOrphanKls", function()
-  local proc = require("aosp-dev.kotlin.proc")
-  local n = proc.kill_all()
-  vim.notify(("[aosp-nav] killed %d KLS process(es)"):format(n),
-    n > 0 and vim.log.levels.INFO or vim.log.levels.WARN)
-end, { desc = "Kill all Kotlin language server processes" })
+  local proc = require("aosp-nav.kotlin.proc")
+  local n = proc.cleanup()
+  vim.notify(("[aosp-nav] cleaned %d KLS process(es)"):format(n),
+    n > 0 and vim.log.levels.INFO or vim.log.levels.INFO)
+end, { desc = "Kill orphan/current-session Kotlin language server processes" })
 
 return {}
