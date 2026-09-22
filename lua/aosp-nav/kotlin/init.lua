@@ -68,6 +68,46 @@ function M.configure(opts)
     end
   end
 
+  -- 6. KLS 进程生命周期管理 (v2: 祖先链身份判定):
+  --    fwcd KLS 1.3.13 在客户端断开后不自行退出 (已知缺陷), AOSP 规模的
+  --    source path 扫描会让残留进程长期满载 (实测 14 天 CPU)。
+  --    v2: /proc 祖先链判定 KLS 是否为本 nvim 后代 (内核事实, 零竞态,
+  --    多会话互不误伤); PPid=1 的孤儿 (崩溃残留) 由巡检 timer 顺带清理。
+  do
+    local proc = require("aosp-nav.kotlin.proc")
+    proc.setup()
+
+    local group = vim.api.nvim_create_augroup("aosp_nav_kls_lifecycle", { clear = true })
+    vim.api.nvim_create_autocmd("LspAttach", {
+      group = group,
+      callback = function(args)
+        local client = vim.lsp.get_client_by_id(args.data.client_id)
+        if client and client.name == "kotlin_language_server" then
+          proc.mark_session_active()
+        end
+      end,
+    })
+    vim.api.nvim_create_autocmd("LspDetach", {
+      group = group,
+      callback = function(args)
+        local client = vim.lsp.get_client_by_id(args.data.client_id)
+        if client and client.name == "kotlin_language_server" then
+          proc.on_detach()
+        end
+      end,
+    })
+    vim.api.nvim_create_autocmd("VimLeavePre", {
+      group = group,
+      callback = function()
+        -- 正常 shutdown 流程优先, 再以祖先链精确补杀 KLS 不响应 shutdown 的残留
+        for _, client in ipairs(vim.lsp.get_clients({ name = "kotlin_language_server" })) do
+          pcall(function() vim.lsp.stop_client(client.id) end)
+        end
+        pcall(function() proc.cleanup() end)
+      end,
+    })
+  end
+
   return opts
 end
 
