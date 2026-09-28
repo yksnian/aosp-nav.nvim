@@ -3,6 +3,7 @@
 English | [简体中文](README.zh-CN.md)
 
 Neovim plugin for reading and editing Android (AOSP) source code.
+Just need a full compiled Android source tree(out/soong/.intermediates present).
 
 Normally, with jdtls / kotlin-language-server set up in Neovim, opening an Android project only lets you jump to and complete symbols within the project's own Java/Kotlin files and the JDK. As soon as an Android framework class is involved, you get "no definition".
 
