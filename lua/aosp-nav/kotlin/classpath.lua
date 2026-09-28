@@ -310,6 +310,11 @@ function M.ensure_script()
     if existing_marker and existing_marker == marker then
       return path, nil -- up to date
     end
+    -- family script (aosp-nav-vscode dispatch): managed by the vscode plugin,
+    -- leave it alone so the two plugins don't fight over the same file
+    if (first and first[2] or ""):match("^# aosp%-nav managed") then
+      return path, nil
+    end
     if not existing_marker then
       -- 非插件生成: 备份
       vim.fn.rename(path, path .. ".bak")
