@@ -3,8 +3,9 @@
 [English](README.md) | 简体中文
 
 适合阅读/修改Android系统源码(适合Android系统开发者，应用开发不推荐)。
+**仅需要已全编译的 Android 源码 (存在 out/soong/.intermediates)，打开文件即可生效。**
 
-和的ctags，sourceinsight等静态分析工具不一样，也不像AndroidStudio那么重，无需idegen然后导ipr文件。
+和ctags，sourceinsight等静态分析工具不一样，也不像AndroidStudio那么重，无需idegen然后导ipr文件。
 
 使用此插件以后就能在AOSP代码里翱翔了!
 
