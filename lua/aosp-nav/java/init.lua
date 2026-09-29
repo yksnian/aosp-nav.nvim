@@ -4,6 +4,69 @@
 
 local M = {}
 
+-- [v7] 本会话已就 java.import.exclusions 新发现提示过的 root (避免反复打扰)
+local _excl_notified = {}
+
+-- [v7] 已提示过的失效配置键 (避免每次 configure 重复打扰)
+local _deprecated_warned = {}
+
+--- 提示已失效的配置键 (只提示一次)
+local function warn_deprecated(java_cfg)
+  if java_cfg.exclude_self_jars and not _deprecated_warned.exclude_self_jars then
+    _deprecated_warned.exclude_self_jars = true
+    vim.notify("[aosp-nav] java.exclude_self_jars 已失效 (工作区根 = AOSP 根后自排除恒为空), "
+      .. "请改用 exclude_jars / exclude_globs; 该配置可删除", vim.log.levels.WARN)
+  end
+end
+
+--- 提示用户应用新的 import.exclusions
+--- 已导入的工程持久化在 Eclipse workspace 里, 仅改设置不生效, 必须重启 jdtls;
+--- 若那些目录已被导入过, 还得先删掉 ~/.cache/nvim/jdtls/<project>/workspace
+--- @param root string jdtls root
+--- @param added table 本次新发现的模式
+local function notify_new_exclusions(root, added)
+  -- root 用拼接而非 :format: 路径里若含 % 会被当成格式符
+  vim.notify(("[aosp-nav] java.import.exclusions: %d stale Eclipse metadata dir(s) "
+    .. "found under " .. root .. "; they will no longer be imported.\n"
+    .. "Run :LspRestart to apply. If those projects were already imported, delete "
+    .. "~/.cache/nvim/jdtls/<project>/workspace first (see README).")
+    :format(#added), vim.log.levels.WARN, { timeout = 10000 })
+end
+
+--- [v7] 后台刷新残留 Eclipse 元数据扫描 (eclipseGuardScan.ts 的等价物)
+--- jdt.ls 会把 .project/.classpath 写进导入过的工程目录; 这些目录下次会
+--- 被当成"已存在工程"全量导入。扫描结果写缓存, 下次 configure 生效。
+--- 不阻塞 jdtls 启动: 本次启动用缓存里的旧结果, 新结果靠 :LspRestart 应用。
+--- @param java_cfg table java 段配置
+--- @param root string|nil jdtls root_dir
+--- @param injected table|nil 本次已注入的模式列表
+local function schedule_exclusions_refresh(java_cfg, root, injected)
+  if not java_cfg.import_exclusions_scan or not java_cfg.import_exclusions_enabled then
+    return
+  end
+  if not root or root == "" or not injected then return end
+
+  local mod = require("aosp-nav.java.import_exclusions")
+  if not mod.is_stale(root) then return end
+
+  mod.scan_async(root, function(patterns)
+    mod.save(root, patterns)
+    if _excl_notified[root] then return end
+    local known = {}
+    for _, v in ipairs(injected) do
+      known[v] = true
+    end
+    local added = {}
+    for _, v in ipairs(patterns) do
+      if not known[v] then added[#added + 1] = v end
+    end
+    if #added > 0 then
+      _excl_notified[root] = true
+      notify_new_exclusions(root, added)
+    end
+  end)
+end
+
 --- 注入 AOSP 特化配置到 jdtls opts
 --- 不覆盖用户已有配置 (deep_extend force 合并, AOSP 字段优先)
 --- @param opts table jdtls opts
@@ -19,61 +82,35 @@ function M.configure(opts)
   opts.settings = opts.settings or {}
   opts.capabilities = opts.capabilities or vim.lsp.protocol.make_client_capabilities()
 
-  -- 1. JAR 收集
-  local jars_mod = require("aosp-nav.java.jars")
-  local jars = jars_mod.find_android_jars()
+  warn_deprecated(java_cfg)
 
   local bufname = vim.api.nvim_buf_get_name(0)
 
-  -- 2. workspace root (root_dir 可能是 function, 需调用) — 必须先于自排除:
-  --    自排除与 sourcePaths 必须使用同一个 root
-  local root_path = opts.root_dir
-  if type(root_path) == "function" then
-    root_path = root_path(bufname)
-  end
-  -- 用户未配 root_dir 时兜底 (镜像 root_pattern(".project", ".git") 语义)
-  root_path = root_path or vim.fs.root(bufname, { ".project", ".git" })
+  -- 1. workspace root: AOSP 根优先 (与 VSCode 版一致), 非 AOSP 时原样交还用户的
+  --    root_dir。必须在收集 jar 之前装好 —— 后面所有步骤都以它为准。
+  local root_mod = require("aosp-nav.java.root")
+  local user_root = opts.root_dir
+  opts.root_dir = root_mod.jdtls_root_fn(user_root)
+  local root_path = root_mod.workspace_root(bufname)
 
-  -- 3. self jar 排除: 以源码打开的工程, 其自身产物的 jar 从 classpath 剔除 —
-  --    源码已注册 (jdtls invisible project), jar 与源码双份定义会让 jdtls 解析
-  --    歧义 (读 frameworks/base 时不加载 framework.jar/services.jar 等, 其余
-  --    仓库的 jar 保留)。jar 路径含 .intermediates/<源码目录>/... 按仓库相对
-  --    路径过滤。
-  --    过滤基准 = jdtls workspace root (root_dir), 而非 .git 仓库根:
-  --    .project 放在子模块 (如 frameworks/base/services/) 时 root_dir 是子模块,
-  --    子模块范围外的 framework.jar 必须保留 (.project 提速技巧依赖它提供
-  --    android.* 解析); 只有 root_dir 覆盖范围内的 jar 才与源码重复。
-  --    常规无 .project 场景 root_dir == .git 根, 行为不变。
-  if java_cfg.exclude_self_jars and #jars > 0 and root_path and root_path ~= "" then
-    local android_root = require("aosp-nav.android_root").find_android_platform_root(bufname)
-    local rel = android_root
-      and root_path:sub(1, #android_root + 1) == android_root .. "/"
-      and root_path:sub(#android_root + 2)
-    if rel then
-      local marker = "/.intermediates/" .. rel .. "/"
-      local filtered, removed = {}, 0
-      for _, j in ipairs(jars) do
-        if j:find(marker, 1, true) then
-          removed = removed + 1
-        else
-          filtered[#filtered + 1] = j
-        end
-      end
-      if removed > 0 then
-        vim.notify(("[aosp-nav] self-exclude %s: -%d jars, %d remain")
-          :format(rel, removed, #filtered), vim.log.levels.INFO)
-      end
-      jars = filtered
-    end
-  end
+  -- 2. JAR 收集 (jars.lua 自己按 android_root 检测/缓存, 与 root_path 同源)
+  local jars_mod = require("aosp-nav.java.jars")
+  local jars = jars_mod.find_android_jars()
+  local jar_status = jars_mod.cache_status()
 
-  -- 4. 源码根推断
-  local source_paths_mod = require("aosp-nav.java.source_paths")
-  local source_paths = source_paths_mod.find_source_paths(root_path, bufname)
+  -- 3. 源码根: 默认不注入 (见 config.lua source_paths_mode 的说明 —— 注入会
+  --    关闭 jdt.ls 的逐文件 source root 推断)。只有显式给了列表或切到 scan
+  --    模式且确实扫出内容时才带上这个 key; 空列表也必须整个 key 缺席。
+  local source_paths = nil
+  if java_cfg.source_paths and #java_cfg.source_paths > 0 then
+    source_paths = vim.deepcopy(java_cfg.source_paths)
+  elseif java_cfg.source_paths_mode == "scan" and root_path then
+    local scanned = require("aosp-nav.java.source_paths").find_source_paths(root_path, bufname)
+    if #scanned > 0 then source_paths = scanned end
+  end
 
   -- 5. inlay hints: android 项目 -> off (避签名损坏 NPE), 非 android -> all
-  local cache = jars_mod.cache_status()
-  local is_android = cache.root ~= nil
+  local is_android = jar_status.root ~= nil
   local inlay_mode
   if java_cfg.inlay_hints_mode == "auto" then
     inlay_mode = is_android and "off" or "all"
@@ -117,12 +154,15 @@ function M.configure(opts)
   end
 
   -- 7. 构造 AOSP 特化 settings
+  -- sourcePaths 只在确有内容时才出现: 注入这个 key 会关闭 jdt.ls 的逐文件
+  -- source root 推断 (见 config.lua source_paths_mode 注释)
+  local project_settings = { referencedLibraries = jars }
+  if source_paths then
+    project_settings.sourcePaths = source_paths
+  end
   local aosp_settings = {
     java = {
-      project = {
-        referencedLibraries = jars,
-        sourcePaths = source_paths,
-      },
+      project = project_settings,
       -- 注意: 顶层 java.inlayHints.enabled 已被新版 jdt.ls 移除 (静默无效),
       -- LazyVim 默认 parameterNames.enabled="all" 会激活 inlay hint 请求,
       -- 而 AOSP 1610 个 jar 中存在签名损坏的 class 文件, InlayHintVisitor
@@ -136,26 +176,35 @@ function M.configure(opts)
     },
   }
 
-  -- 禁用 Gradle/Maven 导入 (AOSP 非构建系统项目, 且无网工作站避免下载 checksums)
+  -- 8. java.import.* 注入 (gradle/maven 禁用 + import.exclusions)
   -- 时序关键: 仅放 opts.settings 会走 workspace/didChangeConfiguration, 配置到达时
-  -- GradleProjectImporter 可能已开始 gradle sync; jdt.ls 还会读取 initialize 请求中
-  -- 的 initializationOptions.settings (InitHandler.handleInitializationOptions ->
-  -- preferenceManager.initialize, 先于所有项目导入器执行), 从根本上跳过 gradle 导入,
-  -- 无需在模块目录手动创建 .project 来规避 gradle sync
+  -- GradleProjectImporter 可能已开始 gradle sync, 工程导入也可能已经开始; jdt.ls
+  -- 还会读取 initialize 请求中的 initializationOptions.settings (BaseInitHandler
+  -- .handleInitializationOptions -> Preferences.createFrom -> 早于 initializeProjects),
+  -- 从根本上跳过导入, 无需在模块目录手动创建 .project 来规避 gradle sync
   -- 注入位置: LazyVim java extra 的 attach_jdtls 会硬编码 init_options={bundles},
   -- 丢弃用户 opts.init_options, 仅 opts.jdtls 字段经 extend_or_override 合并;
   -- 因此主注入 opts.jdtls.init_options.settings (LazyVim 环境),
   -- 辅注入 opts.init_options.settings (直接使用 nvim-jdtls 的环境)
+  local import_extras = {}
   if java_cfg.disable_gradle_import then
-    local import_settings = {
-      java = {
-        import = {
-          gradle = { enabled = false },
-          maven = { enabled = false },
-        },
-      },
-    }
-    aosp_settings.java.import = import_settings.java.import
+    import_extras.gradle = { enabled = false }
+    import_extras.maven = { enabled = false }
+  end
+  -- [v7] java.import.exclusions: 静态默认 + 残留 .project/.classpath 扫描缓存
+  -- + 用户条目 (见 java/import_exclusions.lua)。必须与 gradle/maven 同样
+  -- 走 init_options, 否则 root_dir 落在 AOSP 顶层时导入早已开始。
+  -- 仅 android 项目注入 (is_android): 非 AOSP 工程里 **/out/** 之类的模式
+  -- 可能误伤, 而排除项的意义只在 AOSP 这种超大树形上成立
+  local excl_mod = require("aosp-nav.java.import_exclusions")
+  local injected_exclusions = nil
+  if java_cfg.import_exclusions_enabled and is_android then
+    injected_exclusions = excl_mod.effective(java_cfg, root_path)
+    import_extras.exclusions = injected_exclusions
+  end
+  if next(import_extras) then
+    local import_settings = { java = { import = import_extras } }
+    aosp_settings.java.import = import_extras
     opts.jdtls = opts.jdtls or {}
     opts.jdtls.init_options = opts.jdtls.init_options or {}
     opts.jdtls.init_options.settings = vim.tbl_deep_extend("force",
@@ -165,8 +214,30 @@ function M.configure(opts)
       opts.init_options.settings or {}, import_settings)
   end
 
-  -- 8. 深度合并: AOSP 字段优先, 但不覆盖用户其他 settings (如 completion, signatureHelp 等)
+  -- 9. 深度合并: AOSP 字段优先, 但不覆盖用户其他 settings (如 completion, signatureHelp 等)
   opts.settings = vim.tbl_deep_extend("force", opts.settings, aosp_settings)
+
+  -- 10. 后台刷新残留 Eclipse 元数据排除 (不阻塞 jdtls 启动)
+  if is_android then
+    schedule_exclusions_refresh(java_cfg, root_path, injected_exclusions)
+  end
+
+  -- 11. 会话状态 (供 :AospStatus / :AospDiagnostics / statusline 读取)
+  require("aosp-nav.state").set({
+    phase = is_android and (#jars > 0 and "indexing" or "no-out") or "failed",
+    root = root_path,
+    android_root = jar_status.root,
+    jars = #jars,
+    cache_origin = jar_status.origin,
+  })
+
+  -- 12. jar 缓存陈旧提醒 (AOSP 重新编译过)。只提醒不自动重扫: 全树重扫要在
+  --     主循环里跑数秒, 启动期卡 UI 比一条通知更糟; :AospRescan 一条命令解决。
+  if is_android and jar_status.origin == "cache" and jar_status.stale then
+    vim.notify("[aosp-nav] AOSP 已重新编译 (out/soong/build.ninja 比 jar 缓存新), "
+      .. "jar 列表可能过期 — 跑 :AospRescan 更新后 :LspRestart 生效",
+      vim.log.levels.WARN, { timeout = 10000 })
+  end
 
   return opts
 end

@@ -10,6 +10,9 @@ local M = {}
 
 local BS = string.char(92) -- backslash, 避免源码字符串中出现反斜杠 (fs.lua 教训)
 
+-- 用户自有 classpath 脚本被备份的提示只发一次 (每次 configure 都发很吵)
+local _user_script_warned = false
+
 --- 获取当前配置 (setup 后有效, 经 M.kotlin 访问时 metatable 已 ensure setup)
 local function get_cfg()
   return require("aosp-nav").config
@@ -27,6 +30,83 @@ end
 --- @return string
 function M.script_path()
   return kls_config_dir() .. "/classpath"
+end
+
+--- 另一家族 (aosp-nav-vscode) 脚本的备份路径
+--- 生成脚本时若发现 classpath 是 VSCode 家族写的, 就转到这个路径, 并在我们的
+--- `*)` 分支里 exec 它 —— 两个插件共用同一个文件时互为兜底, 而不是互相覆盖
+--- @return string
+local function vscode_backup_path()
+  return kls_config_dir() .. "/classpath.vscode.bak"
+end
+
+--- 本插件维护的 "root -> AOSP 根" 分发表 (dispatch 用)
+--- 每行: <root>\t<aosp_root>
+--- @return string
+local function roots_file()
+  return kls_config_dir() .. "/aosp-nav/nvim-roots.txt"
+end
+
+--- 读取分发表
+--- @return table list { {root=string, aosp=string}, ... }
+function M.registered_roots()
+  local f = roots_file()
+  if vim.fn.filereadable(f) ~= 1 then return {} end
+  local out = {}
+  for _, l in ipairs(vim.fn.readfile(f)) do
+    local root, aosp = l:match("^(.-)\t(.+)$")
+    if root and root ~= "" and aosp and aosp ~= "" then
+      out[#out + 1] = { root = root, aosp = aosp }
+    end
+  end
+  return out
+end
+
+local MAX_ROOTS = 50
+
+--- 登记一个 "KLS 工作区根 -> AOSP 根" 映射 (去重, 上限 MAX_ROOTS 条)
+--- @param root string|nil KLS 的 workspace root ($PWD)
+--- @param aosp string|nil AOSP 根
+--- @return boolean changed 是否有变化 (true = 需要重新生成脚本)
+function M.register_root(root, aosp)
+  if not root or root == "" or not aosp or aosp == "" then return false end
+  local dir = vim.fn.fnamemodify(root, ":p"):gsub("/+$", "")
+  local list = M.registered_roots()
+  local seen = {}
+  local out = {}
+  for _, e in ipairs(list) do
+    if e.root == dir then
+      if e.aosp == aosp then return false end  -- 已登记且一致
+    else
+      out[#out + 1] = e
+      seen[e.root] = true
+    end
+  end
+  out[#out + 1] = { root = dir, aosp = aosp }
+  -- 超限时丢最早的 (保留最近活跃的 root)
+  while #out > MAX_ROOTS do
+    table.remove(out, 1)
+  end
+  local lines = {}
+  for _, e in ipairs(out) do
+    lines[#lines + 1] = e.root .. "\t" .. e.aosp
+  end
+  vim.fn.mkdir(kls_config_dir() .. "/aosp-nav", "p")
+  vim.fn.writefile(lines, roots_file())
+  return true
+end
+
+--- 探测 classpath 脚本归属 (诊断用, 对应 VSCode 版 probeKotlinChannel)
+--- @return string owner "nvim"|"vscode"|"user"|"none"
+--- @return string|nil path
+function M.probe()
+  local path = M.script_path()
+  if vim.fn.filereadable(path) ~= 1 then return "none", path end
+  local head = vim.fn.readfile(path, "", 5)
+  local text = table.concat(head or {}, "\n")
+  if text:match("# aosp%-nav%.nvim classpath") then return "nvim", path end
+  if text:match("# aosp%-nav managed") then return "vscode", path end
+  return "user", path
 end
 
 --- Lua string pattern -> POSIX ERE (用于脚本内 grep -E)
@@ -81,11 +161,12 @@ local function shq(s)
   return "'" .. s .. "'"
 end
 
---- 计算配置指纹 (相关配置子集的 djb2 hash, 嵌入脚本首行 marker 用于幂等更新;
+--- 计算配置指纹 (相关配置子集的 djb2 hash, 嵌入脚本 marker 用于标识;
 --- nvim 无 sha1() 函数, 用纯 Lua hash)
 --- @param cfg table
+--- @param branches table 分发表 (参与 hash, 否则分发表变化不会体现在 marker 上)
 --- @return string
-local function config_hash(cfg)
+local function config_hash(cfg, branches)
   local subset = {
     cache_dir = cfg.cache_dir,
     fallback = cfg.java.jar_fallback_dir,
@@ -95,6 +176,7 @@ local function config_hash(cfg)
     curated_modules = cfg.kotlin.curated_modules,
     soong_tag_priority = cfg.kotlin.soong_tag_priority,
     make_jar_priority = cfg.kotlin.make_jar_priority,
+    branches = branches,
   }
   local s = vim.inspect(subset)
   local h = 5381
@@ -105,9 +187,10 @@ local function config_hash(cfg)
 end
 
 --- 渲染脚本内容 (纯函数, 便于测试)
+--- @param branches table|nil 分发表 { {root=..., aosp=...}, ... }
 --- @return string|nil content
 --- @return string|nil err
-function M.render()
+function M.render(branches)
   local cfg = get_cfg()
   local k = cfg.kotlin
   local j = cfg.java
@@ -120,9 +203,35 @@ function M.render()
   end
   local exclude_re = shq("(" .. table.concat(ere_parts, "|") .. ")$")
 
+  local vsc = shq(vscode_backup_path())
+  if not vsc then return nil, "config dir contains single quote" end
+
+  -- 分发表: root -> AOSP 根。用 case 的 | 合并同一 AOSP 根下的多个 root
+  local case_lines = {}
+  local by_aosp = {}
+  local order = {}
+  for _, e in ipairs(branches or {}) do
+    local key = shq(e.root)
+    if key then
+      if not by_aosp[e.aosp] then
+        by_aosp[e.aosp] = {}
+        order[#order + 1] = e.aosp
+      end
+      table.insert(by_aosp[e.aosp], key)
+    end
+  end
+  for _, aosp in ipairs(order) do
+    local q = shq(aosp)
+    if not q then return nil, "aosp root contains single quote: " .. aosp end
+    table.insert(case_lines,
+      "  " .. table.concat(by_aosp[aosp], "|") .. ") root=" .. q .. " ;;")
+  end
+
   local lines = {
     "#!/usr/bin/env bash",
-    "# aosp-nav.nvim classpath v1 hash=" .. config_hash(cfg),
+    "# aosp-nav.nvim classpath v2 hash=" .. config_hash(cfg, branches),
+    "# Family: nvim (aosp-nav.nvim). Backs up / falls through to the aosp-nav-vscode",
+    "# script at classpath.vscode.bak, so both plugins can share this file.",
     "# Managed by aosp-nav.nvim, manual edits will be overwritten.",
     "# Called by kotlin-language-server ShellClassPathResolver, cwd = workspace root.",
     "# stdout: colon-separated jar list (File.pathSeparator).",
@@ -131,6 +240,7 @@ function M.render()
     "",
     "CACHE_DIR=" .. shq(cfg.cache_dir),
     "FALLBACK_DIR=" .. shq(j.jar_fallback_dir),
+    "VSC_BACKUP=" .. vsc,
     "MODE=" .. shq(k.jar_mode),
     "EXCLUDE_JAR_RE=" .. exclude_re,
     "",
@@ -169,28 +279,46 @@ function M.render()
 
   local body = [[
 
-# ---- 1. detect android root from $PWD (bash port of android_root.lua) ----
+# ---- 0. dispatch: 已知工作区根 -> AOSP 根 ----
+# 与 VSCode 版同族的分发表 (aosp-nav/nvim-roots.txt)。命中即免去向上遍历,
+# 也避免 KLS 以模块目录为 workspace 时选出与 VSCode 不同的根。
 root=""
-fb_mk=""
-fb_repo=""
-p=$PWD
-while [ "$p" != "/" ]; do
-  if [ -d "$p/out/soong/.intermediates" ] || [ -d "$p/out/.soong/.intermediates" ] \
-     || [ -d "$p/out/target/common/obj/JAVA_LIBRARIES" ]; then
-    root=$p; break
-  fi
-  [ -z "$fb_mk" ] && [ -f "$p/build/make/core/main.mk" ] && fb_mk=$p
-  [ -z "$fb_repo" ] && [ -d "$p/.repo" ] && fb_repo=$p
-  p=$(dirname "$p")
-done
+case "$PWD" in
+__BRANCHES__
+esac
+
+# ---- 1. detect android root from $PWD (bash port of android_root.lua) ----
 if [ -z "$root" ]; then
-  top=${fb_mk:-$fb_repo}
-  for sub in "${SIBLINGS[@]}"; do
-    if [ -n "$top" ] && { [ -d "$top/$sub/out/soong/.intermediates" ] || [ -d "$top/$sub/out/.soong/.intermediates" ]; }; then
-      root="$top/$sub"; break
+  fb_mk=""
+  fb_repo=""
+  p=$PWD
+  while [ "$p" != "/" ]; do
+    if [ -d "$p/out/soong/.intermediates" ] || [ -d "$p/out/.soong/.intermediates" ] \
+       || [ -d "$p/out/target/common/obj/JAVA_LIBRARIES" ]; then
+      root=$p; break
     fi
+    [ -z "$fb_mk" ] && [ -f "$p/build/make/core/main.mk" ] && fb_mk=$p
+    [ -z "$fb_repo" ] && [ -d "$p/.repo" ] && fb_repo=$p
+    p=$(dirname "$p")
   done
-  [ -z "$root" ] && root=${fb_mk:-$fb_repo}
+  if [ -z "$root" ]; then
+    top=${fb_mk:-$fb_repo}
+    for sub in "${SIBLINGS[@]}"; do
+      if [ -n "$top" ] && { [ -d "$top/$sub/out/soong/.intermediates" ] || [ -d "$top/$sub/out/.soong/.intermediates" ]; }; then
+        root="$top/$sub"; break
+      fi
+    done
+    [ -z "$root" ] && root=${fb_mk:-$fb_repo}
+  fi
+fi
+
+# ---- 1b. 我们解析不出 (非 AOSP 工作区): 交给另一家族 (aosp-nav-vscode) 的脚本 ----
+# 放在自检测之后: 凡是 AOSP 树内的根我们自己处理, VSCode 脚本只兜底它才知道
+# 的非 AOSP Kotlin 工程。若它又把控制权交回我们 (它的 *) 分支指向
+# classpath.nvim.bak), AOSP_NAV_DISPATCH 已置位 -> 不再 exec, 直接退出,
+# 保证 exec 链一定终止 (不会无限互 exec)。
+if [ -z "$root" ] && [ -x "$VSC_BACKUP" ] && [ -z "${AOSP_NAV_DISPATCH:-}" ]; then
+  AOSP_NAV_DISPATCH=1 exec "$VSC_BACKUP"
 fi
 [ -z "$root" ] && exit 0
 
@@ -289,36 +417,72 @@ fi
 exit 0
 ]]
 
+  -- 用函数式 gsub: 路径里可能含 % , 字符串替换会把 %s 之类当捕获引用
+  local branch_text = #case_lines > 0 and (table.concat(case_lines, "\n") .. "\n") or ""
+  body = body:gsub("__BRANCHES__\n", function() return branch_text end)
+
   return table.concat(lines, "\n") .. "\n" .. body, nil
 end
 
---- 生成/更新脚本 (幂等, marker 不匹配才重写)
+--- 生成/更新脚本 (幂等: 内容无变化不重写)
+---
+--- 与 aosp-nav-vscode 共存 (两边写同一个文件, 后写者胜):
+---   1. 现有脚本是本插件家族的 -> 直接按分发表重生成;
+---   2. 现有脚本是 VSCode 家族 (`# aosp-nav managed`) -> 转存 classpath.vscode.bak,
+---      我们生成的脚本 `*)` 分支 exec 它 —— 双方分支同时存在, 谁后运行都不丢对方;
+---   3. 现有脚本无家族标记 (用户自己写的) -> 备份为 classpath.bak 并警告一次, 仍接管。
+--- @param extra table|nil 额外登记的 { root = string, aosp = string } (通常是当前 buffer)
 --- @return string|nil path 生成的脚本路径
 --- @return string|nil err
-function M.ensure_script()
+function M.ensure_script(extra)
   local path = M.script_path()
-  local content, err = M.render()
+
+  -- 0. 当前 buffer 的 root 先入表 (分发表是脚本的 dispatch 依据)
+  if extra and extra.root and extra.aosp then
+    M.register_root(extra.root, extra.aosp)
+  end
+
+  -- 1. 家族归属处理 (必须在 render 之前: VSC_BACKUP 是否可用影响脚本内容)
+  local exists = vim.fn.filereadable(path) == 1
+  local head_text = exists and table.concat(vim.fn.readfile(path, "", 5), "\n") or ""
+  -- 不加 ^ 锚: marker 在第 2 行, 而 readfile 结果是多行拼接 (锚只匹配串首)
+  local ours = head_text:match("# aosp%-nav%.nvim classpath") ~= nil
+  local vscode_family = head_text:match("# aosp%-nav managed") ~= nil
+  if exists and not ours then
+    if vscode_family then
+      local bak = vscode_backup_path()
+      if vim.fn.rename(path, bak) ~= 0 then
+        return nil, "cannot move the VSCode classpath script to " .. bak
+      end
+      vim.notify(("[aosp-nav] 接管 classpath 脚本 (原 aosp-nav-vscode 版已转存 %s); "
+        .. "未登记的 workspace, 本脚本会 exec 它, 两个插件可共存"):format(bak),
+        vim.log.levels.INFO)
+    else
+      -- 用户自己的脚本: 备份 + 警告一次 (与旧行为一致)
+      vim.fn.rename(path, path .. ".bak")
+      if not _user_script_warned then
+        _user_script_warned = true
+        vim.notify("[aosp-nav] backed up existing classpath to classpath.bak",
+          vim.log.levels.WARN)
+      end
+    end
+    exists = false
+  end
+
+  -- 2. 渲染 (分发表 -> case 分支)
+  local branches = M.registered_roots()
+  local content, err = M.render(branches)
   if not content then
     return nil, err
   end
-  local marker = content:match("# aosp%-nav%.nvim classpath v1 hash=%S+")
 
-  local exists = vim.fn.filereadable(path) == 1
+  -- 3. 内容未变则不写 (避免每次启动都碰 mtime)
   if exists then
-    local first = vim.fn.readfile(path, "", 2)
-    local existing_marker = (first and first[2] or ""):match("^# aosp%-nav%.nvim classpath v1 hash=%S+")
-    if existing_marker and existing_marker == marker then
-      return path, nil -- up to date
-    end
-    -- family script (aosp-nav-vscode dispatch): managed by the vscode plugin,
-    -- leave it alone so the two plugins don't fight over the same file
-    if (first and first[2] or ""):match("^# aosp%-nav managed") then
+    local marker = content:match("# aosp%-nav%.nvim classpath v%d+ hash=%S+")
+    local line2 = vim.fn.readfile(path, "", 2)[2] or ""
+    local old = line2:match("# aosp%-nav%.nvim classpath v%d+ hash=%S+")
+    if old and old == marker then
       return path, nil
-    end
-    if not existing_marker then
-      -- 非插件生成: 备份
-      vim.fn.rename(path, path .. ".bak")
-      vim.notify("[aosp-nav] backed up existing classpath to classpath.bak", vim.log.levels.WARN)
     end
   end
 
