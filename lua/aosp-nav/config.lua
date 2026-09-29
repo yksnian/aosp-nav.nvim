@@ -3,6 +3,16 @@
 
 local M = {}
 
+-- [v7] 排除类列表家族: 这些键按 java.exclude_merge 语义合并 (append = 用户项
+-- 拼在默认项之后), 其余字段走 tbl_deep_extend 的整表替换语义。
+-- import_exclusions 与 exclude_* 同族 (都是"用户几乎只想追加"的清单)
+local EXCLUSION_LIST_KEYS = {
+  "exclude_jars",
+  "exclude_paths",
+  "exclude_globs",
+  "import_exclusions",
+}
+
 -- 默认配置
 M.defaults = {
   -- nil = 自动检测 (从打开文件路径向上找含 out 产物的目录)
@@ -60,14 +70,43 @@ M.defaults = {
     -- (教训: 旧的整体替换语义曾让用户自定义 exclude_globs 静默挤掉默认
     -- SDK 桩排除, 导致桩进入 classpath 抢占跳转)
     exclude_merge = "append",
-    -- 是否剔除 root_dir 覆盖范围内模块自身的 jar。默认 false:
-    --   - JDT 对同 FQN 源码优先于 jar, 保留 jar 不会把跳转劫持到反编译视图;
-    --   - AIDL/proto/aconfig 生成类 (如 INetworkOfferCallback) 源码树里没有
-    --     .java, jar 是唯一来源, 剔除即失联 (Connectivity 模块实测);
-    --   - 排除粒度是模块目录, 无法按类区分"源码在树内/生成"两种情况。
-    -- 若某项目确实出现源码/jar 干扰, 可对单个项目改为 true (配合 .project
-    -- 放模块级目录缩小范围), 或用 exclude_jars 按 jar 名精确排除问题 jar。
+    -- [v7] jdt.ls java.import.exclusions (移植自 VSCode 版 aosp-nav 的
+    -- compat.ts + eclipseGuardScan.ts): 让 out/、.repo/ 以及源码树里遗留的
+    -- .project+.classpath 目录不参与 jdt.ls 的工程导入。root_dir 落在 AOSP
+    -- 顶层时 (整包树根是 git 仓库, 或根目录被放了 .project), 没有这层排除会
+    -- 触发全量导入 -> 首次索引卡死、跳转不可用。
+    --   import_exclusions_enabled = 注入开关
+    --   import_exclusions         = 用户追加的 glob 模式 (jdt.ls glob 语义,
+    --                               "!" 开头 = 反向放行), 排在默认值之后
+    --   import_exclusions_scan    = 是否后台扫描残留 .project/.classpath 目录
+    --   import_exclusions_ttl     = 扫描结果缓存有效期 (秒), <= 0 表示永不过期
+    -- 默认模式见 java/import_exclusions.lua 的 M.DEFAULT_PATTERNS
+    import_exclusions = {},
+    import_exclusions_enabled = true,
+    import_exclusions_scan = true,
+    import_exclusions_ttl = 604800,
+    -- [v7] 源码根 (java.project.sourcePaths) 注入策略。
+    --   "infer" (默认) = 不注入这个 key, 让 jdt.ls 自己推断。
+    --     jdt.ls 的 BaseDocumentLifeCycleHandler.inferInvisibleProjectSourceRoot
+    --     在 Preferences.getInvisibleProjectSourcePaths() == null 时才按打开
+    --     文件的 package 声明反推 source root (触发条件 =
+    --     PackageIsNotExpectedPackage / PublicClassMustMatchFileName 问题)。
+    --     一旦注入本 key — 哪怕是空数组, Preferences.createFrom 也会把它写成
+    --     非 null 列表 — 该推断会被整体关闭, 跨模块跳转只能落到反编译 jar。
+    --     VSCode 版从不设置本 key, 这正是它跨模块跳转体验更好的原因之一。
+    --   "scan" = 注入 java/source_paths.lua 手工扫出的浅层源码根列表
+    --     (小模块根 / 离线场景可用, AOSP 根下覆盖不全)。需要时优先直接给
+    --     source_paths 列表, 而非切到 scan。
+    source_paths_mode = "infer",
+    -- [v7] DEPRECATED / 已失效: 工作区根现在恒等于 AOSP 根 (java/root.lua), 而
+    -- 自排除的判定基准是"root_dir 相对 android_root 的差值", 两者恒等 → 恒为
+    -- 空 → 永远匹配不到任何 jar, 该开关不再产生任何效果。
+    -- 需要剔除某模块的 jar 请用 exclude_jars / exclude_globs。
+    -- 保留此键只为不静默吞掉老配置, 设置后会在启动时提示一次。
     exclude_self_jars = false,
+    -- 显式源码根列表 (相对 workspace root 或绝对路径); 非空时优先于上面两项
+    -- 例如: source_paths = { "frameworks/base/core/java", "frameworks/base/services/core/java" }
+    -- source_paths = {},
     -- Make 构建系统 jar 优先级 (Android 14 及更早)
     make_jar_priority = { "classes.jar", "classes-header.jar", "javalib.jar" },
     -- Make 构建排除的 intermediates 目录名
@@ -155,6 +194,18 @@ function M.validate(cfg)
     return false, "java.exclude_merge must be 'append' or 'replace'"
   end
 
+  -- [v7] source_paths_mode 合法值
+  if cfg.java and cfg.java.source_paths_mode
+      and cfg.java.source_paths_mode ~= "infer" and cfg.java.source_paths_mode ~= "scan" then
+    return false, "java.source_paths_mode must be 'infer' or 'scan'"
+  end
+
+  -- [v7] import_exclusions_ttl 必须是数字 (秒)
+  if cfg.java and cfg.java.import_exclusions_ttl ~= nil
+      and type(cfg.java.import_exclusions_ttl) ~= "number" then
+    return false, "java.import_exclusions_ttl must be a number (seconds)"
+  end
+
   -- kotlin 段校验 (kotlin 启用时)
   if cfg.kotlin and cfg.kotlin.enabled then
     if cfg.kotlin.jar_mode ~= "curated" and cfg.kotlin.jar_mode ~= "all" then
@@ -200,6 +251,7 @@ end
 
 --- [v6] 两次 setup 的配置合并: 已生效配置与新用户 opts 中, 排除类列表按
 --- append 拼接 (两批用户项都不丢), 其余字段新值优先。
+--- [v7] import_exclusions 与 exclude_* 同族, 一并按 append 处理。
 --- 供顶层 setup 在重复 setup 时使用
 --- @param base table 已生效配置 (M.config)
 --- @param opts table 新的用户 opts
@@ -208,7 +260,7 @@ function M.merge_lists(base, opts)
   local j = base and base.java or nil
   opts = vim.deepcopy(opts) or {}
   opts.java = opts.java or {}
-  for _, key in ipairs({ "exclude_jars", "exclude_paths", "exclude_globs" }) do
+  for _, key in ipairs(EXCLUSION_LIST_KEYS) do
     local prev = j and j[key] or nil
     local cur = opts.java[key]
     if prev and #prev > 0 then
@@ -228,7 +280,7 @@ function M.merge_lists(base, opts)
 end
 
 --- 合并用户配置到默认配置
---- 排除类列表 (exclude_jars/paths/globs) 按 java.exclude_merge 语义处理:
+--- 排除类列表 (exclude_jars/paths/globs/import_exclusions) 按 java.exclude_merge 语义处理:
 ---   append (默认) = 默认项 + 用户项拼接 (用户几乎总是想追加而非推翻默认
 ---     排除项; 旧的 tbl_deep_extend 列表整体替换语义曾导致默认桩排除被
 ---     用户列表静默挤掉)
@@ -242,7 +294,7 @@ function M.merge(user_opts)
 
   local j = M.defaults.java
   if merged.java and merged.java.exclude_merge == "append" then
-    for _, key in ipairs({ "exclude_jars", "exclude_paths", "exclude_globs" }) do
+    for _, key in ipairs(EXCLUSION_LIST_KEYS) do
       local user_list = user_opts.java and user_opts.java[key]
       local out = append_list(j[key], user_list)
       if out then

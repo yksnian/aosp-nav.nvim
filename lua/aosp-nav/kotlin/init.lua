@@ -10,6 +10,29 @@ local function get_cfg()
   return require("aosp-nav").config
 end
 
+--- 预测 nvim 给 KLS 选的工作区根 (与 lspconfig 的 root_markers 规则一致)
+--- @param fname string
+--- @param markers table
+--- @return string|nil
+local function predict_kls_root(fname, markers)
+  local target = (fname ~= "") and fname or vim.fn.getcwd()
+  local ok, r = pcall(vim.fs.root, target, markers)
+  if ok and type(r) == "string" and r ~= "" then return r end
+  return nil
+end
+
+--- 登记 "KLS 工作区根 -> AOSP 根" 映射, 变化时重生成 dispatch 脚本
+--- 分发表只是快路径: 脚本自身仍会从 $PWD 向上找 out/, 未登记的模块目录照常工作
+--- @param root string|nil KLS 的 workspace root
+--- @param fname string 触发文件 (用于反查 AOSP 根)
+--- @return table|nil extra 供 ensure_script 使用
+local function kls_root_extra(root, fname)
+  if type(root) ~= "string" or root == "" then return nil end
+  local aosp = require("aosp-nav.java.root").workspace_root(fname)
+  if not aosp then return nil end
+  return { root = root, aosp = aosp }
+end
+
 --- 注入 AOSP 特化配置到 lspconfig kotlin_language_server opts
 --- @param opts table lspconfig server opts
 --- @return table opts 修改后的 opts
@@ -52,7 +75,12 @@ function M.configure(opts)
   end
 
   -- 4. 生成/更新 classpath 脚本 (KLS 1.3.13 ShellClassPathResolver.global() 读取)
-  local path, err = require("aosp-nav.kotlin.classpath").ensure_script()
+  --    同时把本 buffer 的 "KLS 工作区根 -> AOSP 根" 登记进分发表: AOSP repo
+  --    checkout 里每个模块目录都有 .git, KLS 的 cwd 因此是模块目录而非 AOSP 根,
+  --    分发表让它直接命中正确的 AOSP 根 (脚本自身向上找 out/ 也能兜住没登记的)
+  local buf = vim.api.nvim_buf_get_name(0)
+  local path, err = require("aosp-nav.kotlin.classpath").ensure_script(
+    kls_root_extra(predict_kls_root(buf, opts.root_markers), buf))
   if not path then
     vim.notify("[aosp-nav] kls-classpath generate failed: " .. (err or "unknown"), vim.log.levels.WARN)
   end
@@ -84,6 +112,22 @@ function M.configure(opts)
         local client = vim.lsp.get_client_by_id(args.data.client_id)
         if client and client.name == "kotlin_language_server" then
           proc.mark_session_active()
+          -- 权威根 (client 实际用的 workspace root) 登记 + 刷新脚本:
+          -- 覆盖 configure 期预测失败/被用户 root_dir 改写的情况; 本次 KLS 已
+          -- 解析过 classpath, 生效于下次启动或 :LspRestart
+          local fname = vim.api.nvim_buf_get_name(args.buf)
+          local rd = client.config and client.config.root_dir or client.root_dir
+          local extra = kls_root_extra(rd, fname)
+          if extra then
+            local kc = require("aosp-nav.kotlin.classpath")
+            if kc.register_root(extra.root, extra.aosp) then
+              local p, e = kc.ensure_script()
+              if not p then
+                vim.notify("[aosp-nav] kls-classpath regenerate failed: " .. (e or "unknown"),
+                  vim.log.levels.WARN)
+              end
+            end
+          end
         end
       end,
     })
@@ -123,7 +167,10 @@ function M.preview_classpath(mode)
     cfg.kotlin.jar_mode = mode
   end
   local classpath = require("aosp-nav.kotlin.classpath")
-  local path, err = classpath.ensure_script()
+  -- 顺带登记 cwd: 手动预览通常就在目标工作区里跑
+  local cwd = vim.fn.getcwd()
+  local path, err = classpath.ensure_script(
+    kls_root_extra(cwd, vim.api.nvim_buf_get_name(0)))
   if not path then
     vim.notify("[aosp-nav] generate failed: " .. (err or "unknown"), vim.log.levels.ERROR)
     return

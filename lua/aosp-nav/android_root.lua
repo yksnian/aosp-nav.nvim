@@ -25,8 +25,14 @@ end
 
 --- 根据当前打开文件路径, 识别它所属的 android 源码根目录
 --- @param fname string 当前文件路径
+--- @param opts table|nil { sibling = false } 关闭兄弟子项目回退 (见下)
 --- @return string|nil android_root 路径, nil 表示未找到
-function M.find_android_platform_root(fname)
+function M.find_android_platform_root(fname, opts)
+  -- sibling = false: 只认文件真实祖先里带 out/ (或 main.mk / .repo) 的那一层,
+  -- 不再回退到兄弟子项目。取 jar 时兄弟回退是对的 (厂商目录自身不编译, jar
+  -- 在兄弟项目里), 但当"工作区根"用就错了 —— 会把 jdtls 的 workspace 指到
+  -- 一个根本不含当前文件的树。java/root.lua 走这个分支。
+  local allow_sibling = not (opts and opts.sibling == false)
   local path = fname and vim.fs.dirname(fname) or vim.fn.getcwd()
 
   -- fallback 候选, 越靠后越弱
@@ -54,7 +60,7 @@ function M.find_android_platform_root(fname)
   -- 走到顶层都没找到带 out 的根 (典型: 在 AOSP同级的目录下由ODM或者厂商拓展的代码目录下打开 , 自身无 out)
   -- 在最近的顶层根下, 按优先级查找兄弟子项目
   local top = fallback_mk or fallback_repo
-  if top then
+  if top and allow_sibling then
     for _, sub in ipairs(sibling_project_order) do
       local cand = top .. "/" .. sub
       if M.has_jar_source(cand) then

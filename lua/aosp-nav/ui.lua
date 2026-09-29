@@ -1,0 +1,320 @@
+-- ui.lua: 状态反馈 / 诊断 / 重扫 / 清理 jdtls 工作区
+--
+-- 对应 VSCode 版的 status.ts + commands/{diagnostics,rescan}.ts +
+-- eclipseGuard 的 cleanAndReload。纯展示层: 只读 state.lua 与各模块状态,
+-- 不改配置; 唯一的写操作是 :AospCleanWorkspace 删 jdtls workspace 目录。
+
+local M = {}
+
+--- 获取当前配置
+local function get_cfg()
+  return require("aosp-nav").config
+end
+
+--- 当前 buffer 对应的 AOSP 检测根 (jar 语义, 允许兄弟子项目回退)
+--- @return string|nil
+local function jar_root()
+  local cfg = get_cfg()
+  if cfg.android_root and cfg.android_root ~= "" then
+    return (vim.fn.fnamemodify(cfg.android_root, ":p"):gsub("/+$", ""))
+  end
+  return require("aosp-nav.android_root").find_android_platform_root(vim.api.nvim_buf_get_name(0))
+end
+
+--- 结构化状态 (供 lualine/heirline 等调用)
+--- @return table
+function M.status()
+  local st = require("aosp-nav.state").get()
+  return {
+    phase = st.phase,
+    root = st.root,
+    android_root = st.android_root,
+    jars = st.jars,
+    cache_origin = st.cache_origin,
+    blockers = st.blocked,
+    jdtls_clients = #vim.lsp.get_clients({ name = "jdtls" }),
+  }
+end
+
+--- 状态行片段 (纯函数, 无副作用)。非 AOSP 场景返回空串, 可直接常驻 statusline。
+--- @return string
+function M.statusline()
+  local s = M.status()
+  if s.phase == "idle" and not s.root then return "" end
+  local n = s.jars > 0 and (":" .. s.jars) or ""
+  if s.blockers > 0 then
+    return " AOSP" .. n .. "(!" .. s.blockers .. ")"
+  end
+  if s.phase == "ready" then return " AOSP" .. n end
+  if s.phase == "indexing" then return " AOSP" .. n .. "(idx)" end
+  if s.phase == "scanning" then return " AOSP(scan)" end
+  if s.phase == "no-out" then return " AOSP(no out)" end
+  if s.phase == "failed" then return " AOSP(err)" end
+  return " AOSP" .. n
+end
+
+--- :AospStatus — 人读汇总
+function M.show_status()
+  local s = M.status()
+  local lines = {
+    ("phase   : %s"):format(s.phase),
+    ("workspace: %s"):format(s.root or "<none>"),
+    ("aosp root: %s"):format(s.android_root or "<none>"),
+    ("jars     : %d (origin=%s)"):format(s.jars, tostring(s.cache_origin)),
+    ("blockers : %d"):format(s.blockers),
+    ("jdtls    : %d client(s)"):format(s.jdtls_clients),
+  }
+  vim.notify("[aosp-nav]\n" .. table.concat(lines, "\n"), vim.log.levels.INFO, { timeout = 8000 })
+end
+
+--- 插件版本 (git 短哈希; 拿不到就返回 "unknown")
+--- @return string
+local function plugin_version()
+  local path = vim.api.nvim_get_runtime_file("lua/aosp-nav/init.lua", false)[1]
+  if not path then return "unknown" end
+  local dir = vim.fn.fnamemodify(path, ":h:h:h")
+  local out = vim.fn.systemlist({ "git", "-C", dir, "rev-parse", "--short", "HEAD" })
+  if vim.v.shell_error ~= 0 or not out[1] or out[1] == "" then return "unknown" end
+  return out[1]
+end
+
+--- 检查项: 一条诊断行
+--- @param name string
+--- @param value string
+--- @param ok boolean|nil nil = 灰色/仅信息
+--- @param action string|nil
+--- @return table
+local function line(name, value, ok, action)
+  return { name = name, value = value, ok = ok, action = action }
+end
+
+--- action 只在检查项不通过时显示。
+--- 注意不能写 `ok and nil or msg` —— Lua 里该式恒等于 msg (nil 为假时会走 or 分支)
+--- @param ok boolean|nil
+--- @param msg string
+--- @return string|nil
+local function action_if(ok, msg)
+  if ok then return nil end
+  return msg
+end
+
+--- 收集全部诊断项
+--- @return table lines
+function M.diagnose()
+  local cfg = get_cfg()
+  local st = require("aosp-nav.state").get()
+  local lines = {}
+
+  table.insert(lines, line("plugin", "aosp-nav.nvim " .. plugin_version(), true))
+
+  -- jdtls client
+  local clients = vim.lsp.get_clients({ name = "jdtls" })
+  if #clients == 0 then
+    lines[#lines + 1] = line("jdtls", "not attached", false, "open a .java file in the AOSP tree")
+  else
+    local c = clients[1]
+    local rd = c.root_dir
+    if not rd or rd == "" then rd = c.config and c.config.root_dir end
+    lines[#lines + 1] = line("jdtls",
+      ("%d client(s), root=%s, id=%d"):format(#clients, tostring(rd), c.id), true)
+    -- vmargs (只读, 本插件从不写)
+    local cmd = type(c.config) == "table" and c.config.cmd or nil
+    local joined = type(cmd) == "table" and table.concat(cmd, " ") or ""
+    local has_xmx = joined:find("-Xmx", 1, true) ~= nil
+    lines[#lines + 1] = line("jdtls vmargs", has_xmx and "has -Xmx" or "no -Xmx (AOSP 建议 >= 4G)",
+      has_xmx, action_if(has_xmx, "add --jvm-arg=-Xmx8G to the jdtls cmd"))
+    -- referencedLibraries / import 设置
+    local s = c.config and c.config.settings or {}
+    local rl = s.java and s.java.project and s.java.project.referencedLibraries
+    local n_rl = type(rl) == "table" and #rl or 0
+    lines[#lines + 1] = line("referencedLibraries", tostring(n_rl), n_rl > 0,
+      action_if(n_rl > 0, ":AospRescan"))
+    local sp = s.java and s.java.project and s.java.project.sourcePaths
+    lines[#lines + 1] = line("sourcePaths",
+      sp and ("injected (" .. #sp .. " entries)") or "not injected (jdt.ls 自行推断, 推荐)",
+      sp == nil, sp and "remove java.source_paths / source_paths_mode" or nil)
+    local imp = s.java and s.java.import
+    local ex_n = imp and imp.exclusions and #imp.exclusions or 0
+    lines[#lines + 1] = line("import.exclusions", tostring(ex_n), ex_n > 0)
+    local g = imp and imp.gradle and imp.gradle.enabled
+    local m = imp and imp.maven and imp.maven.enabled
+    lines[#lines + 1] = line("gradle/maven import",
+      ("gradle=%s maven=%s"):format(tostring(g), tostring(m)), g == false and m == false)
+  end
+
+  -- workspace root / 模式
+  local wr = require("aosp-nav.java.root").workspace_root(vim.api.nvim_buf_get_name(0))
+  lines[#lines + 1] = line("workspace root", wr or "<not an AOSP file>", wr ~= nil,
+    action_if(wr ~= nil, "aosp-nav only manages roots inside an AOSP tree"))
+
+  -- session state
+  lines[#lines + 1] = line("session", ("phase=%s jars=%d origin=%s"):format(
+    st.phase, st.jars, tostring(st.cache_origin)), st.phase == "ready" or st.phase == "indexing")
+
+  -- jar 缓存新鲜度
+  local jr = jar_root()
+  if jr then
+    local jm = require("aosp-nav.java.jars")
+    local stale = jm.cache_stale(jr)
+    lines[#lines + 1] = line("jar cache", stale and "stale (AOSP rebuilt)" or "fresh", not stale,
+      stale and ":AospRescan" or nil)
+    -- Eclipse 元数据 blockers
+    local cached = require("aosp-nav.java.import_exclusions").cached(jr)
+    local n_b = cached and #cached or 0
+    lines[#lines + 1] = line("eclipse blockers", tostring(n_b), true,
+      n_b > 0 and ":AospCleanWorkspace (若这些目录已被导入过)" or nil)
+    -- jdtls workspace 目录
+    local wd = M._workspace_dir()
+    local wd_ok = wd ~= nil and vim.fn.isdirectory(wd) == 1
+    lines[#lines + 1] = line("jdtls workspace", tostring(wd), wd_ok,
+      action_if(wd_ok, "will be created on next start"))
+  end
+
+  -- Kotlin
+  local k = cfg.kotlin
+  lines[#lines + 1] = line("kotlin",
+    "enabled=" .. tostring(k.enabled) .. " mode=" .. tostring(k.jar_mode), k.enabled)
+  if k.enabled then
+    local kc = require("aosp-nav.kotlin.classpath")
+    local owner, kpath = kc.probe()
+    local ok = owner == "nvim"
+    local hint = action_if(ok, owner == "none" and ":AospKlsClasspath (尚未生成)"
+      or ":AospKlsClasspath (脚本归属 " .. owner .. ", 非本插件)")
+    lines[#lines + 1] = line("kls classpath", owner .. " (" .. tostring(kpath) .. ")", ok, hint)
+    local n_kls = #vim.lsp.get_clients({ name = "kotlin_language_server" })
+    lines[#lines + 1] = line("kls client", n_kls .. " attached", true)
+  end
+
+  return lines
+end
+
+--- 渲染诊断行 (VSCode printDiagnostics 的等价物)
+--- @param lines table
+--- @return table string 行列表
+function M.render_diagnostics(lines)
+  local out = {
+    "aosp-nav diagnostics",
+    "generated: " .. os.date("%Y-%m-%d %H:%M:%S"),
+    "",
+  }
+  for _, l in ipairs(lines) do
+    local mark = l.ok == nil and "-" or (l.ok and "v" or "!")
+    out[#out + 1] = ("%s %-20s %s"):format(mark, l.name, l.value)
+    if l.action then
+      out[#out + 1] = ("    -> %s"):format(l.action)
+    end
+  end
+  return out
+end
+
+--- :AospDiagnostics — 输出到 scratch buffer
+function M.diagnostics()
+  local text = M.render_diagnostics(M.diagnose())
+  vim.cmd("botright new")
+  local buf = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, text)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].filetype = "aosp-nav-diagnostics"
+  vim.api.nvim_buf_set_name(buf, "aosp-nav://diagnostics")
+end
+
+--- jdtls workspace 目录 (从 client cmd 的 -data 取; 取不到按 LazyVim/nvim-jdtls
+--- 约定兜底 ~/.cache/nvim/jdtls/<project>/workspace)
+--- @return string|nil
+function M._workspace_dir()
+  for _, c in ipairs(vim.lsp.get_clients({ name = "jdtls" })) do
+    local cmd = type(c.config) == "table" and c.config.cmd or nil
+    if type(cmd) == "table" then
+      for i, a in ipairs(cmd) do
+        if a == "-data" and cmd[i + 1] then
+          return cmd[i + 1]
+        end
+      end
+    end
+  end
+  local root = require("aosp-nav.java.root").workspace_root(vim.api.nvim_buf_get_name(0))
+  if not root then return nil end
+  return vim.fn.stdpath("cache") .. "/jdtls/" .. vim.fn.fnamemodify(root, ":t") .. "/workspace"
+end
+
+--- :AospRescan — 清 jar 缓存并重扫 (替代手动 rm + 重启 nvim)
+function M.rescan()
+  local jm = require("aosp-nav.java.jars")
+  local root = jar_root()
+  if not root then
+    vim.notify("[aosp-nav] no AOSP root detected for current buffer", vim.log.levels.ERROR)
+    return
+  end
+  vim.notify("[aosp-nav] rescanning jars under " .. root .. " ...", vim.log.levels.INFO)
+  -- 只清内存; 文件缓存留着: 重扫失败时下次启动仍有旧列表可用
+  jm.reset_cache(root)
+  -- no_cache: 否则文件缓存还在, find_android_jars 会直接命中它, 等于没重扫
+  local jars = jm.find_android_jars({ no_cache = true })
+  if #jars == 0 then
+    vim.notify("[aosp-nav] rescan found no jars (is the tree built? out/ exists?)",
+      vim.log.levels.ERROR)
+    return
+  end
+  local bad = 0
+  for _, j in ipairs(jars) do
+    if vim.fn.filereadable(j) ~= 1 then bad = bad + 1 end
+  end
+  require("aosp-nav.state").set({
+    jars = #jars,
+    android_root = root,
+    cache_origin = "scan",
+  })
+  vim.notify(("[aosp-nav] rescan done: %d jars (%d missing on disk). "
+    .. "Run :LspRestart to apply to jdtls."):format(#jars, bad), vim.log.levels.INFO,
+    { timeout = 10000 })
+end
+
+--- :AospCleanWorkspace — 删除 jdtls workspace 目录 (等价 VSCode 的
+--- Clean && Reload / java.clean.workspace): import.exclusions 变更后、或残留
+--- .project/.classpath 已被导入过时, 必须重建 Eclipse workspace 才生效
+--- @param opts table|nil { force = boolean } 跳过确认
+function M.clean_workspace(opts)
+  opts = opts or {}
+  local dir = M._workspace_dir()
+  if not dir or dir == "" then
+    vim.notify("[aosp-nav] cannot determine the jdtls workspace dir", vim.log.levels.ERROR)
+    return
+  end
+  -- 只允许删 "jdtls 缓存根" 之下的路径, 防手滑
+  local cache_root = vim.fn.stdpath("cache") .. "/jdtls"
+  if dir:sub(1, #cache_root + 1) ~= cache_root .. "/" then
+    vim.notify("[aosp-nav] refusing to delete " .. dir .. " (outside " .. cache_root .. ")",
+      vim.log.levels.ERROR)
+    return
+  end
+  if vim.fn.isdirectory(dir) ~= 1 then
+    vim.notify("[aosp-nav] jdtls workspace not found: " .. dir, vim.log.levels.WARN)
+    return
+  end
+  if not opts.force then
+    local choice = vim.fn.confirm(
+      "Delete jdtls workspace?\n" .. dir
+      .. "\n\nEclipse will re-import all projects on next start (slow, 数十分钟)。",
+      "&Yes\n&No", 2)
+    if choice ~= 1 then return end
+  end
+
+  -- 先停客户端再删, 否则 jdtls 还在写这个目录
+  local clients = vim.lsp.get_clients({ name = "jdtls" })
+  for _, c in ipairs(clients) do
+    pcall(function() vim.lsp.stop_client(c.id, true) end)
+  end
+  vim.defer_fn(function()
+    local ok = vim.fn.delete(dir, "rf") == 0
+    if not ok then
+      vim.notify("[aosp-nav] failed to delete " .. dir, vim.log.levels.ERROR)
+      return
+    end
+    vim.notify(("[aosp-nav] jdtls workspace removed (%s). Reopen a .java file (:e) to re-import.")
+      :format(dir), vim.log.levels.INFO, { timeout = 10000 })
+  end, clients[1] and 800 or 0)
+end
+
+return M

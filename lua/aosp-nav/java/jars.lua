@@ -7,10 +7,21 @@ local M = {}
 local _jars_cache = nil       -- 缓存的 jar 列表
 local _jars_cache_root = nil  -- 缓存对应的 android_root
 local _jars_computed = false  -- 是否已计算过
+local _jars_origin = nil      -- "cache" | "soong" | "make" | "fallback"
 
 --- 获取当前配置 (setup 后有效, __index metatable 保证 setup 已调用)
 local function get_cfg()
   return require("aosp-nav").config
+end
+
+--- jar 文件缓存路径 (键规则与 import_exclusions 一致)
+--- @param root string android_root
+--- @return string|nil
+local function cache_file_for(root)
+  local cfg = get_cfg()
+  if not cfg.cache_dir or not root or root == "" then return nil end
+  local key = root:gsub("/", "-"):gsub("^-", "")
+  return cfg.cache_dir .. "/" .. key .. ".txt"
 end
 
 --- 按完整路径去重添加 jar
@@ -278,8 +289,9 @@ end
 --- 主入口: 收集 AOSP jar 列表
 --- 顺序: soong intermediates -> make JAVA_LIBRARIES -> fallback
 --- 支持内存缓存 + 文件缓存
+--- @param opts table|nil { no_cache = boolean } 跳过一次文件缓存读取 (:AospRescan 用)
 --- @return table jars jar 路径列表
-function M.find_android_jars()
+function M.find_android_jars(opts)
   local cfg = get_cfg()
   local java_cfg = cfg.java
   local android_root_mod = require("aosp-nav.android_root")
@@ -311,9 +323,8 @@ function M.find_android_jars()
                            --      + %-headers 桩家族排除 (默认值在 config.lua)
   local fhash = filters_hash(java_cfg)
   if cfg.cache_dir and android_root then
-    local cache_key = android_root:gsub("/", "-"):gsub("^-", "")
-    cache_file = cfg.cache_dir .. "/" .. cache_key .. ".txt"
-    if vim.fn.filereadable(cache_file) == 1 then
+    cache_file = cache_file_for(android_root)
+    if cache_file and not (opts and opts.no_cache) and vim.fn.filereadable(cache_file) == 1 then
       local lines = vim.fn.readfile(cache_file)
       -- version 与 filters 指纹都匹配才复用缓存:
       --   version  = 算法变更 (插件升级)
@@ -333,6 +344,7 @@ function M.find_android_jars()
           _jars_cache = jars
           _jars_cache_root = android_root
           _jars_computed = true
+          _jars_origin = "cache"  -- 缓存命中路径也要记来源 (状态/诊断读它)
           vim.notify("[aosp-nav] JAR loaded from cache (" .. #jars .. " jars)", vim.log.levels.INFO)
           return jars
         end
@@ -423,24 +435,65 @@ function M.find_android_jars()
   _jars_cache = jars
   _jars_cache_root = android_root
   _jars_computed = true
+  _jars_origin = from_cache and "cache" or (source_parts[1] or nil)
 
   return jars
 end
 
---- 清除内存缓存 (:AospCollectJars 收集后调用, 也可手动调用)
-function M.reset_cache()
+--- jar 缓存是否已陈旧 (AOSP 重新编译过)
+--- 判据: out/soong/build.ninja (每次构建都会重写) 或 make 时代 JAVA_LIBRARIES
+--- 目录的 mtime 比缓存文件新。只有一次 getftime, 可在启动路径上调用。
+--- @param root string|nil android_root (nil = 用当前内存缓存对应的 root)
+--- @return boolean
+function M.cache_stale(root)
+  local r = root or _jars_cache_root
+  if not r or r == "" then return false end
+  local f = cache_file_for(r)
+  if not f or vim.fn.filereadable(f) ~= 1 then return false end
+  local newest = 0
+  for _, marker in ipairs({
+    r .. "/out/soong/build.ninja",
+    r .. "/out/target/common/obj/JAVA_LIBRARIES",
+  }) do
+    local t = vim.fn.getftime(marker)
+    if t > newest then newest = t end
+  end
+  if newest == 0 then return false end
+  return newest > vim.fn.getftime(f)
+end
+
+--- 清除 jar 缓存 (默认只清内存态; 文件缓存留作下次启动的兜底)
+--- 调用方:
+---   :AospCollectJars — 只清内存 (fallback jar 变化不影响命中自身 out 的项目)
+---   :AospRescan     — 只清内存 + find_android_jars({ no_cache = true }), 重扫完
+---                     会把新结果写回文件; 重扫失败时旧文件仍在, 下次启动不至于裸奔
+--- @param root string|nil android_root (nil = 用当前内存缓存对应的 root)
+--- @param opts table|nil { delete_file = boolean } true 时连文件缓存一起删
+--- @return string|nil cache_file 被删除的缓存文件路径 (仅在 delete_file 时)
+function M.reset_cache(root, opts)
+  local r = root or _jars_cache_root
   _jars_cache = nil
   _jars_cache_root = nil
   _jars_computed = false
+  _jars_origin = nil
+  if not (opts and opts.delete_file) then return nil end
+  local f = r and cache_file_for(r)
+  if f and vim.fn.filereadable(f) == 1 then
+    vim.fn.delete(f)
+    return f
+  end
+  return nil
 end
 
---- 获取当前缓存状态 (供诊断)
---- @return table {computed, root, count}
+--- 获取当前缓存状态 (供诊断/状态反馈)
+--- @return table {computed, root, count, origin, stale}
 function M.cache_status()
   return {
     computed = _jars_computed,
     root = _jars_cache_root,
     count = _jars_cache and #_jars_cache or 0,
+    origin = _jars_origin,
+    stale = M.cache_stale(),
   }
 end
 
