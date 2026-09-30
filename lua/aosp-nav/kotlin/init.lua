@@ -28,7 +28,9 @@ end
 --- @return table|nil extra 供 ensure_script 使用
 local function kls_root_extra(root, fname)
   if type(root) ~= "string" or root == "" then return nil end
-  local aosp = require("aosp-nav.java.root").workspace_root(fname)
+  -- 用 aosp_root 而非 workspace_root: 后者在 java.workspace_mode="project" 下为
+  -- nil, 而这里的映射要的是 AOSP 根 (KLS 的 workspace root 可能是模块目录)
+  local aosp = require("aosp-nav.java.root").aosp_root(fname)
   if not aosp then return nil end
   return { root = root, aosp = aosp }
 end

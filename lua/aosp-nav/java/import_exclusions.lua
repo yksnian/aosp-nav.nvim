@@ -135,6 +135,28 @@ function M.invalidate(root)
   vim.fn.delete(cache_path(root))
 end
 
+-- [v8] 冷缓存补齐 (本会话每 root 只做一次)。
+-- 首次在某棵树上运行时排除项缓存还不存在, 而 jdt.ls 的工程导入在 initialize
+-- 期就开始了 —— 等后台扫描回来已经晚了: 树里遗留的 .project/.classpath 目录
+-- 已被当成可见工程导入, 而 AOSP 根下只要存在可见工程,
+-- InvisibleProjectImporter.loadInvisibleProject 的第一道闸
+-- (ProjectUtils.getVisibleProjects(rootPath).isEmpty()) 就直接失败, 之后整个
+-- AOSP 根再也建不出 invisible project, 所有跳转落进 jdt.ls-java-project 假工程
+-- (且不可逆 —— 只有换一个 workspace 才会重新尝试)。
+-- 实测本机整棵树 (maxdepth 6, 跳过 out/.repo/.git) 扫描是毫秒级
+-- (fd 44ms / find 14ms), 所以冷缓存时同步扫一次即可, 之后走缓存 + TTL 后台刷新。
+local _cold_done = {}
+
+--- 缓存缺失时同步扫描一次并落盘 (幂等, 每 root 每会话最多扫一次)
+--- @param root string 扫描基准目录 (jdtls root_dir)
+function M.ensure_cached(root)
+  if not root or root == "" or _cold_done[root] then return end
+  _cold_done[root] = true
+  if M.cached(root) ~= nil then return end
+  -- 空结果也要落盘 (cached() 返回空表而非 nil): 否则每次开 java 文件都重扫
+  M.save(root, M.scan_sync(root))
+end
+
 --- 组装最终注入给 jdt.ls 的 java.import.exclusions
 --- 顺序: 静态默认 -> 缓存命中的残留目录 -> 用户 import_exclusions
 --- (jdt.ls 按序匹配且支持 "!" 反向放行, 用户条目必须靠后);
@@ -162,6 +184,7 @@ function M.effective(java_cfg, root)
 
   add(M.DEFAULT_PATTERNS)
   if root and root ~= "" then
+    M.ensure_cached(root)
     add(M.cached(root))
   end
   add(user)

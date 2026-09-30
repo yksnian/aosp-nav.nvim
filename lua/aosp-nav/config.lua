@@ -85,34 +85,57 @@ M.defaults = {
     import_exclusions_enabled = true,
     import_exclusions_scan = true,
     import_exclusions_ttl = 604800,
-    -- [v7] 源码根 (java.project.sourcePaths) 注入策略。
-    --   "infer" (默认) = 不注入这个 key, 让 jdt.ls 自己推断。
-    --     jdt.ls 的 BaseDocumentLifeCycleHandler.inferInvisibleProjectSourceRoot
-    --     在 Preferences.getInvisibleProjectSourcePaths() == null 时才按打开
-    --     文件的 package 声明反推 source root (触发条件 =
-    --     PackageIsNotExpectedPackage / PublicClassMustMatchFileName 问题)。
-    --     一旦注入本 key — 哪怕是空数组, Preferences.createFrom 也会把它写成
-    --     非 null 列表 — 该推断会被整体关闭, 跨模块跳转只能落到反编译 jar。
-    --     VSCode 版从不设置本 key, 这正是它跨模块跳转体验更好的原因之一。
-    --   "scan" = 注入 java/source_paths.lua 手工扫出的浅层源码根列表
-    --     (小模块根 / 离线场景可用, AOSP 根下覆盖不全)。需要时优先直接给
-    --     source_paths 列表, 而非切到 scan。
-    source_paths_mode = "infer",
+    -- [v8] jdtls 工作区根:
+    --   "aosp" (默认) = AOSP 根, 整棵树共用一个索引, 跨模块跳转落到真实 .java
+    --     (代价: 首次索引重, 见 DEVELOPMENT.md 的实测数据)
+    --   "project" = 按项目 (.git/.project 就近) 开工作区 —— 本插件接管之前的
+    --     行为, 索引小启动快, 但跨模块跳转只能落到反编译 jar
+    workspace_mode = "aosp",
+    -- [v8] 源码根 (java.project.sourcePaths) 注入策略:
+    --   "core" (默认) = 预置核心集在导入期注入, 之后按打开文件所属项目
+    --     (.git 边界) 增量累积。跳转落到可编辑的真实 .java。
+    --   "infer" = 完全不注入这个 key, 让 jdt.ls 自己按打开文件的 package 逐文件
+    --     推断源码根。行为与本插件早期版本一致: 跨模块跳转落到反编译 jar。
+    --   "project" = 由 workspace_mode="project" 自动选定, 同样不注入。
+    -- 注意 (机制, 见 DEVELOPMENT.md): 注入这个 key 会**整体关闭** jdt.ls 的逐文件
+    -- 推断 (BaseDocumentLifeCycleHandler.inferInvisibleProjectSourceRoot 在
+    -- getInvisibleProjectSourcePaths() != null 时直接 return), 所以注入的列表
+    -- 必须自己维护完整, 且**空列表绝不注入** —— 那会关掉推断又没有替代。
+    source_paths_mode = "core",
+    -- [v8] 预置核心集 (相对 AOSP 根)。这些是几乎每个 AOSP 会话都要读的根,
+    -- 在 jdt.ls 导入期就位, 不必等用户逐个打开文件才累积上来。
+    -- 语义 = 整表替换 (同 kotlin.curated_modules): 想增减请把默认两条一起写上。
+    -- 条目在磁盘上不存在时自动跳过 (不同 AOSP 版本目录布局有差异)。
+    -- 给得越多首次索引越重 —— 实测 frameworks/base/core/java (4638 文件) 让
+    -- 首次索引从 154s/2.1G 变为 183s/5.0G, 建议只放最常跳转的目标。
+    core_source_roots = {
+      "frameworks/base/core/java",          -- android.* (framework.jar)
+      "frameworks/base/services/core/java", -- com.android.server.* (services.jar)
+    },
+    -- [v8] 累积的 .git 项目数上限 (LRU 淘汰; 0 = 不限)。每个项目会把它的源码根
+    -- 并进注入列表, 无上限时开得越多索引内存越高 (实测每个根都进 Eclipse 工程模型)。
+    source_paths_max_projects = 8,
+    -- [v8] 源码根剪枝: Lua 模式列表 (同 exclude_globs 语义), 匹配**项目内相对
+    -- 路径**的根会被整根剔掉, 例如 { "^external/cronet/" }。
+    -- 其余剪枝规则 (测试根 / JDK 影子根 / 同名影子根) 是算法的一部分, 不可配。
+    source_root_exclude = {},
     -- [v7] DEPRECATED / 已失效: 工作区根现在恒等于 AOSP 根 (java/root.lua), 而
     -- 自排除的判定基准是"root_dir 相对 android_root 的差值", 两者恒等 → 恒为
     -- 空 → 永远匹配不到任何 jar, 该开关不再产生任何效果。
     -- 需要剔除某模块的 jar 请用 exclude_jars / exclude_globs。
     -- 保留此键只为不静默吞掉老配置, 设置后会在启动时提示一次。
     exclude_self_jars = false,
-    -- 显式源码根列表 (相对 workspace root 或绝对路径); 非空时优先于上面两项
-    -- 例如: source_paths = { "frameworks/base/core/java", "frameworks/base/services/core/java" }
+    -- 显式源码根列表 (相对 AOSP 根或绝对路径)。非空时**完全接管**注入列表,
+    -- 不再使用 core_source_roots / 项目累积 —— 想手工钉死一份列表时用它:
+    --   source_paths = { "frameworks/base/core/java", "libcore/ojluni/src/main/java" }
     -- source_paths = {},
     -- Make 构建系统 jar 优先级 (Android 14 及更早)
     make_jar_priority = { "classes.jar", "classes-header.jar", "javalib.jar" },
     -- Make 构建排除的 intermediates 目录名
     make_blacklist = { "android_stubs_current_intermediates" },
-    -- 源码根目录扫描模式 (用于 find_source_paths)
-    source_patterns = { "src", "java", "src/main/java" },
+    -- [v8] DEPRECATED / 已失效: 浅层 source root 扫描 (旧 java/source_paths.lua)
+    -- 已删除, 本键不再有任何效果 (设置时提示一次)。
+    -- 要注入源码根请用上面的 core_source_roots / source_paths。
     -- 禁用 foldingRange (jdtls FoldingRangeHandler 在某些 token 上抛 NegativeArraySizeException)
     disable_folding_range = true,
     -- 禁用 Gradle/Maven 导入 (AOSP 非构建系统项目, 且无网工作站避免下载 checksums)
@@ -167,6 +190,85 @@ M.defaults = {
   },
 }
 
+-- [v8] 合法值与历史别名。别名静默归一 (提示一次) 而不是报错中断 setup:
+--   scan   = 早期版本的浅层扫描模式 (java/source_paths.lua, 已删除)
+--   shallow / attach / full = 未发布的实验模式, 一律落到 core
+local WORKSPACE_MODES = { aosp = true, project = true }
+local SOURCE_PATHS_MODES = { core = true, infer = true, project = true }
+local SOURCE_PATHS_ALIASES = {
+  scan = "core", shallow = "core", attach = "core", full = "core",
+}
+
+-- 已提示过的模式归一 (避免每次 setup 重复打扰)
+local _mode_warned = {}
+
+--- 提示一次
+--- @param key string
+--- @param msg string
+local function warn_once(key, msg)
+  if _mode_warned[key] then return end
+  _mode_warned[key] = true
+  vim.notify("[aosp-nav] " .. msg, vim.log.levels.WARN)
+end
+
+--- [v8] 模式字段归一 (就地修改 cfg.java)。见 M.validate 里的调用说明。
+--- @param java_cfg table
+local function normalize_modes(java_cfg)
+  -- workspace_mode
+  local wm = java_cfg.workspace_mode
+  if wm ~= nil and not WORKSPACE_MODES[wm] then
+    warn_once("workspace_mode:" .. tostring(wm),
+      ("java.workspace_mode = %q 不是合法值, 已回落为 'aosp' (可选: 'aosp' | 'project')")
+        :format(tostring(wm)))
+    java_cfg.workspace_mode = "aosp"
+  end
+  if java_cfg.workspace_mode == nil then
+    java_cfg.workspace_mode = "aosp"
+  end
+
+  -- source_paths_mode
+  local sm = java_cfg.source_paths_mode
+  if sm ~= nil and SOURCE_PATHS_ALIASES[sm] then
+    warn_once("sp_alias:" .. tostring(sm),
+      ("java.source_paths_mode = %q 是已废弃的写法, 已按 'core' 处理")
+        :format(tostring(sm)))
+    sm = SOURCE_PATHS_ALIASES[sm]
+  end
+  if sm ~= nil and not SOURCE_PATHS_MODES[sm] then
+    warn_once("sp_mode:" .. tostring(sm),
+      ("java.source_paths_mode = %q 不是合法值, 已回落为 'core' (可选: 'core' | 'infer')")
+        :format(tostring(sm)))
+    sm = "core"
+  end
+  java_cfg.source_paths_mode = sm or "core"
+
+  -- workspace_mode = "project" 与 sourcePaths 注入互斥: 那个模式下每个项目
+  -- 自成工作区, 注入列表反而会把所有项目拖进同一个 Eclipse 工程
+  if java_cfg.workspace_mode == "project" and java_cfg.source_paths_mode ~= "project" then
+    if java_cfg.source_paths_mode ~= "infer" then
+      warn_once("project_mode",
+        "java.workspace_mode = 'project' 时 sourcePaths 注入被关闭 "
+        .. "(source_paths_mode 视为 'project')")
+    end
+    java_cfg.source_paths_mode = "project"
+  end
+
+  -- 已删除的键
+  if java_cfg.source_patterns ~= nil then
+    warn_once("source_patterns",
+      "java.source_patterns 已废弃 (浅层扫描实现已删除), 本键不再有任何效果; "
+      .. "请改用 java.core_source_roots / java.source_paths")
+  end
+
+  -- 数值字段
+  local mx = java_cfg.source_paths_max_projects
+  if mx ~= nil and (type(mx) ~= "number" or mx < 0) then
+    warn_once("max_projects:" .. tostring(mx),
+      ("java.source_paths_max_projects = %s 不是非负数字, 已回落为 8"):format(tostring(mx)))
+    java_cfg.source_paths_max_projects = 8
+  end
+end
+
 --- 校验配置
 --- @param cfg table 合并后的配置
 --- @return boolean ok
@@ -194,10 +296,12 @@ function M.validate(cfg)
     return false, "java.exclude_merge must be 'append' or 'replace'"
   end
 
-  -- [v7] source_paths_mode 合法值
-  if cfg.java and cfg.java.source_paths_mode
-      and cfg.java.source_paths_mode ~= "infer" and cfg.java.source_paths_mode ~= "scan" then
-    return false, "java.source_paths_mode must be 'infer' or 'scan'"
+  -- [v8] 模式归一。
+  -- 校验**绝不返回 false 中断 setup** —— init.lua 的 setup 遇 false 会直接放弃
+  -- 整个插件 (连 jar 收集都不做), 一个写错的枚举值不该有这个后果。
+  -- 策略: 认识的别名静默归一 (提示一次), 不认识的值回落到默认值并提示。
+  if cfg.java then
+    normalize_modes(cfg.java)
   end
 
   -- [v7] import_exclusions_ttl 必须是数字 (秒)

@@ -289,14 +289,18 @@ end
 --- 主入口: 收集 AOSP jar 列表
 --- 顺序: soong intermediates -> make JAVA_LIBRARIES -> fallback
 --- 支持内存缓存 + 文件缓存
---- @param opts table|nil { no_cache = boolean } 跳过一次文件缓存读取 (:AospRescan 用)
+--- @param opts table|nil { no_cache = boolean, fname = string }
+---   no_cache: 跳过一次文件缓存读取 (:AospRescan 用)
+---   fname:    推断 AOSP 根的基准文件。调用方 (java/init.lua configure) 必须传 ——
+---             buf 0 在 LazyVim 的 ft=java 求值时机里未必是 java 文件, 而 jar 列表
+---             与 sourcePaths/exclusions 必须以同一个 AOSP 根为准
 --- @return table jars jar 路径列表
 function M.find_android_jars(opts)
   local cfg = get_cfg()
   local java_cfg = cfg.java
   local android_root_mod = require("aosp-nav.android_root")
 
-  local bufname = vim.api.nvim_buf_get_name(0)
+  local bufname = (opts and opts.fname) or vim.api.nvim_buf_get_name(0)
   local android_root = cfg.android_root or android_root_mod.find_android_platform_root(bufname)
 
   -- 非 android 项目: 返回空 (不加载任何 android jar, 仅用 JDK 基础库)
