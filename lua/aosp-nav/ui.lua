@@ -33,6 +33,10 @@ function M.status()
     cache_origin = st.cache_origin,
     blockers = st.blocked,
     jdtls_clients = #vim.lsp.get_clients({ name = "jdtls" }),
+    source_paths_mode = st.source_paths_mode,
+    source_roots = st.source_roots,
+    source_projects = st.source_projects,
+    workspace_mode = st.workspace_mode,
   }
 end
 
@@ -61,6 +65,8 @@ function M.show_status()
     ("workspace: %s"):format(s.root or "<none>"),
     ("aosp root: %s"):format(s.android_root or "<none>"),
     ("jars     : %d (origin=%s)"):format(s.jars, tostring(s.cache_origin)),
+    ("sources  : %d entry(ies), mode=%s, %d project(s)"):format(
+      s.source_roots, tostring(s.source_paths_mode), s.source_projects),
     ("blockers : %d"):format(s.blockers),
     ("jdtls    : %d client(s)"):format(s.jdtls_clients),
   }
@@ -129,10 +135,21 @@ function M.diagnose()
     local n_rl = type(rl) == "table" and #rl or 0
     lines[#lines + 1] = line("referencedLibraries", tostring(n_rl), n_rl > 0,
       action_if(n_rl > 0, ":AospRescan"))
+    -- sourcePaths: 按模式给不同的判据 —— core 模式下"未注入"是故障 (推断被
+    -- 关掉又没有替代), infer/project 模式下"未注入"才是预期
     local sp = s.java and s.java.project and s.java.project.sourcePaths
-    lines[#lines + 1] = line("sourcePaths",
-      sp and ("injected (" .. #sp .. " entries)") or "not injected (jdt.ls 自行推断, 推荐)",
-      sp == nil, sp and "remove java.source_paths / source_paths_mode" or nil)
+    local sp_n = type(sp) == "table" and #sp or 0
+    local mode = st.source_paths_mode or (cfg.java and cfg.java.source_paths_mode)
+    if mode == "core" then
+      lines[#lines + 1] = line("sourcePaths",
+        sp_n > 0 and ("injected (%d entries)"):format(sp_n) or "NOT injected (core mode!)",
+        sp_n > 0, action_if(sp_n > 0, "check java.core_source_roots / open a .java file"))
+    else
+      lines[#lines + 1] = line("sourcePaths",
+        sp_n > 0 and ("injected (%d entries)"):format(sp_n)
+          or ("not injected (jdt.ls 自行推断, mode=" .. tostring(mode) .. ")"),
+        sp_n == 0, sp_n > 0 and ("mode=" .. tostring(mode)) or nil)
+    end
     local imp = s.java and s.java.import
     local ex_n = imp and imp.exclusions and #imp.exclusions or 0
     lines[#lines + 1] = line("import.exclusions", tostring(ex_n), ex_n > 0)
@@ -143,9 +160,27 @@ function M.diagnose()
   end
 
   -- workspace root / 模式
-  local wr = require("aosp-nav.java.root").workspace_root(vim.api.nvim_buf_get_name(0))
-  lines[#lines + 1] = line("workspace root", wr or "<not an AOSP file>", wr ~= nil,
-    action_if(wr ~= nil, "aosp-nav only manages roots inside an AOSP tree"))
+  local root_mod = require("aosp-nav.java.root")
+  local bufname = vim.api.nvim_buf_get_name(0)
+  local aosp_r = root_mod.aosp_root(bufname)
+  local wm = cfg.java and cfg.java.workspace_mode or "aosp"
+  local wr = root_mod.workspace_root(bufname) or aosp_r
+  lines[#lines + 1] = line("aosp root", aosp_r or "<not an AOSP file>", aosp_r ~= nil,
+    action_if(aosp_r ~= nil, "aosp-nav only manages roots inside an AOSP tree"))
+  lines[#lines + 1] = line("workspace root", ("%s (mode=%s)"):format(wr or "<none>", wm),
+    wr ~= nil)
+
+  -- 累积的项目 (core 模式)
+  if st.source_paths_mode == "core" then
+    local si = require("aosp-nav.java.source_inject").state()
+    lines[#lines + 1] = line("source projects",
+      ("core=%d projects=%d installed=%d pending=%d"):format(si.core, #si.projects,
+        si.installed, si.pending),
+      true,
+      -- 只 :LspRestart 不够: invisible project 已存在时新 sourcePaths 会被闸门挡掉
+      si.pending > 0 and ":AospCleanWorkspace (rebuild the jdtls workspace) to apply"
+        or (#si.projects == 0 and "open more .java files to accumulate" or nil))
+  end
 
   -- session state
   lines[#lines + 1] = line("session", ("phase=%s jars=%d origin=%s"):format(
@@ -234,7 +269,9 @@ function M._workspace_dir()
       end
     end
   end
-  local root = require("aosp-nav.java.root").workspace_root(vim.api.nvim_buf_get_name(0))
+  local rm = require("aosp-nav.java.root")
+  local bufname = vim.api.nvim_buf_get_name(0)
+  local root = rm.workspace_root(bufname) or rm.aosp_root(bufname)
   if not root then return nil end
   return vim.fn.stdpath("cache") .. "/jdtls/" .. vim.fn.fnamemodify(root, ":t") .. "/workspace"
 end
@@ -248,6 +285,18 @@ function M.rescan()
     return
   end
   vim.notify("[aosp-nav] rescanning jars under " .. root .. " ...", vim.log.levels.INFO)
+
+  -- core 模式的源码根: 清掉累积的项目与其磁盘缓存, 下次打开文件重新扫。
+  -- AOSP 根自身的缓存也要清 —— 旧版本把整棵树的源码根缓存在那里。
+  local si = require("aosp-nav.java.source_inject")
+  local sr = require("aosp-nav.java.source_roots")
+  local n_src = 0
+  for _, p in ipairs(si.state().projects) do
+    if sr.reset(p.path, { delete_file = true }) then n_src = n_src + 1 end
+  end
+  if sr.reset(root, { delete_file = true }) then n_src = n_src + 1 end
+  si.reset()
+
   -- 只清内存; 文件缓存留着: 重扫失败时下次启动仍有旧列表可用
   jm.reset_cache(root)
   -- no_cache: 否则文件缓存还在, find_android_jars 会直接命中它, 等于没重扫
@@ -266,9 +315,76 @@ function M.rescan()
     android_root = root,
     cache_origin = "scan",
   })
-  vim.notify(("[aosp-nav] rescan done: %d jars (%d missing on disk). "
-    .. "Run :LspRestart to apply to jdtls."):format(#jars, bad), vim.log.levels.INFO,
-    { timeout = 10000 })
+  vim.notify(("[aosp-nav] rescan done: %d jars (%d missing on disk), "
+    .. "%d source-root cache(s) dropped. Run :LspRestart to apply to jdtls.")
+    :format(#jars, bad, n_src), vim.log.levels.INFO, { timeout = 10000 })
+end
+
+--- :AospSourceRoots — 列出核心集与已累积的项目 (scratch buffer)
+--- core 模式下"跳转为什么落到 jar / 为什么落到这个实现"基本都在这张表里
+function M.show_source_roots()
+  local cfg = get_cfg()
+  local si = require("aosp-nav.java.source_inject")
+  local st = si.state()
+  local out = {
+    "aosp-nav source roots",
+    "generated : " .. os.date("%Y-%m-%d %H:%M:%S"),
+    ("mode      : %s (workspace_mode=%s, max_projects=%d)"):format(
+      tostring(cfg.java.source_paths_mode), tostring(cfg.java.workspace_mode),
+      cfg.java.source_paths_max_projects or 0),
+    ("aosp root : %s"):format(st.aosp_root or "<none>"),
+    ("installed : %d entry(ies) in the jdtls initialize payload"):format(st.installed),
+    st.pending > 0
+        and ("pending   : %d entry(ies) accumulated; apply with :AospCleanWorkspace "
+          .. "(a plain :LspRestart is silently ignored once the project exists)"):format(st.pending)
+      or "pending   : 0",
+    "",
+    "core source roots (java.core_source_roots):",
+  }
+  local core = cfg.java.core_source_roots or {}
+  if #core == 0 then
+    out[#out + 1] = "  (empty)"
+  end
+  for _, rel in ipairs(core) do
+    local abs = st.aosp_root and (st.aosp_root .. "/" .. rel) or rel
+    out[#out + 1] = ("  [%s] %s"):format(vim.fn.isdirectory(abs) == 1 and "x" or " ", rel)
+  end
+
+  out[#out + 1] = ""
+  out[#out + 1] = ("accumulated projects (%d, LRU order):"):format(#st.projects)
+  if #st.projects == 0 then
+    out[#out + 1] = "  (none yet — open a .java file inside a project)"
+  end
+  local aosp = st.aosp_root or ""
+  for _, p in ipairs(st.projects) do
+    out[#out + 1] = ("  %s  (%d root(s))"):format(p.rel, p.roots)
+    for _, abs in ipairs(p.list) do
+      local rel = abs:sub(1, #aosp + 1) == aosp .. "/" and abs:sub(#aosp + 2) or abs
+      out[#out + 1] = "      " .. rel
+    end
+  end
+
+  out[#out + 1] = ""
+  out[#out + 1] = "caches (<cache_dir>):"
+  local sr = require("aosp-nav.java.source_roots")
+  local function cache_line(label, root)
+    local f = root and sr.cache_file(root)
+    local ok = f and vim.fn.filereadable(f) == 1
+    out[#out + 1] = ("  %-40s %s"):format(label, ok and f or "(none)")
+  end
+  cache_line("core@aosp-root", st.aosp_root)
+  for _, p in ipairs(st.projects) do
+    cache_line(p.rel, p.path)
+  end
+
+  vim.cmd("botright new")
+  local buf = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, out)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].filetype = "aosp-nav-source-roots"
+  vim.api.nvim_buf_set_name(buf, "aosp-nav://source-roots")
 end
 
 --- :AospCleanWorkspace — 删除 jdtls workspace 目录 (等价 VSCode 的

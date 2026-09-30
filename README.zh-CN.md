@@ -28,10 +28,10 @@ Android cpp代码演示。![cpp_demo](https://github.com/user-attachments/assets
 ## 功能
 
 - **android_root 自动检测**: 支持多子项目结构
-- **工作区根 = AOSP 根**: 整棵源码树共用一个 jdtls 索引 (与 VSCode 版一致), 跨模块跳转不需要任何手工标记, 详见 [工作区模型](#工作区模型)
-- **Soong intermediates jar 加载**: out/soong/.intermediates/ 目录扫描, fd 优先 find 备选; 模块级去重 (自身产物 javac/kotlinc 全保留, fat jar 仅兜底; `.impl` 归一化; stubs/重打包产物排除), 详见 [Soong jar 选择规则](#soong-jar-选择规则)
-- **文件缓存**: jar 列表缓存到 ~/.cache/nvim/aosp_nav/ (带算法版本号, 升级后旧缓存自动作废重扫), 避免每次打开都全盘扫描; AOSP 重新编译后用 `:AospRescan` 一条命令刷新
-- **源码根由 jdt.ls 自行推断**: 不注入 `java.project.sourcePaths` (注入会关闭 jdt.ls 的逐文件 source root 推断), 打开文件时按 package 声明反推, 同级/跨模块跳转都落到真实源码
+- **工作区根 = AOSP 根**: 整棵源码树共用一个 jdtls 索引, 跨模块跳转不需要任何手工标记, 详见 [导航模式](#导航模式)
+- **Soong intermediates jar 加载**: out/soong/.intermediates/ 目录扫描, fd 优先 find 备选; 模块级去重 (自身产物 javac/kotlinc 全保留, fat jar 仅兜底; stubs/重打包产物排除)
+- **文件缓存**: jar 列表与扫出的源码根都缓存到 ~/.cache/nvim/aosp_nav/ (带算法版本号, 升级后旧缓存自动作废重扫), 避免每次打开都全盘扫描; 用 `:AospRescan` 一条命令全部刷新
+- **跨模块跳转到定义落到真实 `.java`**: 预置核心集从首次导入起就作为 `java.project.sourcePaths` 注入, 之后每打开一个项目就把它的源码根累积上去。没有这层时, 从 `ConnectivityService` 跳到 `Handler` / `Binder` 打开的是只读的反编译视图而不是可编辑文件
 - AOSP 兼容性修复
   - 禁用 foldingRange 避免 jdtls -32603 NegativeArraySizeException
   - 禁用 Gradle/Maven 导入避免无网工作站下载 checksums
@@ -39,7 +39,7 @@ Android cpp代码演示。![cpp_demo](https://github.com/user-attachments/assets
 - Kotlin (kotlin-language-server) 支持
   - 自动生成 `~/.config/kotlin-language-server/classpath` 脚本 (KLS ShellClassPathResolver 机制), 从 soong intermediates 加载 AOSP framework jar
   - root_markers 追加 `.git` 兜底: AOSP 无 gradle/maven 根文件, 默认 root_dir=nil 会导致 KLS classpath 永不解析
-  - "KLS 工作区根 → AOSP 根" 分发表: 模块目录带 `.git` 时 KLS 的 cwd 是模块而非 AOSP 根, 分发表让它直接命中正确根; 与 VSCode 版共用同一个脚本 (VSCode 写过的转存 `classpath.vscode.bak` 作为兜底分支)
+  - "KLS 工作区根 → AOSP 根" 分发表: 模块目录带 `.git` 时 KLS 的 cwd 是模块而非 AOSP 根, 分发表让它直接命中正确根
   - 跳转优先落点为 AOSP 真实源码 (如 `core/java/android/os/Build.java`), 外部依赖 (dagger 等) 落点为 jar 反编译
   - 禁用 documentHighlight 避免 KLS NoTopLevelDescriptorProvider -32603
 
@@ -114,15 +114,17 @@ require("aosp-nav").setup({
 在 lspconfig 的 opts 中注入 KLS 配置 (以 LazyVim 为例):
 
 ```lua
-require("aosp-nav").setup({
-  cache_dir = "~/.cache/nvim/aosp_nav",
-  java = {
-    jar_fallback_dir = "~/.usr/android_jars",
-    exclude_paths = { "linux_glibc_common", "android_common_apex" },
-    disable_folding_range = true,
-    inlay_hints_mode = "auto",  -- "auto" | "off" | "all"
+-- lua/plugins/lsp.lua
+return {
+  {
+    "neovim/nvim-lspconfig",
+    opts = function(_, opts)
+      opts.servers = opts.servers or {}
+      opts.servers.kotlin_language_server =
+        require("aosp-nav").kotlin.configure(opts.servers.kotlin_language_server or {})
+    end,
   },
-})
+}
 ```
 
 `configure` 会:
@@ -131,17 +133,27 @@ require("aosp-nav").setup({
 - 禁用 `documentHighlight` handler (AOSP 无 gradle 时 KLS 降级模式会 -32603)
 - 补全 `root_markers` (追加 `.git`, 否则 AOSP 下 root_dir=nil, KLS 不加载 classpath)
 - 生成 `~/.config/kotlin-language-server/classpath` 脚本: KLS 启动时执行, 从 soong intermediates 输出 AOSP framework jar 列表 (Kotlin -> Java 跳转的依赖来源)
-- 维护一张 "KLS 工作区根 → AOSP 根" 分发表 (`~/.config/kotlin-language-server/aosp-nav/nvim-roots.txt`)。AOSP 每个模块目录都有 `.git`, KLS 的 cwd 因此是模块目录而不是 AOSP 根; 分发表让它直接命中正确的根, 未登记的目录仍由脚本自身向上找 `out/` 兜底。与 VSCode 版 aosp-nav 共用同一个 `classpath` 文件: 它写过的脚本会被转存为 `classpath.vscode.bak` 并作为本脚本的兜底分支, 两个插件可以共存
+- 维护一张 "KLS 工作区根 → AOSP 根" 分发表 (`~/.config/kotlin-language-server/aosp-nav/nvim-roots.txt`)。AOSP 每个模块目录都有 `.git`, KLS 的 cwd 因此是模块目录而不是 AOSP 根; 分发表让它直接命中正确的根, 未登记的目录仍由脚本自身向上找 `out/` 兜底
 
-## 工作区模型
+## 导航模式
 
-**jdtls 的工程根 (Eclipse workspace 的 `root_dir`) = AOSP 根**, 与 VSCode 版 `detectAospRoot()` 完全一致 (从打开的文件向上找 `out/soong/.intermediates` / `out/.soong/.intermediates` / `out/target/common/obj/JAVA_LIBRARIES`, 再回退到带 `build/make/core/main.mk` 或 `.repo` 的那一层)。
+默认情况下 **jdtls 的工程根 (Eclipse workspace 的 `root_dir`) = AOSP 根**, 并在 jar 列表之外注入一份预置核心源码集。整棵树共用一个索引, 跨模块跳转到定义落到真实、可编辑的 `.java`。
 
-为什么不能用"最近的 `.git`"定根: AOSP 是 repo 多仓检出, **每个模块目录自带 `.git`** (`frameworks/base/.git`、`packages/apps/Settings/.git` …)。用 `.git` 定根会让每个模块各自成为一个 jdtls workspace —— 磁盘上就是 `~/.cache/nvim/jdtls/{base,Settings,Connectivity,...}/`, 模块间索引互相不可见, 跨模块跳转退化, 每个 workspace 还要各自重新索引几十万个文件。整棵树只有一个 workspace 时, 打开任何模块的文件都命中同一份索引。
+| 你想要 | 配置 |
+| ------ | ---- |
+| 跨模块跳转到真实 `.java` (默认) | `java.source_paths_mode = "core"` + `java.workspace_mode = "aosp"` |
+| 索引尽可能轻, 接受跨模块跳转打开反编译 jar | `java.source_paths_mode = "infer"` |
+| 每个模块一个 jdtls 工作区 (本插件接管之前的行为) | `java.workspace_mode = "project"` |
+
+为什么默认用 AOSP 根: AOSP 是 repo 多仓检出, **每个模块目录自带 `.git`** (`frameworks/base/.git`、`packages/apps/Settings/.git` …)。用 `.git` 定根会让每个模块各自成为一个 jdtls workspace —— 磁盘上就是 `~/.cache/nvim/jdtls/{base,Settings,Connectivity,...}/`, 模块间索引互相不可见, 跨模块跳转退化到反编译 jar。如果你偏好小而快、自包含的索引, 且基本只在一个模块里工作, 就选 `workspace_mode = "project"`。
+
+默认模式的代价: 注入的源码根会撑大 Eclipse 的工程模型, 首次索引比纯 jar 更重。参考值 —— 约 1100 个 jar 的树上, 纯 jar 首次索引约 3 分钟 / 2 GB RSS, 再加 `frameworks/base/core/java` (约 4600 个文件) 约 3.5 分钟 / 5 GB。所以 `java.core_source_roots` 保持精简, 其余交给项目累积。累积的源码根要等下次重建工作区 (`:AospCleanWorkspace`) 才生效, 届时索引量按累积总量增长 —— 打开过 `frameworks/base` 后累积约 245 个源码根, 重建后的首次索引会明显变慢。
+
+累积是怎么生效的: 源码根只在 jdt.ls 导入工作区那一刻定下来, 所以"打开过的新项目"没法加进正在跑的会话 (jdt.ls 会把它们排在一千多个 jar **之后**, 那正是跳转退回 jar 的原因)。插件于是把每个项目的源码根在后台扫出来、写进缓存, 等下次导入工作区时一并生效 —— 用 `:AospDiagnostics` 的 `pending` 看还差多少条, 想立刻应用就 `:AospCleanWorkspace`。
 
 两条相关规则:
 
-- **`android_root` 优先级最高**: 显式配置时, 只要打开的文件在该目录之下, 工作区根就用它。反过来, 想"只索引某个模块" (旧的 `.project` 技巧想做的事) 现在应当把 `android_root` 指到该模块目录 —— 插件会以小索引运行, 其余依赖由编译好的 jar 补 (见 [配置项](#配置项) 的 `java.source_paths_mode`)。
+- **`android_root` 优先级最高**: 显式配置时, 只要打开的文件在该目录之下, 就用它作为 AOSP 根 (默认模式下也就是工作区根)。
 - **AOSP 树外不管**: 文件不在 AOSP 树内时 `configure` 把 `root_dir` 原样交还, 你自己的配置照常生效。
 
 ### 会话状态与诊断
@@ -154,20 +166,6 @@ require("aosp-nav").setup({
 ```
 
 `statusline()` 在非 AOSP 场景返回 `""`, 可以常驻状态栏; 字段与命令见 [命令](#命令)。
-
-## Soong jar 选择规则
-
-`out/soong/.intermediates` 下同一模块会产出多份 jar, 插件按以下规则去重, 每模块只保留必要产物:
-
-1. **变体**: `android_common` 首选; `android_common_apexNN` 兜底 (core-oj 等只有 apex 变体); host (`linux_glibc_common`) 与产品变体排除
-2. **类型分桶**: `javac`/`kotlinc` (模块自身编译产物) **全保留**——混合 Java/Kotlin 模块两个目录各含一半类; `combined` (impl+静态依赖 fat jar, 类重复主因) / `turbine*` (API 签名, 无方法体) 仅当模块无自身产物时兜底取一份
-3. **`.impl` 归一化**: `java_sdk_library` 的真实编译产物在 `<name>.impl` 子模块, 剥后缀归到主模块名去重 (`service-connectivity.impl/javac` 优先于 `service-connectivity/combined`)
-4. **排除**: `*/repackaged-jarjar/*`、`*/jarjar/*`、模块名含 `stubs` (API 签名桩, 如 `android-non-updatable.stubs.*`)、R/lint/dex/srcjars/kapt jar
-5. **自排除**: v7 起移除。工作区根已恒为 AOSP 根, 旧的 `exclude_self_jars` 作用域差值恒为空, 该配置项保留为 deprecated no-op; 需要精细排除请用 `exclude_jars` / `exclude_globs`
-
-`soong_tag_priority` 配置仅决定第 2 条中兜底桶的内部顺序; `javac`/`kotlinc` 属自身产物桶, 无条件保留。
-
-**注意**: AIDL/proto/aconfig 生成类 (如 INetworkOfferCallback、IActivityManager) 的 Java 代码由构建系统生成到 out/, 源码树内不存在对应 .java 文件, 其唯一来源是编译产物 jar——这也是默认不排除任何 jar 的原因。
 
 ## 命令
 
@@ -185,7 +183,7 @@ require("aosp-nav").setup({
 
 此后即使打开未编译的项目，也能正常跳转和补全，因为插件会让jdtls使用`~/.usr/android_jars/`进行解析。
 
-收集时的过滤规则与运行时一致 (见 [Soong jar 选择规则](#soong-jar-选择规则))。
+收集时的过滤规则与运行时一致。
 
 ```
 :AospCollectJars [aosp_root] [output_dir]
@@ -203,7 +201,7 @@ require("aosp-nav").setup({
 
 ### :AospStatus
 
-打印当前会话状态一行式汇总 (phase / workspace 根 / AOSP 根 / jar 数及来源 / blockers / jdtls 客户端数)。
+打印当前会话状态一行式汇总 (phase / workspace 根 / AOSP 根 / jar 数及来源 / 注入的源码根条数与模式 / blockers / jdtls 客户端数)。
 
 `phase` 取值: `idle` (还没打开过 AOSP java 文件) / `indexing` (已注入 jar, jdtls 正在索引) / `no-out` (AOSP 树里没有编译产物, 走的 fallback) / `failed` (非 AOSP 文件)。
 
@@ -216,27 +214,31 @@ require("aosp-nav").statusline()  -- 非 AOSP 时返回 ""
 
 ### :AospDiagnostics
 
-把 VSCode 版 Show Diagnostics 的检查清单输出到一个 scratch buffer (`aosp-nav://diagnostics`), 逐项带 `v`/`!` 标记与下一步动作提示:
+把一份检查清单输出到 scratch buffer (`aosp-nav://diagnostics`), 逐项带 `v`/`!` 标记与下一步动作提示:
 
-插件版本 / jdtls 客户端与其 root_dir / JVM `-Xmx` 是否够用 / `referencedLibraries` 条数 / `java.project.sourcePaths` 是否被注入 (期望"未注入") / `java.import.exclusions` 条数 / gradle+maven 是否关闭 / 工作区根 / 会话 phase / jar 缓存新鲜度 / Eclipse 残留 blockers / jdtls workspace 目录 / Kotlin 脚本归属与 KLS 客户端数。
+插件版本 / jdtls 客户端与其 root_dir / JVM `-Xmx` 是否够用 / `referencedLibraries` 条数 / `java.project.sourcePaths` 是否被注入 (core 模式下期望"已注入", 缺失即故障) / 已累积的项目 (`source projects` 行: `core=`/`projects=`/`installed=`/`pending=`, `pending>0` 表示需要重建工作区才能应用) / `java.import.exclusions` 条数 / gradle+maven 是否关闭 / AOSP 根与工作区根及当前模式 / 会话 phase / jar 缓存新鲜度 / Eclipse 残留 blockers / jdtls workspace 目录 / Kotlin 脚本归属与 KLS 客户端数。
 
 出问题时先跑这个。
+
+### :AospSourceRoots
+
+打开一个 scratch buffer (`aosp-nav://source-roots`), 列出当前注入 `java.project.sourcePaths` 的全部源码根: 配置的核心集 (存在磁盘上的条目标 `x`), 以及每个已累积项目的源码根 (按 LRU 顺序)。当跳转落到同名类的意外实现时用来看清来源。
 
 ### :AospRescan
 
 等价于旧的"手动 `rm ~/.cache/nvim/aosp_nav/*.txt` + 重启 nvim", 现在一条命令搞定:
 
-1. 清掉 jar 列表的内存缓存 (文件缓存保留, 万一重扫失败下次启动仍有得用);
+1. 清掉 jar 列表的内存缓存, 同时清空已累积的源码根及其扫描缓存 (jar 文件缓存保留, 万一重扫失败下次启动仍有得用);
 2. 忽略旧缓存重扫整个 `out/`, 重写缓存文件;
-3. 报告条数与磁盘上已失效的 jar 数, 并提示 `:LspRestart`。
+3. 报告 jar 条数、磁盘上已失效的 jar 数、清掉的源码根缓存数, 并提示 `:LspRestart`。
 
-jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须 `:LspRestart` (或重开 nvim) 才生效**。
+jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须 `:LspRestart` (或重开 nvim) 才生效**; 累积的源码根还要额外 `:AospCleanWorkspace` 重建工作区 (见 FAQ)。
 
 插件启动时若发现 `out/soong/build.ninja` 比 jar 缓存新 (即 AOSP 重新编译过), 会弹一次提示让你跑这条命令。它不会在后台自动重扫: 重扫本身很快, 但不重启 jdtls 就不生效, 静默重扫只是白烧 CPU。
 
 ### :AospCleanWorkspace [!]
 
-删除当前 jdtls 的 Eclipse workspace 目录并停掉客户端, 下次打开 java 文件时全量重新导入 (即 VSCode 版的 Clean && Reload / `java.clean.workspace`)。
+删除当前 jdtls 的 Eclipse workspace 目录并停掉客户端, 下次打开 java 文件时全量重新导入。
 
 什么时候需要:
 
@@ -268,12 +270,16 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须 `:LspRestart` (
 | java.exclude_globs | {^prebuilts/sdk/sdk_} | Lua 模式排除: 匹配 .intermediates/ 之后的相对路径。默认剔除预构建 module SDK 桩; 用户自定义时与默认值**拼接 (见 exclude_merge), 锚定 ^ 可精确到顶层目录, 如 { "^external/cronet/" } |
 | java.exclude_paths | {linux_glibc_common, development/} | 排除的路径关键词 (子串匹配); 勿加 android_common_apex (会误杀只有 apex 变体的 core-oj 等模块) |
 | java.exclude_merge | append | 排除类列表 (exclude_jars/paths/globs/import_exclusions) 的合并语义: append=用户项追加到默认值后 (推荐); replace=整体替换默认值 |
-| java.source_paths | nil | 显式指定 `java.project.sourcePaths`。**默认 nil 且强烈建议保持 nil**: jdt.ls 的 `BaseDocumentLifeCycleHandler.inferInvisibleProjectSourceRoot` 只要看到这个 settings 键存在 (空数组也算) 就彻底关闭逐文件 source root 推断 (`needInferSourceRoot` 的触发条件正是 AOSP 里常见的 `PackageIsNotExpectedPackage` / `PublicClassMustMatchFileName`)。只有"工作区根 = 某模块, 但源码根不是常规布局"时才需要手填 |
-| java.source_paths_mode | infer | `infer` = 不注入, 交给 jdt.ls 推断 (默认); `scan` = 注入 `java.source_patterns` 扫出来的源码根列表。仅在小工作区根/离线场景作为可选加速, 大型 AOSP 树用 scan 反而会让跨模块跳转退化 |
+| java.workspace_mode | aosp | `aosp` = 整棵树一个工作区 (默认); `project` = 每个模块一个 jdtls 工作区, 以最近的 `.git`/`.project` 为根, 取不到时回落你自己的 `root_dir` |
+| java.source_paths_mode | core | `core` = 注入预置核心集 + 累积打开过的项目的源码根 (默认; 累积部分下次重建工作区时生效); `infer` = 什么都不注入, 交给 jdt.ls 逐文件推断; `project` = 由 `workspace_mode = "project"` 自动选定 |
+| java.core_source_roots | {frameworks/base/core/java, frameworks/base/services/core/java} | 预置源码根 (相对 AOSP 根), 从首次导入起就注入。整表替换默认值 (同 `kotlin.curated_modules` 语义); 磁盘上不存在的条目自动跳过。给得越多首次索引越重 |
+| java.source_paths_max_projects | 8 | 累积的 `.git` 项目数上限 (LRU 淘汰, `0` = 不限)。上限与累积集合都会跨会话保留 |
+| java.source_root_exclude | {} | Lua 模式排除, 匹配源码根相对所属项目的路径, 如 `{ "^external/cronet/" }`。其余剪枝规则 (测试根 / JDK 影子根 / 同名影子根) 属算法的一部分 |
+| java.source_paths | nil | 显式指定 `java.project.sourcePaths` (相对 AOSP 根; 树内的绝对路径会自动转成相对, 树外的丢弃)。非空即完全接管: 不再使用核心集与项目累积。除非想钉死一份固定列表, 否则不要设置 |
 | java.exclude_self_jars            | false                                                        | **已废弃**: 工作区根改成 AOSP 根后, "root_dir 相对 android_root 的差值"恒为空, 该选项恒为 no-op。保留键只为不静默吞掉旧配置; 新配置请用 `exclude_jars` / `exclude_globs` |
 | java.make_jar_priority            | {classes.jar, classes-header.jar, javalib.jar}               | Make 构建系统 jar 优先级                                     |
 | java.make_blacklist               | {android_stubs_current_intermediates}                        | Make 构建排除目录                                            |
-| java.source_patterns              | {src, java, src/main/java}                                   | 源码根扫描模式                                               |
+| java.source_patterns              | —                                                            | **已废弃** (它配置的浅层扫描实现已删除), 设置后提示一次且无任何效果 |
 | java.disable_folding_range        | true                                                         | 禁用 foldingRange (避 -32603)                                |
 | java.disable_gradle_import        | true                                                         | 禁用 Gradle/Maven 导入                                       |
 | java.import_exclusions_enabled    | true                                                         | 是否注入 `java.import.exclusions` (仅 android 项目; 见 [从 Android 根目录打开](#从-android-根目录打开-javaimportexclusions)) |
@@ -291,17 +297,17 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须 `:LspRestart` (
 
 ## 从 Android 根目录打开 (java.import.exclusions)
 
-**本插件的工作区根恒为 AOSP 根** (除非你显式配置了 `android_root`, 见 [工作区模型](#工作区模型)), 所以 jdt.ls 会直接从整棵树的根开始递归导入工程:
+**本插件的工作区根默认就是 AOSP 根** (见 [导航模式](#导航模式)), 所以 jdt.ls 会直接从整棵树的根开始递归导入工程:
 
 - 走进 `out/`（构建产物，上万个目录）和 `.repo/`（repo 的每个 project 副本）；
 - 把源码树里遗留的 `.project`+`.classpath` 目录当成"已存在工程"全量导入（jdt.ls 每导入一个工程就会在工程目录写下这两个文件）。
 
-结果是导入爆炸、首次索引迟迟不结束、跳转不可用。插件默认注入 `java.import.exclusions` 避免这种情况，与 VSCode 版 aosp-nav 的机制一一对应：
+结果是导入爆炸、首次索引迟迟不结束、跳转不可用。插件默认注入 `java.import.exclusions` 避免这种情况：
 
-| 组成部分 | 内容                                                                  | VSCode 对应 |
-| -------- | --------------------------------------------------------------------- | ----------- |
-| 静态排除 | `**/out/**`、`**/.repo/**`，外加 jdt.ls 自带的 4 项默认排除 (显式设置 `java.import.exclusions` 会整体替换默认值，所以这里补回) | `compat.ts` |
-| 残留扫描 | 后台扫描 root_dir（跳过 `out/.repo/.git/node_modules/.metadata`，深度 ≤5），把同时含 `.project` 与 `.classpath` 的目录逐个排除（绝对路径精确匹配） | `eclipseGuardScan.ts` |
+| 组成部分 | 内容 |
+| -------- | ---- |
+| 静态排除 | `**/out/**`、`**/.repo/**`，外加 jdt.ls 自带的 4 项默认排除 (显式设置 `java.import.exclusions` 会整体替换默认值，所以这里补回) |
+| 残留扫描 | 后台扫描 AOSP 根（跳过 `out/.repo/.git/node_modules/.metadata`，深度 ≤5），把同时含 `.project` 与 `.classpath` 的目录逐个排除（绝对路径精确匹配） |
 
 注入走 `initializationOptions.settings`（与禁用 Gradle 导入同一套路），**先于工程导入执行** —— 只放 `settings` 会等到 attach 后的 `didChangeConfiguration`，那时导入早已开始。
 
@@ -334,6 +340,17 @@ require("aosp-nav").setup({
 **注意**: Gradle 项目 (AOSP 里 `build.gradle` 存在于 `frameworks/base/tests/UiBench/` 等目录) 由 `java.disable_gradle_import` 统一处理, 与 `.project` 无关。
 
 ## FAQ
+
+### 跳转到 framework 类时打开的是只读/反编译视图
+
+说明 jdt.ls 从 jar 而不是源码解析了这个类型。依次检查:
+
+1. `:AospDiagnostics` 的 `sourcePaths` 一行必须是 `injected (N entries)`。如果 `java.source_paths_mode = "core"` 却显示 "NOT injected", 说明 `java.core_source_roots` 在磁盘上没解析出来 (AOSP 版本不同或写错了) —— `:AospSourceRoots` 会给存在的条目标 `x`。
+2. 同一页的 `source projects` 一行形如 `core=N projects=N installed=N pending=N`。`pending > 0` 表示累积的源码根还没进当前工作区, 见下一条。
+3. `:AospSourceRoots` —— 如果这个类所属项目不在列表里, 打开该项目下任意一个 `.java` 文件一次, 它的源码根会在后台扫出来并写进缓存。若该项目被 `source_paths_max_projects` 挤掉了, 提高上限或再打开一次它的文件 (`:AospRescan` 清空累积)。
+4. 还是不行 → `:AospCleanWorkspace` 后重开。源码根在导入期就定死了, 早于某个根存在的工作区会一直用旧 classpath; **删掉工作区是应用新累积源码根的唯一办法** (只 `:LspRestart` 不够 —— jdt.ls 会跳过它已经认识的工程)。
+
+注意**构建生成**的类 (AIDL/proto/aconfig 的 Stub/Proxy, 例如 `INetworkOfferCallback`) 在源码树里根本没有 `.java`, jar 是它们的唯一来源, 落到反编译视图是正确结果。
 
 ### jdtls 报 -32603: Internal error
 
@@ -371,7 +388,7 @@ AOSP 重新编译后:
 :AospRescan
 ```
 
-(等价于旧的 `rm ~/.cache/nvim/aosp_nav/*.txt` + 重启 nvim; 现在无需重启, 重扫后 `:LspRestart` 即可生效。)
+(等价于旧的 `rm ~/.cache/nvim/aosp_nav/*.txt` + 重启 nvim; 现在无需重启 nvim, 重扫后 `:LspRestart` 即可让 jar 列表生效 —— 源码根另需 `:AospCleanWorkspace`。)
 
 插件升级导致过滤算法变化时无需手动清除: 缓存文件带算法版本号, 旧版本缓存自动作废重扫。
 

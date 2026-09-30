@@ -76,6 +76,11 @@ vim.api.nvim_create_user_command("AospDiagnostics", function()
   require("aosp-nav.ui").diagnostics()
 end, { desc = "Open aosp-nav diagnostics scratch buffer" })
 
+vim.api.nvim_create_user_command("AospSourceRoots", function()
+  require("aosp-nav").setup()
+  require("aosp-nav.ui").show_source_roots()
+end, { desc = "Open a scratch buffer listing injected source roots (core + projects)" })
+
 vim.api.nvim_create_user_command("AospRescan", function()
   require("aosp-nav").setup()
   require("aosp-nav.ui").rescan()

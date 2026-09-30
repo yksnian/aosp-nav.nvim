@@ -37,6 +37,8 @@ end
 
 -- 子模块 lazy 导出 (metatable: 首次访问才 require, 避免非 java 文件也加载 java 模块)
 -- 访问 M.java / M.clang / M.kotlin 时自动 ensure setup, 然后 require 并缓存到表上
+-- M.status / M.statusline 转发到 ui.lua (它们本来就是 ui 的方法, 挂在顶层只是
+-- 为了 lualine 之类的调用点写起来短; 之前缺失导致文档里的用法拿到 nil)
 setmetatable(M, {
   __index = function(t, key)
     if key == "java" or key == "clang" or key == "kotlin" then
@@ -47,6 +49,15 @@ setmetatable(M, {
       local mod = require("aosp-nav." .. key)
       rawset(t, key, mod)  -- 缓存到表上, 后续访问不再触发 __index
       return mod
+    end
+    if key == "status" or key == "statusline" then
+      if not M._state.setup_done then
+        M.setup()
+      end
+      local mod = require("aosp-nav.ui")
+      local fn = mod[key]
+      rawset(t, key, fn)
+      return fn
     end
     return nil
   end,

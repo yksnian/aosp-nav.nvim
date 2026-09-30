@@ -19,6 +19,11 @@ local s = {
   cache_origin = nil,  -- "cache" | "scan" | "fallback" | nil
   blocked = 0,         -- 残留 Eclipse 元数据目录数 (import_exclusions 扫描)
   index_warned = false,
+  -- [v8] sourcePaths 注入 (见 java/source_inject.lua)
+  source_roots = 0,          -- 导入期注入的条目数
+  source_paths_mode = nil,   -- "core" | "infer" | "project"
+  workspace_mode = nil,      -- "aosp" | "project"
+  source_projects = 0,       -- 已累积的项目数
 }
 
 --- 更新状态字段 (只覆盖给定字段)
