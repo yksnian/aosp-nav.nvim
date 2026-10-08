@@ -31,10 +31,15 @@ local M = {}
 -- v2: 新增测试根 / JDK 影子根过滤
 -- v3: header 增加 files=/test=/jre=, 解析改为逐字段
 -- v4: 剪枝旋钮从 config 收进模块常量, 扫描基准由 AOSP 根改为项目目录
-local CACHE_VERSION = "v5"
+-- v5: header 增加 ratio= (影子阈值随统计一起落盘)
+-- v6: header 第 2 行改成 java.source_root_exclude 的指纹 (# exclude=, 对齐 jar 侧
+--     的 # filters=), stats 行挪到第 3 行并增加 excl=; 缓存失效的判据从"只有版本"
+--     变成"版本 + 排除配置"
+local CACHE_VERSION = "v6"
 
 -- 剪枝阈值。这些是算法的一部分而非使用偏好, 故为模块常量: 唯一的用户裁剪
--- 入口是 java.source_root_exclude (Lua 模式, 同 exclude_globs 语义)。
+-- 入口是 java.source_root_exclude (Lua 模式, 同 exclude_globs 语义, 带精选默认值,
+-- 其内容会进缓存指纹 —— 改一条模式缓存立即失效重扫)。
 local SHADOW_RATIO = 0.5      -- 自有 FQN 被遮蔽比例 >= 此值 -> 整根剔掉
 local JDK_SHADOW_RATIO = 0.5  -- 包名落在 JDK 命名空间的比例 >= 此值 -> 整根剔掉
 
@@ -189,10 +194,12 @@ local function analyze(root, lines)
   --    Lua 模式匹配, 与 java.exclude_globs 同一套语义 (不要用 vim.fn.glob2regpat:
   --    它会把模式锚成整段匹配, "^services/" 这种前缀写法反而永远不命中)
   local exclude = get_cfg().java.source_root_exclude or {}
+  local n_exclude = 0
   if #exclude > 0 then
     for rel in pairs(files) do
       for _, pat in ipairs(exclude) do
         if rel:match(pat) then
+          if not drop[rel] then n_exclude = n_exclude + 1 end
           drop[rel] = true
           break
         end
@@ -310,6 +317,7 @@ local function analyze(root, lines)
     test_dropped = n_test,
     jre_dropped = n_jre,
     shadow_dropped = n_shadow,
+    exclude_dropped = n_exclude,
     dup_fqn = dup,
     shadow_ratio = SHADOW_RATIO,
   }
@@ -373,6 +381,14 @@ function M.cache_file(root)
   return cfg.cache_dir .. "/" .. key .. ".source-roots.txt"
 end
 
+--- 排除配置指纹 (写进缓存第 2 行): 与 jar 侧的 # filters= 同一个算法,
+--- 同样解决"改了排除模式但缓存照旧命中"。
+--- @return string
+local function exclude_hash()
+  local exclude = get_cfg().java.source_root_exclude or {}
+  return require("aosp-nav.util.hash").fingerprint(exclude)
+end
+
 --- 读缓存
 --- @param root string
 --- @return table|nil roots, table|nil stats
@@ -384,10 +400,12 @@ function M.load(root)
   if not head:find("# aosp%-nav%.nvim source%-roots " .. CACHE_VERSION, 1) then
     return nil
   end
+  -- 排除配置变了 -> 缓存里的根列表已经不成立, 必须重扫 (整行相等才算命中)
+  if (lines[2] or "") ~= "# exclude=" .. exclude_hash() then return nil end
   local stats = { shadow_ratio = SHADOW_RATIO }
   local roots = {}
   for i, l in ipairs(lines) do
-    if i == 2 then
+    if i == 3 then
       -- 逐字段匹配而不是整行一个 pattern: 统计字段会随版本增删 (v2 加过
       -- test=/jre=)。整行匹配时多一个/少一个字段就整体解析失败, 统计全变成
       -- 0 —— 而列表本身是好的, 白白误导人。缺的字段留 nil, 显示层用 `or 0`。
@@ -403,6 +421,7 @@ function M.load(root)
       stats.test_dropped = num("test")
       stats.jre_dropped = num("jre")
       stats.shadow_dropped = num("shadow")
+      stats.exclude_dropped = num("excl")
       stats.dup_fqn = num("dup")
       stats.files = num("files")
       local rt = l:match("# stats .*ratio=([%d%.]+)")
@@ -425,10 +444,14 @@ function M.save(root, roots, stats)
   vim.fn.mkdir(vim.fn.fnamemodify(f, ":h"), "p")
   local out = {
     "# aosp-nav.nvim source-roots " .. CACHE_VERSION,
-    ("# stats roots=%d files=%d ancestor=%d nested=%d test=%d jre=%d shadow=%d dup=%d ratio=%.2f")
+    -- 排除配置指纹, 与 jar 缓存第 2 行 (# filters=) 同构
+    "# exclude=" .. exclude_hash(),
+    ("# stats roots=%d files=%d ancestor=%d nested=%d test=%d jre=%d shadow=%d dup=%d "
+      .. "excl=%d ratio=%.2f")
       :format(#roots, stats.files or 0, stats.ancestor_dropped or 0,
         stats.nested_dropped or 0, stats.test_dropped or 0, stats.jre_dropped or 0,
-        stats.shadow_dropped or 0, stats.dup_fqn or 0, stats.shadow_ratio or 0),
+        stats.shadow_dropped or 0, stats.dup_fqn or 0, stats.exclude_dropped or 0,
+        stats.shadow_ratio or 0),
   }
   vim.list_extend(out, roots)
   vim.fn.writefile(out, f)

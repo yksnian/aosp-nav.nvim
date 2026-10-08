@@ -415,7 +415,7 @@ grep -r -m1 -H --include=*.java \
 | - | ---- | ---- | ----- |
 | 1 | A 是 B 的**严格祖先**且 A 文件数更少 → 丢 A | — | 包名与路径对不上的个别文件会派生出 `build/`、`frameworks/base` 这种把整棵子树吞掉的"根" |
 | 1b | A **嵌套在**另一个保留根里 → 丢 A | — | 见下, 这条不修就等着跳转全废 |
-| 2 | 命中 `java.source_root_exclude` → 丢 | 用户配置 | 唯一留给用户的裁剪入口 |
+| 2 | 命中 `java.source_root_exclude` → 丢 | 用户配置 (带 7 条精选默认值) | 唯一留给用户的裁剪入口; v9 起与 jar 侧 `exclude_globs` 完全对位 —— 带默认值、走 `exclude_merge` 的 append 语义、进缓存指纹 |
 | 2' | 路径含测试段 → 丢 | `TEST_SEGS` | 测试根不是任何生产代码的依赖。实测占注入文件数 **37%** |
 | 3 | 包名落在 JDK 命名空间 → 丢 | `JRE_PREFIXES` / `JDK_SHADOW_RATIO` | JRE 容器 (`con`) 排在 classpath **最前**, 源码根里的 `java.*` 永远被遮蔽, 注入它们一个字节都解析不到, 却要 JDT 从头编译一遍 JDK。实测占 **7%** |
 | 4 | 自己的 FQN 有 ≥ 50% 已被优先级更高的根提供 → 丢 | `SHADOW_RATIO` | 见下 |
@@ -452,6 +452,32 @@ hover 在 NetworkManagementService.java 的 Handler 上:
 `"^services/"` 会被变成 `^^services/$`, 前缀写法永远不命中。这里对齐
 `java.exclude_globs` 的既有语义 (`rel:match(pat)`)。
 
+### 5.3.1 为什么默认值里要有那 7 条测试目录模式 (v9)
+
+剪枝 2' 的 `TEST_SEGS` 是**整段相等**匹配 (`rel:gmatch("[^/]+")` 逐个 segment 比),
+于是段名不等于 `test` / `tests` / `cts` / `hostside` / `integration` / `benchmarks` /
+`androidtest` / `robotests` / `tck` 的测试目录**全部漏网** —— 而 AOSP 里这类命名是常态。
+
+frameworks/base 实测(逐根 `find -name '*.java' | wc -l`):
+
+| 残留根 (节选) | 文件数 | 为什么 TEST_SEGS 抓不到 |
+| --- | ---: | --- |
+| `apct-tests/perftests/core/src` | 321 | 段名是 `apct-tests` / `perftests` |
+| `packages/SystemUI/multivalentTests/src` | 264 | 段名是 camelCase `multivalentTests` |
+| `ravenwood/tools/hoststubgen/test-tiny-framework/tiny-framework/src` | 75 | 段名是 `test-tiny-framework` |
+| `test-base` / `test-junit` / `test-mock` / `test-runner` `/src` | 13/20/11/34 | 段名是 `test-…` |
+| `tools/aapt2/integration-tests/*/src` | 6 | 段名是 `integration-tests`, 而常量里只有 `integration` |
+| `cmds/uiautomator/{library,instrumentation}/testrunner-src` | 各 5 | 段名是 `testrunner-src` |
+| **合计 (28 个根)** | **815** | 占注入文件 13287 的 **6.1%** |
+
+处理方式不是去放宽 `TEST_SEGS` (改成前缀/子串匹配会误伤 `latest/`、`contest/` 这类
+目录名), 而是把这 7 条**写进 `source_root_exclude` 的默认值** —— 于是它天然可配、
+可关、可追加, 与 jar 侧 `exclude_globs` 完全同构。`samples/` 下的样例应用**不**默认排除
+(它们不是测试), README 里作为"用户自己加一条"的例子。
+
+诊断上这个数字现在可见: `stats.exclude_dropped` → 缓存 header 的 `excl=` →
+`:AospSourceRoots` 的缓存行 `[roots=… files=… excl=… test=… jre=… shadow=…]`。
+
 **剪枝 4 (影子根) 是控制"同名类跳向哪个实现"的唯一手段。** AOSP 全树实测有 528 个
 重复 FQN, 多来自 `*-fake` / `*-stub` / ravenwood 影子树。JDT 容忍重复 (只给被遮蔽的
 那个文件标 "The type Foo is already defined", 使用方无报错), 但**选哪个不可控** ——
@@ -461,7 +487,8 @@ hover 在 NetworkManagementService.java 的 Handler 上:
 ### 5.4 统计
 
 `analyze()` 返回 `{roots, files, ancestor_dropped, nested_dropped, test_dropped,
-jre_dropped, shadow_dropped, dup_fqn, shadow_ratio}`, 用于 `:AospDiagnostics` 与缓存 header。
+jre_dropped, shadow_dropped, exclude_dropped, dup_fqn, shadow_ratio}`, 用于
+`:AospDiagnostics` 与缓存 header。
 
 **嵌套/影子根可疑时看 `dup_fqn`**: 它统计最终列表里仍有多个根提供的 FQN。正常项目
 应为个位数 (真树 frameworks/base: 2)。
@@ -473,22 +500,32 @@ jre_dropped, shadow_dropped, dup_fqn, shadow_ratio}`, 用于 `:AospDiagnostics` 
 路径: `<cache_dir>/<flattened root>.source-roots.txt` (`/` → `-`, 去前导 `-`)。
 
 ```
-# aosp-nav.nvim source-roots v5
-# stats roots=12 files=4638 ancestor=3 nested=8 test=41 jre=5 shadow=7 dup=2 ratio=0.50
+# aosp-nav.nvim source-roots v6
+# exclude=4f4ac43d
+# stats roots=219 files=12472 ancestor=8 nested=8 test=406 jre=1 shadow=6 dup=2 excl=28 ratio=0.50
 frameworks/base/core/java
 frameworks/base/services/core/java
 ...
 ```
 
-`CACHE_VERSION` 现在是 **v5** (v5 加了 `nested=`)。改了剪枝规则就必须 bump ——
-老缓存带着已被剔掉的根继续用 (§12)。
+`CACHE_VERSION` 现在是 **v6**。改了剪枝规则就必须 bump —— 老缓存带着已被剔掉的根
+继续用 (§12)。
 
 - 第 1 行带 `CACHE_VERSION`; 不匹配即视为**失效**(返回 nil, 触发重扫)。
   变更剪枝规则或缓存格式时**必须 bump**:
   - `v2` 新增测试根 / JDK 影子根过滤
   - `v3` header 增加 `files=/test=/jre=`, 解析改为逐字段
   - `v4` 剪枝旋钮从 config 收进模块常量; 扫描基准由 AOSP 根改为项目目录
-- 第 2 行统计**逐字段解析** (`num(k)`), 不能整行一个 pattern: 字段会随版本增删,
+  - `v5` header 增加 `ratio=`
+  - `v6` 第 2 行改成 `source_root_exclude` 的**指纹** `# exclude=…`, 统计行挪到第 3 行
+    并增加 `excl=`
+- 第 2 行是排除配置指纹, 与 jar 缓存的 `# filters=` **同一个算法**
+  (`lua/aosp-nav/util/hash.lua` 的 `fingerprint`, djb2 over `vim.inspect`), 整行相等
+  才算命中。**没有它的时候**: 用户改了 `source_root_exclude`, 缓存照旧命中, 静默沿用
+  旧根列表 —— jar 侧早就用 `filters_hash` 解决了这个问题, v6 只是把同一套搬过来。
+  教训: 抽公共函数时必须保证输出逐字节不变, 否则现存缓存会集体失效
+  (`t_hash.lua` 里内联了一份旧实现做对拍)。
+- 第 3 行统计**逐字段解析** (`num(k)`), 不能整行一个 pattern: 字段会随版本增删,
   整行匹配时多/少一个字段就整体失败, 统计全变 0 —— 而列表本身是好的, 白白误导人。
   缺失字段留 nil, 显示层用 `or 0`。
 - 注意 `# stats ` 前缀只在**整行最前面出现一次**, 不要给每个键都加。
@@ -684,6 +721,82 @@ reset()  再清一次 (用户真的按了 :AospRescan)
 
 注入 `attach` 时代这些返回的是 `jdt://…/framework.jar/…` 只读虚拟缓冲。
 
+### 8.1 索引到底存不存得住 (v9 取证, 直接回答"索引不动")
+
+把 `-data` 下的日志与索引目录对着时间轴读一遍 (2026-09-30 20:54 → 10-01 00:38,
+同一份 `~/.cache/nvim/jdtls/aosp/workspace`):
+
+| 观测 | 值 |
+| --- | --- |
+| 日志里的 JVM 启动次数 | **4**(20:54:46 / 22:22:38 / 00:10:28 / 00:31:54) |
+| `Finished creating the Java project aosp_3f7ad7da` | **1**(只有第 1 次) |
+| `Updating classpath` / `Adding … to the classpath` | 每次启动都做, 合计 3701 条 (每次 800–1126) |
+| `build jobs finished` | 每次启动都有 |
+| 每次启动后的**无日志高 CPU 静默期** | 1h24m / 1h46m / 20m / 5.5m |
+| `.index` 文件 | 1129 个 / 831 MB; **1126 个是 jar 索引**(每个 40–50 MB, 两分钟能全部写完) |
+| **工程源码索引** (`264720899.index`) | **25 字节 = 空**, mtime 停在 20:55 |
+| `savedIndexNames.txt` | 1127 条, 磁盘上一条不缺 (但工程索引本身就是空的) |
+| 末段日志 | `Validated 1. Took 33407 ms` + `206 problems reported for /ConnectivityService.java`, 之后 5.5 分钟无任何输出, 直到 `Parent process stopped running` |
+
+三条结论:
+
+1. **jar 索引是好的、可复用的** (两分钟写完 1126 个文件), 慢的从来不是它。
+2. **注入的源码树索引从没写出来过** —— 25 字节的空文件。根因见下面的 GC 死亡螺旋:
+   JVM 绝大部分时间在做无效 full GC, 根本没走到写索引那一步; 即便走到了, `IndexManager`
+   也只在空闲/退出时 `saveIndexes`, 而会话总是被"用户等不下去 → 关 nvim"结束
+   (`Parent process stopped running, forcing server exit`), 于是下次启动从头再来一遍。
+   表现就是"打开很久了还在索引"。
+3. **每次启动都白跑一遍** classpath 解析 + build: `Updating classpath` 与
+   `build jobs finished` 在 4 次启动里各出现 4 次, 没有热启动。
+
+#### 静默期到底在烧什么: 不是索引, 不是 build, 是 **GC 死亡螺旋**
+
+2026-10-01 01:14 对活的 jdtls (`-Xmx6G -Xms2G -XX:+UseParallelGC -XX:GCTimeRatio=4
+-XX:AdaptiveSizePolicyWeight=90`, 存活 500 s) 做的取证 —— `jcmd <pid> Thread.print`
+里的 `cpu=` 字段直接给出了每个线程累计的 CPU:
+
+| 观测 | 值 | 说明 |
+| --- | --- | --- |
+| 15 个 `GC Thread#*` 各 | **~363 s** | 单个线程累计 CPU |
+| 全部线程累计 CPU | 6082 s / 500 s 墙钟 | = **12.2 核平均**, 与 `ps` 的 1221% 吻合 |
+| 认领 CPU 的线程 | GC 线程占 5450 s = **90%** | 其余 80 个线程总共只烧了 10% |
+| `ParOldGen used / total` | **4194032K / 4194304K** | old gen **100% 满** |
+| `sun.gc.policy.liveAtLastFullGc` | 4294689696 ≈ **4.00 GB** | full GC 实测的存活集 |
+| full GC 次数 / 累计耗时 | **598 次 / 408 s** | 500 s 的 JVM 里 82% 墙钟在做 full GC |
+| `majorGcCost` / `majorPauseOldSlope` | 99 / 447 ms per MB | GC 自己的代价模型都说 old gen 严重不足 |
+| 存活集的趋势 | 稳定在 4.0 GB (`avgOldLive` 同值) | **不是泄漏, 是稳定工作集放不下** |
+
+判定: **存活集 4.0 GB 正好等于 old gen 的容量**, 于是每次 full GC 几乎回收不到东西
+(live == capacity), ParallelGC 只能立刻再 full GC —— 经典死亡螺旋。线程栈里刷屏的
+`Parser.consumeRule` / `lombok.eclipse.Eclipse` / `ClasspathJar.hasCompilationUnit`
+**都不是热点**, 只是 80 个线程里少数几个死亡螺旋缝隙里还能跑的被采样到; 90% 的 CPU
+从头到尾都在 GC 线程上。所以:
+
+- 这解释了"CPU 打满但索引不动": 应用根本没机会推进;
+- 也解释了日志静默 (GC 不写应用日志) 与 `.index` 冻结;
+- **`-Xmx6G` 是这台机器上 `-Xmx` 的下限之下的**: 实测存活集 4 G, 需要 ≥ 8 G 才有余量。
+  `~/.config/nvim/lua/plugins/jdtls.lua` 里"保持 6G, 8G 会把 swap 拖进来"的判断被实测
+  推翻 (8 G 时 RSS 约 8 G, 机器 15.7 G total / 8.1 G available, 不会换页)。
+- 判据必须是**堆的数值**, 不是"-Xmx 串存在"。旧版 `:AospDiagnostics` 的 `jdtls vmargs`
+  行只查字符串, 对这种配置照样显示绿灯 —— 已改为按 `util/jvm.lua` 的 `assess()` 判数值
+  并给出 `-Xmx8G` 的 action。
+
+另外两条与"索引被反复重建"直接相关的机制:
+
+- **工程已存在时, initialize 里带的 sourcePaths 会被静默忽略** (`loadInvisibleProject`
+  的第一道闸 `ProjectUtils.getVisibleProjects(rootPath).isEmpty()`) —— 4 次启动里工程只在
+  第 1 次被创建, 后 3 次的注入等于没发。这就是"累积必须重建工作区才生效"的来源, 也是
+  那条提示必须写清代价 (整库重索引, 以小时计) 的原因。
+- **两个 JVM 抢同一份 `-data` 会互相覆盖索引**: 实测过
+  `Java Index broken - will be automatically deleted to repair`、
+  `Failed to save JDT index … (No such file or directory)`, 以及同一次导入里
+  `Adding` 计数从 1126 变成 2252。索引被反复删掉重建 = 索引永远追不上。
+  自检入口: `:AospDiagnostics` 的 `jdtls instances` 行与 `jdtls index` 行。
+- **定位静默期的正确手法**: 线程栈顶帧会骗人 (上面那堆 Parser/lombok 帧就是假热点),
+  要看 **每个线程的累计 CPU**。`jcmd <pid> Thread.print` 输出的 `cpu=` 字段排序后一眼可见;
+  `jcmd <pid> PerfCounter.print | grep '^sun\.gc'` 里的 `invocations` / `time` 给出 GC 占比。
+  `/tmp/aospnav-probe.sh` 是那支 30 s 采样脚本, 但它只记栈顶帧 —— 要判 GC 得用上面两条。
+
 工作区工程名单实测 (真实 AOSP 树, 4 个模块都开过 java 文件之后查 `-data`):
 
 | 场景 | `.projects/` 内容 | invisible project |
@@ -783,14 +896,15 @@ Buildship 的 gradle-wrapper 校验告警) —— 禁用 gradle 必须进 `initi
 | ---- | ---- | ---- |
 | `t_root.lua` | 15 | 两种 workspace_mode / 树外回落 / 用户函数透传 |
 | `t_projects.lua` | 10 | 真实 AOSP 路径 → `frameworks/base`; 越过 AOSP 根即停 |
-| `t_source_roots.lua` | 29 | 深层根保留 / test / JDK / shadow / **嵌套根** 剪枝 / header 逐字段 / 版本失效 |
+| `t_source_roots.lua` | 49 | 深层根保留 / test / JDK / shadow / **嵌套根** 剪枝 / **7 条默认排除模式** / append 后默认项仍生效 / header 三行 / `excl=` 统计 / 改排除配置即失效 / 版本失效 |
 | `t_inject.lua` | 44 | union 去重与 core 在前 / LRU 淘汰与重纳入 / 空集不注入 / **绝不下发** / 顺序落盘与重启读回 / reset 后丢弃在飞扫描 |
-| `t_config.lua` | 24 | 别名 warn 不中断 / 未知值回落 / 上限校验 / 老校验仍生效 |
+| `t_config.lua` | 29 | 别名 warn 不中断 / 未知值回落 / 上限校验 / 老校验仍生效 / `source_root_exclude` 默认 7 条 + append/replace/去重 |
+| `t_hash.lua` | 14 | 与 jar 侧旧 `filters_hash` **逐字节对拍** / djb2 边界 (空串、长串、非 ASCII) / 同输入同输出 / 两处缓存头共用同一指纹 |
 | `t_configure.lua` | 26 | `infer` → key 缺席; `core` → 三处 settings; 核心集全不存在 → 缺席; **buf 0 不是 java 文件时仍注入 / buf 0 是外部 java 文件时不注入**; invisible project 名复算 + 外部工程识别 |
 | `t_onfile.lua` | 13 | BufEnter → 异步扫描 → 累积 → 落缓存, 热路径时延 |
 | `t_exclusions.lua` | 14 | 冷缓存同步扫描 / `.project`+`.classpath` 双文件规则 / 空结果也落盘 |
 
-合计 **175** 条断言。
+合计 **214** 条断言。
 
 `t_inject.lua` 的第 10 组是本模块的"宪法测试": 它把 `vim.lsp.get_clients` 换成假
 client, 断言 `inject_sync` 与 `apply` 全程 **一条消息都没发**。任何人日后想"顺手把
@@ -832,6 +946,11 @@ Kotlin 侧 (KLS) 从一开始就是另一条线: KLS 不认 `sourcePaths`, 它�
 ## 12. 修改指引
 
 - **改剪枝规则** → bump `CACHE_VERSION`, 否则旧缓存带着已被剔掉的根继续用。
+  **只改 `source_root_exclude` 的内容 (含默认值) 不需要 bump** —— 它进缓存指纹
+  (第 2 行 `# exclude=`), 缓存会自动失效。
+- **动缓存头格式** → 源码根与 jar 两处都要看一眼: 指纹算法在
+  `util/hash.lua` 唯一一份, 改它等于同时改两边的缓存 (现存缓存会集体失效, 这是
+  可接受的 —— 但别在没测对拍的情况下改, `t_hash.lua` 里有旧实现副本)。
 - **绝不在运行期下发 `sourcePaths`** → §2.5。想"让累积立刻生效"的冲动只有一个正确
   出口: 让用户重建 jdtls 数据目录。`t_inject.lua` 第 10 组会拦住任何下发。
 - **加一个注入点** → 记住 §2.3 (空数组会关掉推断) 和 §2.7 (必须工作区相对路径)。

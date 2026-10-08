@@ -102,6 +102,9 @@ require("aosp-nav").setup({
   cache_dir = "~/.cache/nvim/aosp_nav",
   java = {
     jar_fallback_dir = "~/.usr/android_jars",
+    -- 追加到精选默认值之后 (默认值已覆盖 apct-tests/、test-*、integration-tests 等
+    -- 内建剪枝抓不到的测试目录); 想掀掉默认项请设 exclude_merge = "replace"
+    source_root_exclude = { "^external/cronet/" },
     exclude_paths = { "linux_glibc_common", "android_common_apex" },
     disable_folding_range = true,
     inlay_hints_mode = "auto",  -- "auto" | "off" | "all"
@@ -274,7 +277,7 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须 `:LspRestart` (
 | java.source_paths_mode | core | `core` = 注入预置核心集 + 累积打开过的项目的源码根 (默认; 累积部分下次重建工作区时生效); `infer` = 什么都不注入, 交给 jdt.ls 逐文件推断; `project` = 由 `workspace_mode = "project"` 自动选定 |
 | java.core_source_roots | {frameworks/base/core/java, frameworks/base/services/core/java} | 预置源码根 (相对 AOSP 根), 从首次导入起就注入。整表替换默认值 (同 `kotlin.curated_modules` 语义); 磁盘上不存在的条目自动跳过。给得越多首次索引越重 |
 | java.source_paths_max_projects | 8 | 累积的 `.git` 项目数上限 (LRU 淘汰, `0` = 不限)。上限与累积集合都会跨会话保留 |
-| java.source_root_exclude | {} | Lua 模式排除, 匹配源码根相对所属项目的路径, 如 `{ "^external/cronet/" }`。其余剪枝规则 (测试根 / JDK 影子根 / 同名影子根) 属算法的一部分 |
+| java.source_root_exclude | 7 条精选测试目录模式 (见下) | Lua 模式排除, 匹配源码根相对所属项目的路径, 如 `{ "^external/cronet/" }`。默认值补齐内建剪枝抓不到的测试目录家族 (`apct-tests/`、`perftests/`、`test-*`、`integration-tests`、`multivalentTests`、`testrunner-src`) —— frameworks/base 实测 28 个根 / 815 文件 ≈ 注入量的 6%。用户项**追加**在默认值之后 (走 `java.exclude_merge`); 写 `"replace"` 才掀掉默认项。改这个列表会自动让源码根缓存失效 (缓存头带指纹)。其余剪枝规则 (测试根 / JDK 影子根 / 同名影子根) 属算法的一部分 |
 | java.source_paths | nil | 显式指定 `java.project.sourcePaths` (相对 AOSP 根; 树内的绝对路径会自动转成相对, 树外的丢弃)。非空即完全接管: 不再使用核心集与项目累积。除非想钉死一份固定列表, 否则不要设置 |
 | java.exclude_self_jars            | false                                                        | **已废弃**: 工作区根改成 AOSP 根后, "root_dir 相对 android_root 的差值"恒为空, 该选项恒为 no-op。保留键只为不静默吞掉旧配置; 新配置请用 `exclude_jars` / `exclude_globs` |
 | java.make_jar_priority            | {classes.jar, classes-header.jar, javalib.jar}               | Make 构建系统 jar 优先级                                     |

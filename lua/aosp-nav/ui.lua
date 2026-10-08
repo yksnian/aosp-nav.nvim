@@ -123,12 +123,19 @@ function M.diagnose()
     if not rd or rd == "" then rd = c.config and c.config.root_dir end
     lines[#lines + 1] = line("jdtls",
       ("%d client(s), root=%s, id=%d"):format(#clients, tostring(rd), c.id), true)
-    -- vmargs (只读, 本插件从不写)
+    -- vmargs (只读, 本插件从不写)。判据是堆**够不够**, 不是"-Xmx 串在不在" ——
+    -- 实测 -Xmx6G 在 AOSP 全量下会 GC 死亡螺旋 (存活集 4G 正好等于 old gen),
+    -- 旧版只查字符串存在性, 这种情况照样显示绿灯, 属于误导
     local cmd = type(c.config) == "table" and c.config.cmd or nil
-    local joined = type(cmd) == "table" and table.concat(cmd, " ") or ""
-    local has_xmx = joined:find("-Xmx", 1, true) ~= nil
-    lines[#lines + 1] = line("jdtls vmargs", has_xmx and "has -Xmx" or "no -Xmx (AOSP 建议 >= 4G)",
-      has_xmx, action_if(has_xmx, "add --jvm-arg=-Xmx8G to the jdtls cmd"))
+    local vm = require("aosp-nav.util.jvm").assess(cmd)
+    local vm_text
+    if vm.xmx_text == nil then
+      vm_text = "no -Xmx"
+    else
+      vm_text = "-Xmx" .. vm.xmx_text .. (vm.xmx_ok and "" or " (偏小)")
+      if vm.parallel_gc then vm_text = vm_text .. " +ParallelGC" end
+    end
+    lines[#lines + 1] = line("jdtls vmargs", vm_text, vm.xmx_ok, vm.advice)
     -- referencedLibraries / import 设置
     local s = c.config and c.config.settings or {}
     local rl = s.java and s.java.project and s.java.project.referencedLibraries
@@ -211,6 +218,30 @@ function M.diagnose()
       lines[#lines + 1] = line("workspace blockers",
         #blockers == 0 and "none" or table.concat(blockers, ", "), #blockers == 0,
         #blockers > 0 and ":AospCleanWorkspace (这些工程让 invisible project 建不出来)" or nil)
+      -- 索引落盘状态: "索引不动"时最该看的一行。idx 只在空闲/退出时保存,
+      -- 会话被杀就什么都没写 —— 于是每次启动从头再来
+      local ix = M.index_state(wd)
+      if ix then
+        local age = os.time() - ix.newest
+        local fresh = age <= 3600
+        lines[#lines + 1] = line("jdtls index",
+          ("%d file(s) %.1f MB, newest write %s (%s)"):format(ix.files,
+            ix.bytes / 1048576,
+            ix.newest > 0 and os.date("%m-%d %H:%M", ix.newest) or "never",
+            age < 90 and "just now" or (age < 3600 and ("%d min ago"):format(age / 60)
+              or ("%dh ago"):format(age / 3600))),
+          fresh,
+          not fresh and "索引未落盘: 本会话可能仍在重建 (见 DEVELOPMENT.md 索引一节)" or nil)
+      end
+      -- 多个 JVM 抢同一份 -data: 索引互相覆盖, 表现为索引被反复删除重建
+      local others = M.foreign_jdtls(wd)
+      local me = #vim.lsp.get_clients({ name = "jdtls" })
+      local total = me + #others
+      lines[#lines + 1] = line("jdtls instances",
+        ("%d (this nvim: %d, others: %s)"):format(total, me,
+          #others == 0 and "none" or table.concat(others, ", ")),
+        total <= 1,
+        total > 1 and "两个 JVM 共用一份索引会互相覆盖: 关掉多余 nvim / kill 这些 pid" or nil)
     end
   end
 
@@ -342,6 +373,54 @@ function M.workspace_blockers(workspace_dir, root)
   return out
 end
 
+--- jdtls 索引目录的落盘状态。
+--- 为什么值得单独看: 索引文件**不是**"跑完就自动长久有效"的 —— 它只在
+--- IndexManager 空闲/退出时保存, 会话被杀掉就什么都没写。实测过一份数据目录:
+--- 1129 个 .index / 831MB, 其中 1126 个是 jar 索引 (单个 40–50MB), 而**工程源码
+--- 索引只有 25 字节 (空)** —— 于是每次启动都从头索引那 13k 个源码文件, 表现就是
+--- "打开很久了还在索引 / 索引不动"。newest 与当前时间的差就是判据。
+--- @param workspace_dir string|nil
+--- @return table|nil { files, bytes, newest, dir }
+function M.index_state(workspace_dir)
+  if not workspace_dir or workspace_dir == "" then return nil end
+  local dir = workspace_dir .. "/.metadata/.plugins/org.eclipse.jdt.core"
+  if vim.fn.isdirectory(dir) ~= 1 then return nil end
+  local files, bytes, newest = 0, 0, 0
+  for _, f in ipairs(vim.fn.glob(dir .. "/*.index", false, true)) do
+    files = files + 1
+    local sz = vim.fn.getfsize(f)
+    if sz > 0 then bytes = bytes + sz end
+    local t = vim.fn.getftime(f)
+    if t > newest then newest = t end
+  end
+  return { files = files, bytes = bytes, newest = newest, dir = dir }
+end
+
+--- 正在使用同一个 jdtls 数据目录 (-data) 的**别的** JVM 进程号。
+--- 两个 JVM 共用一份 .metadata 会互相覆盖索引与 .classpath, 实测症状:
+---   "Java Index broken - will be automatically deleted to repair"
+---   "Failed to save JDT index ... (No such file or directory)"
+---   同一次导入里 "Adding ... to the classpath" 计数翻倍 (1126 -> 2252)
+--- 而索引被反复删掉重建正是"索引不动"的一大来源。检测手段是直接读 /proc:
+--- 比 .metadata/.lock 可靠 (clean shutdown 会删掉 .lock, 崩溃遗留的 .lock 又
+--- 会误报 —— 而孤儿 JVM 的 cmdline 一直在)。
+--- 只报不杀: 杀进程是用户的决定。
+--- @param workspace_dir string|nil
+--- @return table pids 字符串进程号列表
+function M.foreign_jdtls(workspace_dir)
+  if not workspace_dir or workspace_dir == "" then return {} end
+  local out = {}
+  for _, p in ipairs(vim.fn.glob("/proc/[0-9]*", false, true)) do
+    local ok, lines = pcall(vim.fn.readfile, p .. "/cmdline", "", 1)
+    -- cmdline 是 NUL 分隔的, 用 \n join 只是为了拼成一个可搜索的字符串
+    local s = ok and lines and table.concat(lines, "\n") or nil
+    if s and s:find("equinox%.launcher") and s:find(workspace_dir, 1, true) then
+      out[#out + 1] = vim.fn.fnamemodify(p, ":t")
+    end
+  end
+  return out
+end
+
 --- :AospRescan — 清 jar 缓存并重扫 (替代手动 rm + 重启 nvim)
 function M.rescan()
   local jm = require("aosp-nav.java.jars")
@@ -436,7 +515,21 @@ function M.show_source_roots()
   local function cache_line(label, root)
     local f = root and sr.cache_file(root)
     local ok = f and vim.fn.filereadable(f) == 1
-    out[#out + 1] = ("  %-40s %s"):format(label, ok and f or "(none)")
+    local note = ""
+    if ok then
+      -- 顺带把缓存里的剪枝统计摊开: excl= 是"用户排除模式剔掉的根数",
+      -- test=/jre=/shadow= 是内建剪枝, 用来判断排除配置是否真的生效
+      local roots, stats = sr.load(root)
+      if stats then
+        note = ("  [roots=%d files=%d excl=%d test=%d jre=%d shadow=%d]"):format(
+          stats.roots or #(roots or {}), stats.files or 0, stats.exclude_dropped or 0,
+          stats.test_dropped or 0, stats.jre_dropped or 0, stats.shadow_dropped or 0)
+      else
+        -- 文件在但读不出来 = 版本或排除指纹对不上, 下次会重扫
+        note = "  [stale: 版本或 source_root_exclude 已变, 下次使用时会重扫]"
+      end
+    end
+    out[#out + 1] = ("  %-40s %s%s"):format(label, ok and f or "(none)", note)
   end
   cache_line("core@aosp-root", st.aosp_root)
   for _, p in ipairs(st.projects) do

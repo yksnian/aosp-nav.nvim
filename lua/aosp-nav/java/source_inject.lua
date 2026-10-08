@@ -414,10 +414,17 @@ function M.apply()
   if added > 0 and not _notified_stale then
     _notified_stale = true
     vim.schedule(function()
+      -- 说清代价再让用户决定: 这一步是**整库重建**(已注入的源码根全部重索引),
+      -- 实测在 frameworks/base 上以小时计。而只 :LspRestart 不生效 —— invisible
+      -- project 已存在时 InvisibleProjectImporter.loadInvisibleProject 的第一道
+      -- 闸门直接 return, initialize 里新带的 sourcePaths 会被静默忽略
+      -- (实测: 4 次启动里工程只在第 1 次被创建)。
       vim.notify(
-        ("aosp-nav: 已累积 %d 个源码根, 需 :AospCleanWorkspace 重建 jdtls 工作区后生效 "
-          .. "(累积项目: %d 个; 只 :LspRestart 不生效)"):format(added, #_order),
-        vim.log.levels.INFO)
+        ("aosp-nav: 已累积 %d 个源码根 (累积项目: %d 个), 尚未生效。\n"
+          .. "生效需要 :AospCleanWorkspace 重建 jdtls 工作区 —— 代价是整库重新索引 "
+          .. "(当前注入规模下以小时计), 且只 :LspRestart 一定不生效。\n"
+          .. "只想读当前这几个根就别重建; 下次启动新工作区时会自动带上。"):format(added, #_order),
+        vim.log.levels.INFO, { timeout = 12000 })
     end)
   end
   return added

@@ -13,6 +13,9 @@ local _deprecated_warned = {}
 -- [v9] 已就"工作区存在外部可见工程"提示过的 root (每 root 每会话一次)
 local _blockers_warned = {}
 
+-- [v9] 已就"多个 jdtls 共用同一数据目录"提示过的 -data (每目录每会话一次)
+local _instances_warned = {}
+
 --- 提示已失效的配置键 (只提示一次)
 local function warn_deprecated(java_cfg)
   if java_cfg.exclude_self_jars and not _deprecated_warned.exclude_self_jars then
@@ -329,7 +332,8 @@ function M.configure(opts)
   --     import.exclusions 只挡新导入, 只有 :AospCleanWorkspace 能清掉。
   if is_android and java_cfg.workspace_mode == "aosp" and root_path then
     local ui = require("aosp-nav.ui")
-    local blockers = ui.workspace_blockers(ui._workspace_dir(bufname), root_path)
+    local ws_dir = ui._workspace_dir(bufname)
+    local blockers = ui.workspace_blockers(ws_dir, root_path)
     if #blockers > 0 and not _blockers_warned[root_path] then
       _blockers_warned[root_path] = true
       vim.notify(("[aosp-nav] jdtls 工作区里存在 %d 个外部可见工程 (%s) — "
@@ -337,6 +341,20 @@ function M.configure(opts)
         .. "跑 :AospCleanWorkspace 重建 jdtls 工作区 (排除项已就绪, 下次不会再导入)。")
         :format(#blockers, table.concat(blockers, ", ")),
         vim.log.levels.WARN, { timeout = 15000 })
+    end
+
+    -- 14. 单实例自检。两个 jdtls JVM 共用同一个 -data 会互相覆盖索引与 .classpath,
+    --     实测症状是 "Java Index broken - will be automatically deleted to repair"
+    --     与索引被反复删除重建 —— 正是"索引不动"的一大来源。只提示, 不杀进程。
+    local others = ui.foreign_jdtls(ws_dir)
+    if #others > 0 and not _instances_warned[ws_dir or ""] then
+      _instances_warned[ws_dir or ""] = true
+      vim.notify(("[aosp-nav] 已有 %d 个 jdtls 进程 (pid %s) 正在使用同一个数据目录:\n"
+        .. "  %s\n"
+        .. "两个 JVM 共用一份索引会互相覆盖 (症状: 索引被反复删除重建、Java Index broken)。\n"
+        .. "建议只保留一个: 关掉另一个 nvim, 或 kill 掉这些 pid 后 :AospCleanWorkspace 重建。")
+        :format(#others, table.concat(others, ", "), ws_dir or "?"),
+        vim.log.levels.WARN, { timeout = 20000 })
     end
   end
 

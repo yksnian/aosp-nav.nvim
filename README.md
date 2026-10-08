@@ -108,6 +108,8 @@ require("aosp-nav").setup({
       "frameworks/base/services/core/java",
     },
     source_paths_max_projects = 8,  -- LRU bound on accumulated projects (0 = unlimited)
+    -- Appended to the curated defaults (test-suite dirs the built-in pruning
+    -- misses); use exclude_merge = "replace" to drop the defaults instead
     source_root_exclude = { "^external/cronet/" },
     exclude_paths = { "linux_glibc_common", "android_common_apex" },
     disable_folding_range = true,
@@ -286,7 +288,7 @@ The scan is synchronous (a large tree may take seconds); it finishes by telling 
 | java.source_paths_mode | core | `core` = inject the preset core set plus the roots of every project you open (default); `infer` = inject nothing and let jdt.ls infer per-file source roots; `project` = set automatically by `workspace_mode = "project"` |
 | java.core_source_roots | {frameworks/base/core/java, frameworks/base/services/core/java} | Preset source roots, relative to the AOSP root, injected from the first import. Replaces the default list wholesale (same semantics as `kotlin.curated_modules`); entries missing on disk are skipped. Bigger = heavier first index |
 | java.source_paths_max_projects | 8 | Upper bound on accumulated `.git` projects (LRU eviction, `0` = unlimited). The bound and the accumulated set survive restarts |
-| java.source_root_exclude | {} | Lua-pattern exclusions applied to a root's path relative to its project, e.g. `{ "^external/cronet/" }`. Other pruning rules (test roots, JDK-shadowed roots, duplicate-class shadow roots) are part of the algorithm |
+| java.source_root_exclude | 7 curated test-suite patterns (see below) | Lua-pattern exclusions applied to a root's path relative to its project, e.g. `{ "^external/cronet/" }`. Ships with defaults covering the test-suite directory families the built-in pruning misses (`apct-tests/`, `perftests/`, `test-*`, `integration-tests`, `multivalentTests`, `testrunner-src`) — measured at 28 roots / 815 files ≈ 6% of the injected tree on `frameworks/base`. User entries are **appended** to the defaults (`java.exclude_merge`); `"replace"` drops them. Changing the list invalidates the source-roots cache automatically (fingerprint in the cache header). Other pruning rules (test roots, JDK-shadowed roots, duplicate-class shadow roots) are part of the algorithm |
 | java.source_paths | nil | Explicit `java.project.sourcePaths`, relative to the AOSP root (absolute paths under the root are converted; entries outside it are dropped). Non-empty = full takeover: the core set and project accumulation are not used. Leave it unset unless you want to pin one fixed list |
 | java.source_patterns              | —                                                            | **Deprecated** (the shallow scan it configured was removed); setting it warns once and has no effect |
 | java.disable_folding_range        | true                                                         | Disable foldingRange (avoids -32603)                         |

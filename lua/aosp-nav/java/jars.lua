@@ -56,18 +56,13 @@ local OWN_SOURCE_TAGS = { javac = true, kotlinc = true }
 -- [v6] filters 指纹: 排除类配置的 djb2 hash, 写进缓存头 (# filters=...)。
 -- 排除配置变化 → hash 变 → 缓存自动作废重扫, 不再依赖用户手动 rm 或 bump
 -- CACHE_VERSION (教训: exclude_globs 用户覆盖曾导致默认桩排除静默失效)
+-- 算法在 util/hash.lua, 与源码根缓存的 # exclude= 共用 (见该文件说明)
 local function filters_hash(java_cfg)
-  local subset = {
+  return require("aosp-nav.util.hash").fingerprint({
     exclude_jars = java_cfg.exclude_jars,
     exclude_paths = java_cfg.exclude_paths,
     exclude_globs = java_cfg.exclude_globs,
-  }
-  local s = vim.inspect(subset)
-  local h = 5381
-  for i = 1, #s do
-    h = (h * 33 + s:byte(i)) % 4294967296
-  end
-  return string.format("%08x", h)
+  })
 end
 
 -- [v6] classpath 目录优先级排序: referencedLibraries 有序, JDT 按序取类。

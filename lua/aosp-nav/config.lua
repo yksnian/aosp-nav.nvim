@@ -5,11 +5,14 @@ local M = {}
 
 -- [v7] 排除类列表家族: 这些键按 java.exclude_merge 语义合并 (append = 用户项
 -- 拼在默认项之后), 其余字段走 tbl_deep_extend 的整表替换语义。
--- import_exclusions 与 exclude_* 同族 (都是"用户几乎只想追加"的清单)
+-- import_exclusions 与 exclude_* 同族 (都是"用户几乎只想追加"的清单);
+-- [v9] source_root_exclude 也进这一族 —— 它是源码根侧与 exclude_globs 对位的
+-- 那个键, 带精选默认值, 用户追加而不是推翻 (对齐 jar 侧的既有语义)。
 local EXCLUSION_LIST_KEYS = {
   "exclude_jars",
   "exclude_paths",
   "exclude_globs",
+  "source_root_exclude",
   "import_exclusions",
 }
 
@@ -118,7 +121,33 @@ M.defaults = {
     -- [v8] 源码根剪枝: Lua 模式列表 (同 exclude_globs 语义), 匹配**项目内相对
     -- 路径**的根会被整根剔掉, 例如 { "^external/cronet/" }。
     -- 其余剪枝规则 (测试根 / JDK 影子根 / 同名影子根) 是算法的一部分, 不可配。
-    source_root_exclude = {},
+    --
+    -- [v9] 与 jar 侧的 exclude_globs 完全对位: 带精选默认值 + 走 exclude_merge
+    -- 的 append 语义 (用户项追加在默认项之后, 不挤掉默认项), 且进源码根缓存的
+    -- 指纹 (# exclude=..., 见 util/hash.lua), 改一条模式缓存自动失效。
+    -- 默认值由 frameworks/base 全树实测反推: 内建的测试根剪枝只做"整段等于
+    -- test/tests/cts/..."匹配 (source_roots.lua 的 TEST_SEGS), 于是段名带前后缀
+    -- 或 camelCase 的测试目录全部漏网 —— 实测残留 28 个根 / 815 个 .java 文件,
+    -- 占注入文件的 6.1%。下面 7 条把这类目录补齐:
+    --   ^apct%-tests/      APCT 性能/兼容测试套件 (perftests/*/src, 单根最大 321 文件)
+    --   ^perftests/        同上, perftests 直接挂在项目根时
+    --   ^test%-            顶层 test-* 单测库 (test-base / test-junit / test-mock / test-runner)
+    --   /test%-            任意深度的 test-* (ravenwood/tools/hoststubgen/test-tiny-framework/*)
+    --   testrunner%-src    uiautomator 的测试运行器源码目录
+    --   integration%-tests aapt2 集成测试工程 (TEST_SEGS 里只有 "integration", 段名对不上)
+    --   multivalentTests   SystemUI 多形态测试 (camelCase 段名, 264 文件)
+    -- 注意 samples/ 下的样例应用**不**默认排除 (它们不是测试, 且可能被用户当参考
+    -- 读); 想排除自己加一条 "^samples/" 即可。
+    -- 想放开某条默认项: 把 exclude_merge 设为 "replace" 并写全你要的模式。
+    source_root_exclude = {
+      "^apct%-tests/",
+      "^perftests/",
+      "^test%-",
+      "/test%-",
+      "testrunner%-src",
+      "integration%-tests",
+      "multivalentTests",
+    },
     -- [v7] DEPRECATED / 已失效: 工作区根现在恒等于 AOSP 根 (java/root.lua), 而
     -- 自排除的判定基准是"root_dir 相对 android_root 的差值", 两者恒等 → 恒为
     -- 空 → 永远匹配不到任何 jar, 该开关不再产生任何效果。
