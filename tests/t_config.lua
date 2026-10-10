@@ -59,4 +59,39 @@ local user_opts = { java = { mode = "aosp", workspace_mode = "project" } }
 config.merge(user_opts)
 H.eq(user_opts.java.workspace_mode, "project", "merge 不改写调用方传入的原始表")
 
+-- ---------------------------------------------------------------------------
+-- [v11] 重复 setup 不得把用户配置打回默认值
+-- 回归: config.merge 只以 M.defaults 为底, 而 plugin/aosp-nav.lua 每个命令回调都
+-- 调 setup() 空参 —— 实测 kotlin.jar_mode 配 "all" 跑一次 :Aosp 就变回 "curated"
+-- (面板显示的就是这个错值), log_level 也一起回落。
+-- 修法: merge(user_opts, base) 支持 base = 已生效配置, setup 重复调用时传它;
+-- 原先只保住 java 排除名单的 merge_lists 补丁随之删除。
+-- ---------------------------------------------------------------------------
+local nav = require("aosp-nav")
+nav.setup({ kotlin = { jar_mode = "all" }, log_level = "debug" })
+H.eq(nav.config.kotlin.jar_mode, "all", "setup(opts) 后 kotlin.jar_mode 生效")
+H.eq(D.kotlin.jar_mode, "curated", "前置条件: 代码默认值仍是 curated")
+
+local prev = nav.config
+nav.setup()                                   -- 命令回调里的空参调用
+H.eq(nav.config.kotlin.jar_mode, "all", "空参 setup() 之后 jar_mode 仍是用户值")
+H.eq(nav.config.log_level, "debug", "空参 setup() 之后 log_level 仍是用户值")
+H.check(nav.config ~= prev, "setup 仍产出新表 (不就地改旧表)")
+H.eq(prev.kotlin.jar_mode, "all", "旧 config 表未被就地改写 (这次改的是它的值)")
+H.eq(prev.log_level, "debug", "旧 config 表未被就地改写 (log_level)")
+
+-- 第二次带参 setup: 新键生效, 上一次的键不丢
+nav.setup({ java = { mode = "infer" } })
+H.eq(nav.config.java.mode, "infer", "第二次 setup 的新值生效")
+H.eq(nav.config.kotlin.jar_mode, "all", "第二次 setup 不丢上一次的 kotlin.jar_mode")
+H.eq(nav.config.log_level, "debug", "第二次 setup 不丢上一次的 log_level")
+
+-- 排除名单的 append 语义照旧 (base 换了也不许回归)
+nav.setup({ java = { exclude_jars = { "my-jar" } } })
+H.check(vim.tbl_contains(nav.config.java.exclude_jars, "my-jar"), "用户排除项在")
+H.check(vim.tbl_contains(nav.config.java.exclude_jars, D.java.exclude_jars[1]),
+  "默认排除项与用户项并存 (append 语义未回归)")
+nav.setup({})                                 -- 空表与 nil 同样不能清空用户配置
+H.eq(nav.config.kotlin.jar_mode, "all", "空表 setup({}) 之后 jar_mode 仍是用户值")
+
 H.finish("t_config")

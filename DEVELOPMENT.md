@@ -738,6 +738,42 @@ exclusions/gradle 禁用) 的 jdtls; 每跳一次攒一个 ~45 MB 的垃圾工�
 > `t_virtual_root.lua` 的"真实文件不劫持"那一组就是这么绿的)。现在用
 > `vim.fs.root` + `isdirectory` 自足实现, 并单独断言抛错的情形。
 
+### 2.14 重复 setup 会把用户配置打回默认值 (`M.merge` 的 `base`)
+
+**症状** (用户报告): `:Aosp` 面板的 kotlin 行显示 `enabled=true mode=curated`, 可
+`~/.config/nvim/lua/plugins/aosp-nav.lua` 里写的是 `jar_mode = "all"` —— 面板显示的
+是**代码默认值**。同一根因还静默影响 `log_level` (用户开的 `debug` 逛一次 `:Aosp`
+就回落成 `warn`)。
+
+**根因**: `config.merge(user_opts)` 恒定以 `M.defaults` 为底
+(`vim.tbl_deep_extend("force", M.defaults, opts)`), 而 `plugin/aosp-nav.lua` 的**每个**
+命令回调都先 `require("aosp-nav").setup()` (4 处空参调用) → `merge({})` 就是"整体覆盖
+成默认值"。唯一被保住的是 java 排除名单 —— v6 起有个 `merge_lists` 专门把它们从已生效
+配置搬到新 opts 里。**这个补丁本身就是旁证**: 它说明作者当时已经发现空参 setup 会重置,
+但只把结论用在列表上, 没有推广到其余键。于是 `jar_mode`/`log_level`/`android_root`/
+`java.mode`… 全部随命令一起回默认。
+
+实测复现 (headless):
+
+```
+setup{ kotlin.jar_mode="all", log_level="debug" }  ->  jar_mode=all   log_level=debug
+setup()                                            ->  jar_mode=curated log_level=warn
+```
+
+**修法**: `M.merge(user_opts, base)` 增加 `base` 参数 (默认 `M.defaults`; 顶层 setup 在
+重复调用时传**已生效的** `M.config`), 排除名单 append 语义的参照表跟着 `base` 走。
+`M.merge` 仍返回新表、不改动 `user_opts` 与 `base` (后者现在是活配置, 由
+`t_config.lua` 断言钉住)。原先那个只救列表的 `merge_lists` 随之删除 —— 它解决的正是
+这件事, 而 `base` 一次做全, 不留两套合并路径。
+
+**为什么不能只加"空参就 return"**: 那能治好面板这一例, 但 `setup{a}` 再 `setup{b}`
+照样丢 `a` 的键。真正该消灭的是"以默认值为底"这个默认假设。
+
+覆盖: `tests/t_config.lua` 新增 13 条 (合计 31) —— 空参 `setup()` 后用户值仍在 /
+第二次带参 setup 新值生效且旧键不丢 / `setup({})` 同样不清空 / 新表产出且旧表不被就地
+改写 / 排除名单 append 语义未回归 / **前置断言代码默认值确实是 `curated`** (否则这组
+测试会因为"默认值恰好等于用户值"而假通过)。
+
 ---
 
 ## 3. 导航模式
@@ -1437,7 +1473,7 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | 套件 | 断言 | 覆盖 |
 | ---- | ---- | ---- |
 | `t_commands.lua` | 13 | 命令面冻结契约: 恰好 4 个 `:Aosp*` 命令, 且删掉的那 7 个一个都不在 |
-| `t_config.lua` | 18 | 本轮重构引入/删除的键: 死键静默丢弃 (不映射、不告警) / `merge` 不改调用方的表 / `source_apply_max_roots` 不再是配置键 |
+| `t_config.lua` | 31 | 本轮重构引入/删除的键: 死键静默丢弃 (不映射、不告警) / `merge` 不改调用方的表 / `source_apply_max_roots` 不再是配置键 / **重复 setup 不得打回默认值** (见 §2.14): 空参 `setup()` 后 `kotlin.jar_mode`·`log_level` 仍是用户值 / 第二次带参 setup 不丢上一次的键 / 新表产出且旧表不被就地改写 / 排除名单 append 语义未回归 |
 | `t_log.lua` | 54 | `util/log.lua`: 四档阈值比较 / `log.user` 绕过阈值 / 会话内 `once` 去重 / `once` 被阈值挡下时**不消费**登记 / 消息前缀 |
 | `t_path.lua` | 14 | `util/path.start_dir`: `nil`/`""` 归一成 cwd, 绝不能给 `"."` (§7 痛点 4 的根因) |
 | `t_proc.lua` | 10 | `util/proc`: `/proc/<pid>/cmdline` 必须**真的按 NUL 切开参数** (回归"一个 nvim 报 2 个 jdtls 实例") / `is_descendant` 自反与否定 |
@@ -1447,8 +1483,8 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_root_fallback.lua` | 22 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 |
 | `t_workspace.lua` | 31 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 | 
 
-合计 **229** 条断言 (上表各文件是带 `AOSPNAV_LIVE_TEST=1` 的行数; 默认跑法则
-`t_root_from_cwd` 13 / `t_source_apply` 22, 共 **216**)。
+合计 **242** 条断言 (上表各文件是带 `AOSPNAV_LIVE_TEST=1` 的行数; 默认跑法则
+`t_root_from_cwd` 13 / `t_source_apply` 22, 共 **229**)。
 
 `source_apply` 的分界是明的: `pending()` **不发任何请求** (纯读 `.classpath` + 算差集);
 发请求的只有 `add_serial` —— 手动经 `:Aosp!`, 或自动经 `source_apply.auto_apply()`

@@ -18,12 +18,10 @@ M._state = {
 --- @return table M (self, 支持链式调用)
 function M.setup(opts)
   opts = opts or {}
-  -- 重复 setup 时 (如命令回调的 setup() 空参调用) 按拼接语义保留已生效的
-  -- 排除类列表: 直接 merge({}) 会把用户配置整体重置回默认值
-  if M._state.setup_done and M.config then
-    opts = config.merge_lists(M.config, opts)
-  end
-  M.config = config.merge(opts)
+  -- 重复 setup (命令回调里的 setup() 空参调用到处都是) 必须**以已生效配置为底**,
+  -- 不能重新从默认值起: 否则一次 :Aosp 就会把用户配置整体打回默认 —— 实测
+  -- kotlin.jar_mode 配了 "all", 跑一次命令变回 "curated", 面板显示与日志阈值一起错。
+  M.config = config.merge(opts, M._state.setup_done and M.config or nil)
   -- [v10] 合并成功后把日志阈值推给 util/log.lua —— 这是两者唯一的连接点
   -- (util/log 故意不 require config, 否则 config 校验失败时要用 log 报错会成环)。
   -- 放在 validate 之前, 让校验自身的提示也走用户设定的阈值。

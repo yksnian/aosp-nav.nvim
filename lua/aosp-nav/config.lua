@@ -1,5 +1,5 @@
 -- config.lua: 默认配置 + 校验 + 合并
--- 提供 M.defaults, M.validate, M.merge, M.merge_lists
+-- 提供 M.defaults, M.validate, M.merge
 
 local M = {}
 
@@ -370,36 +370,6 @@ local function append_list(defaults_list, user_list)
   return out
 end
 
---- [v6] 两次 setup 的配置合并: 已生效配置与新用户 opts 中, 排除类列表按
---- append 拼接 (两批用户项都不丢), 其余字段新值优先。
---- [v7] import_exclusions 与 exclude_* 同族, 一并按 append 处理。
---- 供顶层 setup 在重复 setup 时使用
---- @param base table 已生效配置 (M.config)
---- @param opts table 新的用户 opts
---- @return table opts 合并后的用户 opts (供 merge 使用)
-function M.merge_lists(base, opts)
-  local j = base and base.java or nil
-  opts = vim.deepcopy(opts) or {}
-  opts.java = opts.java or {}
-  for _, key in ipairs(EXCLUSION_LIST_KEYS) do
-    local prev = j and j[key] or nil
-    local cur = opts.java[key]
-    if prev and #prev > 0 then
-      local out = {}
-      local seen = {}
-      for _, v in ipairs(prev) do
-        seen[v] = true
-        out[#out + 1] = v
-      end
-      for _, v in ipairs(cur or {}) do
-        if not seen[v] then out[#out + 1] = v end
-      end
-      opts.java[key] = out
-    end
-  end
-  return opts
-end
-
 --- 合并用户配置到默认配置
 --- 排除类列表 (exclude_jars/paths/globs/import_exclusions) 按 java.exclude_merge 语义处理:
 ---   append (默认) = 默认项 + 用户项拼接 (用户几乎总是想追加而非推翻默认
@@ -408,14 +378,20 @@ end
 ---   replace = 整体替换 (旧行为)
 --- 其余字段沿用 tbl_deep_extend force 语义
 --- @param user_opts table|nil 用户传入的配置
---- @return table 合并后的配置
-function M.merge(user_opts)
+--- @param base table|nil 合并的**底**, 默认 M.defaults。
+---   重复 setup 时必须传**已生效的** M.config —— 否则一个空参 setup() (命令回调里
+---   到处都是) 会把用户配置整体打回默认值: 实测 kotlin.jar_mode 配了 "all",
+---   跑一次 :Aosp 就变回 "curated" (面板显示、日志阈值一起错)。
+--- @return table 合并后的配置 (新表, 不改动 user_opts 与 base)
+function M.merge(user_opts, base)
   -- [v10] 在副本上丢弃旧键, 不改写调用方的表
   local opts = vim.deepcopy(user_opts) or {}
   drop_legacy_keys(opts)
-  local merged = vim.tbl_deep_extend("force", M.defaults, opts)
+  base = base or M.defaults
+  local merged = vim.tbl_deep_extend("force", base, opts)
 
-  local j = M.defaults.java
+  -- 追加语义的参照表 = 底 (默认值, 或上次已生效的配置)
+  local j = base.java or M.defaults.java
   if merged.java and merged.java.exclude_merge == "append" then
     for _, key in ipairs(EXCLUSION_LIST_KEYS) do
       local user_list = opts.java and opts.java[key]
