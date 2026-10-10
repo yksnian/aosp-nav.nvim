@@ -130,7 +130,8 @@ if (!ProjectUtils.getVisibleProjects(rootPath).isEmpty()) return false;
    `<AOSP>/frameworks/base/tests/TouchLatency/app/.project`), AOSP 根的 invisible
    project 就永远建不出来** —— 所有 java 文件都落进 `jdt.ls-java-project` 这个假工程,
    `.classpath` 只有一条 `src("src")`、0 个 jar, 跳转/补全全部退化。
-   而且**不可逆**: 该工作区里再怎么改配置也不会重试, 只能换 workspace 目录。
+   而且**不可逆**: 该工作区里再怎么改配置也不会重试, 只能换 workspace 目录 ——
+   但那个"可见工程"往往只是个**空壳**, 不必整个重建, 见 §2.12。
 2. 另一入口 `importToWorkspace` (`InvisibleProjectImporter.java:92`, VSCode 的
    `initializationOptions.triggerFiles` 走这条) 排在 importer 列表**最后**
    (Gradle → Maven → Eclipse → Invisible), 且同样受第 1 条闸门约束 ——
@@ -415,8 +416,8 @@ AOSP 树内) 时, 退到**任一已加载且落在 AOSP 树内的 `.java` 缓冲
 
 **新一轮的护栏**: `configure` 第 13 步做工作区污染自检 (`ui.workspace_blockers`) ——
 若 `-data` 目录里已有非 `jdt.ls-java-project`、非复算出的 invisible project 的工程,
-立即 warn 并指出 `:AospCleanWorkspace`。症状与原因的对应关系否则完全看不出来,
-而它是**不可逆**的 (见 §2.1)。
+说明这套配置白配了 (症状与原因的对应关系否则完全看不出来), 于是**自己把空壳清掉**,
+清不掉的活工程才提示。判据、安全闸与"什么时候才提 `:AospCleanWorkspace`"全在 §2.12。
 
 ### 2.9 运行期**增量**加法: `java.project.addToSourcePath` (v9)
 
@@ -532,9 +533,9 @@ AOSP 树内) 时, 退到**任一已加载且落在 AOSP 树内的 `.java` 缓冲
 
 | # | 场景 | 触发点 |
 | - | ---- | ------ |
-| 1 | 工作区里存在外部可见工程, 需要 `:AospCleanWorkspace` (不可逆, §2.1/§2.8) | `java/init.lua:422` |
-| 2 | 有别的 jdtls 进程共用同一个 `-data` 目录 (索引互相覆盖, §8.1) | `java/init.lua:436` |
-| 3 | 破坏性的 `:AospCleanWorkspace` 确认 | `ui.lua:716` |
+| 1 | 工作区里存在**活**的外部可见工程 (空壳已自清, §2.12); 仅在有 Gradle 下载证据时才追加 `:AospCleanWorkspace` 指引 | `java/init.lua:470` |
+| 2 | 有别的 jdtls 进程共用同一个 `-data` 目录 (索引互相覆盖, §8.1) | `java/init.lua:512` |
+| 3 | 破坏性的 `:AospCleanWorkspace` 确认 | `ui.lua:876` |
 | 4 | 自动注入源码根在耗尽重试预算后失败 (§2.9) | `java/source_apply.lua:454` |
 | 5 | 首次运行需同步扫描残留 Eclipse 目录 (排除项冷缓存, 数秒) | `java/import_exclusions.lua:160` |
 
@@ -578,6 +579,65 @@ make 构建 (Android 14 及更早) 的那条路按 `java.make_jar_priority` 在
   导入, attach 期再发已晚 (§2.1、§9.3 闸门 B)。
 - **inlay-hints**: AOSP jar 里损坏的签名会让 inlay-hints 路径抛 NPE, 所以
   `java.inlay_hints_mode = "auto"` 在有 AOSP jar 时强制关, 纯 Java 工程放开到 `all`。
+
+### 2.12 工作区被"可见工程"阻塞: 空壳自清 (`ui.orphan_project` 家族)
+
+**症状**: 打开 AOSP 树里的 java 文件, jdt.ls **几秒就结束索引**, 跳转落进
+`jdt.ls-java-project`。原因就是 §2.1 的第一条闸门 —— `-data` 工作区里存在任何一个
+位置在 AOSP 根之下的可见工程, invisible project 就永远建不出来。
+
+**阻塞物从哪来**: `EclipseProjectImporter` 扫树时, 只要某目录同时有 `.project` 与
+`.classpath` 就导入它 (本机案例: `frameworks/base/tests/TouchLatency/app`, 一个 Gradle
+测试工程)。排除了也没用的情况是**历史上已经导入过**、`.projects/` 里留下了记录。
+
+**两类阻塞物, 处置完全不同** (判据全部只读):
+
+| 类 | 特征 | 处置 |
+| -- | ---- | ---- |
+| **(a) 空壳** | 工作区侧只剩 `.projects/<名>/` 那一层元数据: `.location`/`.markers*`/`.syncinfo.snap`, `org.eclipse.jdt.core/` 是空的; 资源树 (`.root/<N>.tree` 与 `<N>.snap`) 里**已经没有它这个工程根** | **直接删** (`ui.remove_project_metadata`) |
+| **(b) 真工程** | JDT 元数据 (如 `org.eclipse.jdt.core/state.dat`) 有实体文件, 或名字仍独占资源树的一行 | 只提示, 不动 |
+
+空壳是 jdt.ls 自己的 `deleteInvalidProjects` 摘掉工程时留下的目录 (本机案例只占 4 个
+文件 24 KB, 而 931 MB 的索引一个字节都不在它名下) —— **删了不丢任何东西**: 源码在源码
+树里, 资源树里没有它的条目。删完也不会"长回来": 该路径已在
+`import_exclusions-<root-key>.txt` 里 (§2.1 的扫描规则正好只认同时含 `.project` 与
+`.classpath` 的目录), 下次 jdtls 启动不会再导入它。
+
+**为什么不干脆都清工作区**: jdt.ls 1.61.0 **没有** deleteProject 这类命令 (拆
+`org.eclipse.jdt.ls.core_1.61.0.*.jar` 验证: 注册的只有 addToSourcePath /
+createModuleInfo / getAll / getClasspaths / getSettings / import / isTestFile /
+listSourcePaths / refreshDiagnostics / resolveText / updateClassPaths / updateJdk /
+updateSettings / upgradeGradle), 插件手里只剩全量 `rm -rf` 这一条通路。而清工作区的代价
+是整库重建 + 13187 文件重索引 (§8, 数十分钟), 与"删 24 KB"完全不成比例 —— 于是这一轮
+把手术刀交回插件自己。
+
+**安全闸 (动手前必过)**: 只有 `ui.jdtls_holders(ws) == 0` 时才删 —— 即**没有任何 JVM 的
+argv 里带着这个 `-data`** (`util/proc.argv` 逐参数匹配, 不是子串匹配; §8.1 的
+`foreign_jdtls` 是它的带"排除自己"变体)。理由: jdt.ls 退出/保存时会把内存里的资源模型
+**写回磁盘**, 对着活工作区删只是白删 (下次快照又写回来), 对着被两个 JVM 共用的 `-data`
+删则更糟。`configure()` 跑在 lazy spec-opts 求值期, 早于本会话的 jdtls 客户端启动,
+天然落在安全窗口内; 真有别的 nvim 正开着同一工作区, 那本来就会触发 §8.1 的告警。
+
+**剩下的活工程才开口, 而且分两种口吻** (`java/init.lua` 第 13 步):
+
+- 有活工程时必报 `log.user` (症状与原因否则对不上), 并逐个列出
+  `ui.project_location()` 从 `.location` 里解出的**真实源码路径**, 而不是工程名 ——
+  用户才知道该去看哪个目录。
+- `:AospCleanWorkspace` 那句话**只在有 Gradle 下载/同步证据时**才追加
+  (`ui.gradle_download_evidence`: `.metadata/.log` 里出现 `services.gradle.org/distributions`
+  或 `Could not run phased build action`)。因为 `java.import.gradle.enabled = false` 只挡
+  **新**导入, 挡不住已注册 Gradle 工程的**加载** —— 那些工程每次启动都要重跑一次 Gradle
+  同步并尝试联网下载发行版 (离线工作站上表现为卡住), 这种时候清工作区才是**真的**有用;
+  没有 Gradle 证据时, 全量重建没有收益, 提示只会把人往坑里带。
+- 空壳的处置结果只进日志 (`log.debug`): 插件替用户扫了地, 用户不需要知道。
+
+`:Aosp` 面板的 `workspace blockers` 行同源: 空壳标注
+`(orphan shell: removed automatically on next start)`, 只有 `n_live > 0` 时才在 hint 里
+写 `:AospCleanWorkspace`。
+
+覆盖: `tests/t_workspace.lua` (31 条) —— 用临时目录造一个假工作区, 断言空壳判定的正反
+例 (含"名字只作为树里某条路径的片段出现仍算空壳"这个 `grep -x` 整行语义)、删除的越界
+防护、Gradle 证据的三种日志变体、以及持有者探测。
 
 ---
 
@@ -1126,6 +1186,9 @@ jar)。README 的 AIDL FAQ 保留这一段结论, 机制在此。
 第三行说明树里的 gradle 工程必须靠 `initializationOptions` 里的
 `java.import.gradle.enabled=false` 挡住, attach 期再发已经晚了 (§9.3 闸门 B)。
 
+第二行里的 `app` 后来查明只是个**空壳** (树里已经没有它, 工作区侧只剩 4 个文件 24 KB),
+删掉那一个目录就恢复了, 不必清工作区 —— §2.12 现在把这件事自动化了。
+
 ### 8.2 本会话取证 (2026-10-09, 真机 workspace)
 
 以下把**测量**与**推断**分开标注。被测对象: 活的
@@ -1280,11 +1343,12 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_path.lua` | 14 | `util/path.start_dir`: `nil`/`""` 归一成 cwd, 绝不能给 `"."` (§7 痛点 4 的根因) |
 | `t_proc.lua` | 10 | `util/proc`: `/proc/<pid>/cmdline` 必须**真的按 NUL 切开参数** (回归"一个 nvim 报 2 个 jdtls 实例") / `is_descendant` 自反与否定 |
 | `t_root_from_cwd.lua` | 20 | 痛点 4 的**端到端**回归: 起在 AOSP 根、不打开任何 `.java` 文件时 `aosp_root(nil/"")` 仍拿到树根 (真树断言部分需 `AOSPNAV_LIVE_TEST=1`) |
-| `t_phase.lua` | 18 | `phase` 是活状态的冻结契约: `ui.statusline()` 对 `idle`/`ready`/`indexing`/`no-out`/`failed` 五态各自的渲染 (`indexing` 必须带 `(idx)`) / `install_phase_handler` **链式**调用原有 handler (不吞掉 nvim-jdtls 的 status 消息) / 只有 `ServiceReady` 翻牌, 其余 `ServiceStatus` 不动 / `no-out`/`failed` 不被覆盖 / `err` 非空不翻牌 / 非 jdtls client 不包装 |
+| `t_phase.lua` | 19 | `phase` 是活状态的冻结契约: `ui.statusline()` 对 `idle`/`ready`/`indexing`/`no-out`/`failed` 五态各自的渲染 (`indexing` 必须带 `(idx)`) / `install_phase_handler` **链式**调用原有 handler (不吞掉 nvim-jdtls 的 status 消息) / 只有 `ServiceReady` 翻牌, 其余 `ServiceStatus` 不动 / `no-out`/`failed` 不被覆盖 / `err` 非空不翻牌 / 非 jdtls client 不包装 |
 | `t_source_apply.lua` | 28 | `java/source_apply.lua`: `abs_of` 归一 / `installed` 解析 `.classpath` (去重、带 `excluding`、剥 `_/` 前缀、读不到返回 nil 而非空集) / 真机 `pending` 与磁盘 src 交集为 0 且有序 / 累积根"要么已装要么待装, 绝不丢弃" / 已装与待装不相交 / 非 core 模式拒绝 / `classify` 三类真实返回值 / 无 client 时 `auto()` 惰性 / `source_apply_auto=false` → `off` / `report()` 每会话只提示一次 |
+| `t_workspace.lua` | 31 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 | 
 
-合计 **175** 条断言 (上表各文件是带 `AOSPNAV_LIVE_TEST=1` 的行数; 默认跑法则
-`t_root_from_cwd` 13 / `t_source_apply` 22, 共 **162**)。
+合计 **207** 条断言 (上表各文件是带 `AOSPNAV_LIVE_TEST=1` 的行数; 默认跑法则
+`t_root_from_cwd` 13 / `t_source_apply` 22, 共 **194**)。
 
 `source_apply` 的分界是明的: `pending()` **不发任何请求** (纯读 `.classpath` + 算差集);
 发请求的只有 `add_serial` —— 手动经 `:Aosp!`, 或自动经 `source_apply.auto_apply()`

@@ -444,29 +444,62 @@ function M.configure(opts)
     end
   end
 
-  -- 13. 工作区污染自检。AOSP 根下只要存在**可见工程**, jdt.ls 的
+  -- 13. 工作区污染自检 + 空壳自清。AOSP 根下只要存在**可见工程**, jdt.ls 的
   --     InvisibleProjectImporter 就被第一道闸挡死
   --     (ProjectUtils.getVisibleProjects(rootPath).isEmpty()), 整个根再也建不出
   --     invisible project —— 症状是"jdtls 没怎么索引就结束了、跳转全不工作",
   --     完全看不出原因 (见 lua/aosp-nav/ui.lua M.workspace_blockers)。
-  --     这些工程是**上一次**导入留下的 (源码树里残留的 .project 被 EclipseProject
-  --     Importer 捡走, 或树里的 gradle 工程被 Buildship 导入), 且不可逆:
-  --     import.exclusions 只挡新导入, 只有 :AospCleanWorkspace 能清掉。
+  --     [v10] 分两类处置 (判据都在 ui.lua):
+  --       a) **空壳** (`.projects/<名>/` 只剩一层, 资源树里已经没有它) —— 直接删。
+  --          源码在树里、树里也没有它的位置, 删掉不丢任何索引, 却省下
+  --          :AospCleanWorkspace 的数十分钟重建 + 全量重索引。这正是把
+  --          "不可逆" 改成 "可自愈" 的那一步。
+  --          安全闸: 必须没有 JVM 持有这个 -data, 否则 jdt.ls 退出/保存时会把内存
+  --          里的模型原样写回来 (白删)。configure 跑在 lazy 求值 spec opts 期
+  --          (客户端尚未启动), 正常情况这里就是空的; 有别的 nvim 在跑同一 -data
+  --          时留到下次会话 —— 那时它已经退出, 自然就删掉了。
+  --       b) **真工程** —— 删不得 (源码树里的 .project/.classpath 还在, 删它等于把
+  --          活工程从工作区摘掉), 只提示。
+  --          "清工作区" 那句话**只在日志里有 Gradle 下载/sync 证据时**才出现:
+  --          那说明它在反复 sync 已注册的 Gradle 工程, 而
+  --          java.import.gradle.enabled = false 只挡新导入, 唯一出路是重建。
   --     [v10] 判据用 "根是 AOSP 根" <=> mode ~= "project" (aosp 与 infer 都成立)。
   if is_android and java_cfg.mode ~= "project" and root_path then
     local ui = require("aosp-nav.ui")
     local ws_dir = ui._workspace_dir(bufname)
     local blockers = ui.workspace_blockers(ws_dir, root_path)
+
+    -- (a) 空壳自清 (静默; 结果只进日志, 用户不需要知道插件替他扫了地)
+    if #blockers > 0 and ws_dir and #ui.jdtls_holders(ws_dir) == 0 then
+      local kept = {}
+      for _, name in ipairs(blockers) do
+        if ui.orphan_project(ws_dir, name)
+            and ui.remove_project_metadata(ws_dir, name) then
+          log.debug("removed orphan jdtls project shell: " .. name)
+        else
+          kept[#kept + 1] = name
+        end
+      end
+      blockers = kept
+    end
+
+    -- (b) 剩下的都是活工程: 提示 + 它们各自的真实路径 (只说"有外部工程"没法处置)
     if #blockers > 0 and not _blockers_warned[root_path] then
       _blockers_warned[root_path] = true
-      -- must-see 情况 #1: 工作区被占用, 必须让用户跑 :AospCleanWorkspace
-      log.user(("%d externally-visible project(s) exist in the jdtls workspace (%s) — "
+      local where = {}
+      for _, name in ipairs(blockers) do
+        where[#where + 1] = ui.project_location(ws_dir, name) or name
+      end
+      local msg = ("%d externally-visible project(s) exist in the jdtls workspace — "
         .. "they keep the invisible project for this root from ever being created "
-        .. "(jumps land in a fake project).\n"
-        .. "Run :AospCleanWorkspace to rebuild the jdtls workspace (exclusions are ready, "
-        .. "so they will not be re-imported).")
-        :format(#blockers, table.concat(blockers, ", ")),
-        { id = "blockers:" .. root_path, timeout = 15000 })
+        .. "(jumps land in a fake project):\n" .. table.concat(where, "\n"))
+        :format(#blockers)
+      if ui.gradle_download_evidence(ws_dir) then
+        msg = msg .. "\njdt.ls is still building / downloading Gradle for them. Run "
+          .. ":AospCleanWorkspace to rebuild the jdtls workspace (exclusions are ready, "
+          .. "so they will not be re-imported)."
+      end
+      log.user(msg, { id = "blockers:" .. root_path, timeout = 20000 })
     end
 
     -- 14. 单实例自检。两个 jdtls JVM 共用同一个 -data 会互相覆盖索引与 .classpath,

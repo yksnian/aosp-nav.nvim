@@ -1,8 +1,11 @@
 -- ui.lua: 状态反馈 / 诊断 / 重扫 / 清理 jdtls 工作区
 --
 -- 对应 VSCode 版的 status.ts + commands/{diagnostics,rescan}.ts +
--- eclipseGuard 的 cleanAndReload。纯展示层: 只读 state.lua 与各模块状态,
--- 不改配置; 唯一的写操作是 :AospCleanWorkspace 删 jdtls workspace 目录。
+-- eclipseGuard 的 cleanAndReload。基本是展示层: 只读 state.lua 与各模块状态,
+-- 不改配置。两处写操作: :AospCleanWorkspace 删整个 jdtls workspace 目录;
+-- M.remove_project_metadata 删**单个空壳工程**的元数据 (由 java/init.lua 第 13 步
+-- 在工作区被污染时自动调用, 判据见 M.orphan_project —— 只有确认是空壳、且没有
+-- JVM 持有该 -data 时才动)。
 --
 -- 命令面已收敛为 4 个 (:Aosp / :AospRescan / :AospCleanWorkspace /
 -- :AospCollectJars, 见 plugin/aosp-nav.lua)。:Aosp 打开**一个**信息面板 =
@@ -247,9 +250,20 @@ function M.diagnose()
     -- project 模式下工作区里本来就该是真实工程)。
     if mode ~= "project" then
       local blockers = M.workspace_blockers(wd, jr)
+      -- 空壳会在下一次 configure 里被插件自己删掉 (见 java/init.lua 第 13 步), 所以
+      -- 标出来 —— 免得用户看见名字还在, 以为插件没干活。只有活工程才需要人动手。
+      local shown, n_live = {}, 0
+      for _, name in ipairs(blockers) do
+        if M.orphan_project(wd, name) then
+          shown[#shown + 1] = name .. " (orphan shell: removed automatically on next start)"
+        else
+          shown[#shown + 1] = name
+          n_live = n_live + 1
+        end
+      end
       lines[#lines + 1] = line("workspace blockers",
-        #blockers == 0 and "none" or table.concat(blockers, ", "), #blockers == 0,
-        #blockers > 0 and ":AospCleanWorkspace (these projects block the invisible project)" or nil)
+        #blockers == 0 and "none" or table.concat(shown, ", "), #blockers == 0,
+        n_live > 0 and ":AospCleanWorkspace (a live project blocks the invisible project)" or nil)
       -- 索引落盘状态: "索引不动"时最该看的一行。idx 只在空闲/退出时保存,
       -- 会话被杀就什么都没写 —— 于是每次启动从头再来
       local ix = M.index_state(wd)
@@ -389,8 +403,12 @@ end
 --- 打开的文件全部落进 jdt.ls-java-project 假工程 (无 jar / 无源码 -> 索引秒结束、
 --- 跳转全废)。这些工程来自源码树里残留的 .project (jdt.ls 导入工程时自己写下的
 --- Buildship/Eclipse 元数据) 或树里的 gradle 工程被导入。
---- **不可逆**: java.import.exclusions 只挡新导入, 已导入的工程留在工作区里, 去掉
---- 排除项也不会消失 —— 只有 :AospCleanWorkspace 重建数据目录能清掉。
+--- java.import.exclusions 只挡**新**导入, 已经进来的赶不走。已进来的分两类, 处置
+--- 完全不同 (见 M.orphan_project / M.remove_project_metadata):
+---   a) 空壳 —— 工作区侧只剩 .projects/<名> 一层, 资源树里已经没有它。**可安全删除**,
+---      删一次就够, 不必 :AospCleanWorkspace 全量重建。
+---   b) 真工程 —— 源码树里的 .project/.classpath 还在, 工作区里也还有 JDT 元数据。
+---      删它等于把活工程从工作区摘掉, 不做; 只提示 (rebuild 是唯一出路)。
 --- @param workspace_dir string|nil jdtls -data 目录
 --- @param root string|nil jdtls root_dir (用于算出本该存在的 invisible project 名)
 --- @return table blockers 外部工程名列表
@@ -404,6 +422,101 @@ function M.workspace_blockers(workspace_dir, root)
     end
   end
   return out
+end
+
+--- 工程在源码树里的真实位置 —— `.projects/<名>/.location` 里那个 URI。
+--- 只说"有外部工程"用户没法处置, 得告诉他这些工程到底在哪。
+--- 文件是二进制 (Java writeUTF: 4 字节长度前缀 + URI + NUL), readfile 会把 NUL
+--- 当换行切开, 于是这里得到的就是 "LURI//file:/path/to/proj" 这样一行。
+--- @param workspace_dir string|nil
+--- @param name string 工程名
+--- @return string|nil path
+function M.project_location(workspace_dir, name)
+  if not workspace_dir or workspace_dir == "" then return nil end
+  local f = workspace_dir .. "/.metadata/.plugins/org.eclipse.core.resources/.projects/"
+    .. name .. "/.location"
+  if vim.fn.filereadable(f) ~= 1 then return nil end
+  for _, line in ipairs(vim.fn.readfile(f)) do
+    local p = line:match("URI//file:([^%z%s]+)")
+    if p and p ~= "" then return p end
+  end
+  return nil
+end
+
+--- 该工程是不是"空壳": `.projects/<名>/` 只剩一层壳, 资源树里已经没有它。
+--- 什么时候会有这种东西: jdt.ls 自己把工程从资源树里摘掉过一轮 (源码树里的
+--- .project/.classpath 消失, 或它判定工程 invalid —— 见其 deleteInvalidProjects),
+--- 但 `.projects/<名>/` 这层元数据遗留下来。**空壳照样算可见工程**, 闸门照样
+--- 过不去, 而它删掉不丢任何东西: 源文件在源码树里, 资源树里本来就没有它的位置
+--- (实测 2026-10-10: 一个 24 KB 的空壳挡死了整个 AOSP 根的 invisible project,
+--- 删掉后 931 MB 索引一行没动)。
+--- 判据两条都要满足 —— 宁可不删也不误删活工程:
+---   1. `.projects/<名>/org.eclipse.jdt.core/` 下没有任何实体文件
+---      (活工程必有 state.dat)
+---   2. 名字没作为**工程根**出现在资源树/快照里 (单独占一行才算工程根)
+--- @param workspace_dir string|nil
+--- @param name string
+--- @return boolean
+function M.orphan_project(workspace_dir, name)
+  if not workspace_dir or workspace_dir == "" then return false end
+  local res = workspace_dir .. "/.metadata/.plugins/org.eclipse.core.resources"
+  local pdir = res .. "/.projects/" .. name
+  if vim.fn.isdirectory(pdir) ~= 1 then return false end
+  local core = pdir .. "/org.eclipse.jdt.core"
+  if vim.fn.isdirectory(core) == 1 and #vim.fn.glob(core .. "/*", false, true) > 0 then
+    return false
+  end
+  -- 树与快照都是二进制 (-a 当文本搜); -x 整行匹配: 工程根是单独一行, 子目录/文件名
+  -- 是带前缀的路径, 不会误命中。
+  for _, pat in ipairs({ res .. "/.root/*.tree", res .. "/*.snap" }) do
+    for _, f in ipairs(vim.fn.glob(pat, false, true)) do
+      -- grep 出错/无输出 -> tonumber 得 nil -> 按"不是空壳"处理 (保守)
+      local n = tonumber(vim.trim(vim.fn.system({ "grep", "-acx", name, f })) or "")
+      if n ~= 0 then return false end
+    end
+  end
+  return true
+end
+
+--- 把某个工程的元数据从工作区删掉 (等价 Eclipse 的"从工作区删除工程", 不动源码)。
+--- 只删 `.projects/<名>/` 这一层。调用前必须:
+---   1. 确认是空壳 (M.orphan_project) —— 活工程会连同它的工程元数据一起消失;
+---   2. 确认**没有** JVM 持有这个 -data (M.jdtls_holders 为空) —— 否则 jdt.ls 退出
+---      或保存时会把内存里的模型原样写回来, 删除等于白删。
+--- @param workspace_dir string
+--- @param name string
+--- @return boolean ok
+function M.remove_project_metadata(workspace_dir, name)
+  if not workspace_dir or workspace_dir == "" then return false end
+  -- name 来自 glob 的 basename, 这里再挡一道, 免得拼出 ../ 之类的东西
+  if name == "" or name == "." or name == ".." or name:find("[/\\]") then return false end
+  local pdir = workspace_dir .. "/.metadata/.plugins/org.eclipse.core.resources/.projects/"
+    .. name
+  if vim.fn.isdirectory(pdir) ~= 1 then return false end
+  return vim.fn.delete(pdir, "rf") == 0
+end
+
+--- jdtls 日志里有没有"在为 Gradle 工程跑构建/下发行版"的证据。
+--- 为什么单独看这个: 被导入的 Gradle 工程 (Buildship nature) **每次启动**都会被重新
+--- sync, 而 java.import.gradle.enabled = false 只挡新导入、挡不住已注册工程的加载。
+--- 实测这两条串每次会话都成串出现:
+---   Could not run phased build action using connection to Gradle distribution
+---     'https://services.gradle.org/distributions/gradle-<v>-bin.zip'
+--- 正是"它真的在联网下载 Gradle"的直接证据。这种工程不是空壳, 删不得, 重建工作区
+--- 才是唯一出路 —— 所以"清工作区"那句话只在有这条证据时才出现。
+--- @param workspace_dir string|nil
+--- @return boolean
+function M.gradle_download_evidence(workspace_dir)
+  if not workspace_dir or workspace_dir == "" then return false end
+  local log_file = workspace_dir .. "/.metadata/.log"
+  if vim.fn.filereadable(log_file) ~= 1 then return false end
+  local out = vim.fn.system({
+    "grep", "-ac",
+    "-e", "services.gradle.org/distributions",
+    "-e", "Could not run phased build action",
+    log_file,
+  })
+  return (tonumber(vim.trim(out) or "") or 0) > 0
 end
 
 --- jdtls 索引目录的落盘状态。
@@ -448,29 +561,54 @@ local function is_jdtls_on(argv, workspace_dir)
   return launcher and data_dir ~= nil and (data_dir:gsub("/+$", "")) == workspace_dir
 end
 
+--- 正在使用同一个 jdtls 数据目录 (-data) 的**所有** JVM 进程号 (含本 nvim 拉起的)。
+--- 检测手段是直接读 /proc 判 argv: 比 .metadata/.lock 可靠 (clean shutdown 会删掉
+--- .lock, 崩溃遗留的 .lock 又会误报 —— 而孤儿 JVM 的 cmdline 一直在)。
+--- 两个用途:
+---   M.foreign_jdtls —— 报"别的 nvim 在抢同一份 -data";
+---   M.jdtls_holders —— 删工作区元数据前的**安全闸**: 只要还有 JVM 持有它, 删除就会被
+---     jdt.ls 退出/保存时的内存模型覆盖回去, 不如不删。
+--- @param workspace_dir string|nil
+--- @return table pids 字符串进程号列表
+local function jdtls_holders(workspace_dir)
+  if not workspace_dir or workspace_dir == "" then return {} end
+  workspace_dir = workspace_dir:gsub("/+$", "")
+  local proc = require("aosp-nav.util.proc")
+  local out = {}
+  for _, p in ipairs(vim.fn.glob("/proc/[0-9]*", false, true)) do
+    local pid = vim.fn.fnamemodify(p, ":t")
+    local argv = proc.argv(pid)
+    if argv and is_jdtls_on(argv, workspace_dir) then
+      out[#out + 1] = pid
+    end
+  end
+  return out
+end
+
+--- 同 jdtls_holders (含自己拉起的那个)。
+--- @param workspace_dir string|nil
+--- @return table pids
+function M.jdtls_holders(workspace_dir)
+  return jdtls_holders(workspace_dir)
+end
+
 --- 正在使用同一个 jdtls 数据目录 (-data) 的**别的** JVM 进程号。
 --- 两个 JVM 共用一份 .metadata 会互相覆盖索引与 .classpath, 实测症状:
 ---   "Java Index broken - will be automatically deleted to repair"
 ---   "Failed to save JDT index ... (No such file or directory)"
 ---   同一次导入里 "Adding ... to the classpath" 计数翻倍 (1126 -> 2252)
---- 而索引被反复删掉重建正是"索引不动"的一大来源。检测手段是直接读 /proc:
---- 比 .metadata/.lock 可靠 (clean shutdown 会删掉 .lock, 崩溃遗留的 .lock 又
---- 会误报 —— 而孤儿 JVM 的 cmdline 一直在)。
+--- 而索引被反复删掉重建正是"索引不动"的一大来源。
 --- 必须排除**本 nvim 自己拉起的** jdtls (它是 nvim 的子进程, 扫描必然命中它;
 --- 不排除就会把 1 个 nvim 报成 2 个实例)。
 --- 只报不杀: 杀进程是用户的决定。
 --- @param workspace_dir string|nil
 --- @return table pids 字符串进程号列表
 function M.foreign_jdtls(workspace_dir)
-  if not workspace_dir or workspace_dir == "" then return {} end
-  workspace_dir = workspace_dir:gsub("/+$", "")
   local self = vim.fn.getpid()
   local proc = require("aosp-nav.util.proc")
   local out = {}
-  for _, p in ipairs(vim.fn.glob("/proc/[0-9]*", false, true)) do
-    local pid = vim.fn.fnamemodify(p, ":t")
-    local argv = proc.argv(pid)
-    if argv and is_jdtls_on(argv, workspace_dir) and not proc.is_descendant(pid, self) then
+  for _, pid in ipairs(jdtls_holders(workspace_dir)) do
+    if not proc.is_descendant(pid, self) then
       out[#out + 1] = pid
     end
   end
