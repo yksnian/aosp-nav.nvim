@@ -21,6 +21,8 @@
 
 local M = {}
 
+local log = require("aosp-nav.util.log")
+
 -- [v7] 缓存版本: 扫描算法/默认模式变更时 bump, 旧缓存自动作废重扫
 local CACHE_VERSION = 1
 
@@ -153,6 +155,11 @@ function M.ensure_cached(root)
   if not root or root == "" or _cold_done[root] then return end
   _cold_done[root] = true
   if M.cached(root) ~= nil then return end
+  -- 通知策略席位 5: 首次(冷缓存)排除项扫描是同步阻塞 (数秒), 必须先让用户知道,
+  -- 免得看着像卡死。这是 log.user 的五个指定场景之一, 其余地方不得滥用。
+  log.user("first run: scanning for leftover Eclipse project dirs (exclusion cache, a few "
+    .. "seconds)...",
+    { once = true, id = "exclusions_cold_scan" })
   -- 空结果也要落盘 (cached() 返回空表而非 nil): 否则每次开 java 文件都重扫
   M.save(root, M.scan_sync(root))
 end

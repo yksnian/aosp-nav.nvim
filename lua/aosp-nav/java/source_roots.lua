@@ -26,6 +26,8 @@
 
 local M = {}
 
+local log = require("aosp-nav.util.log")
+
 -- 算法版本: 变更剪枝规则或缓存格式时必须 bump, 否则旧缓存 (含已被剔掉的根,
 -- 或缺少新统计字段的旧 header) 会被继续沿用。
 -- v2: 新增测试根 / JDK 影子根过滤
@@ -482,7 +484,10 @@ end
 function M.find(root, opts)
   if not root or root == "" then return nil end
   opts = opts or {}
-  if get_cfg().java.source_paths_mode ~= "core" then return nil end
+  -- 源码根是给 sourcePaths 注入用的: 只有 mode == "aosp" 才注入。
+  -- "infer"/"project" 都不注入, 故都不提供源码根 (见 config 契约的 infer 陷阱:
+  -- "工作区根是 AOSP 根" ≠ "注入 sourcePaths", 此处问的是后者)
+  if get_cfg().java.mode ~= "aosp" then return nil end
 
   if not opts.no_cache and _root == root and _list then return _list, _stats end
 
@@ -492,8 +497,10 @@ function M.find(root, opts)
       _list, _root, _stats = list, root, stats
       if M.stale(root) and not _stale_notified[root] then
         _stale_notified[root] = true
-        vim.notify("[aosp-nav] 源码根缓存可能过期 — 跑 :AospRescan 更新后 "
-          .. ":AospCleanWorkspace + :LspRestart 生效", vim.log.levels.WARN, { timeout = 10000 })
+        -- 缓存可能过期属 TTL/缓存记账 (例行), 且默认模型下 stale() 是 no-op
+        -- 不点名 :LspRestart (可选命令, 用户配置里不一定有); 重建之后直接重开 .java 文件即可
+        log.debug("source-root cache may be stale — run :AospRescan to refresh, then "
+          .. ":AospCleanWorkspace and reopen the .java file to apply")
       end
       return list, stats
     end
@@ -502,14 +509,15 @@ function M.find(root, opts)
   if not _cold_notified then
     _cold_notified = true
     -- 不承诺时长: 热缓存 ~0.5 s, 冷缓存 (首次开机后) 可能数秒。这里是主循环
-    -- 同步阻塞, 先说清楚免得看着像卡死
-    vim.notify("[aosp-nav] 首次扫描源码根 (全项目 grep, 通常 <1 s, "
-      .. "冷文件缓存时可能数秒; 之后走缓存)…", vim.log.levels.INFO)
+    -- 同步阻塞。按通知策略, 这类例行启动进度是 log.info (默认阈值下不可见),
+    -- 不占用 log.user 的五个席位之一 (那个席位给"排除项冷扫描")
+    log.info("first source-root scan (a full-tree grep, usually <1 s, "
+      .. "a few seconds on a cold page cache; cached afterwards)...")
   end
   local list, stats = M.scan(root)
   if not list or #list == 0 then
-    vim.notify("[aosp-nav] 源码根扫描失败 (grep 不可用?), 退回 jdt.ls 自行推断 —— "
-      .. "跨模块跳转会落到 jar", vim.log.levels.WARN)
+    log.warn("source-root scan failed (grep unavailable?); falling back to jdt.ls inference — "
+      .. "cross-module jumps will land in jars")
     return nil
   end
   M.save(root, list, stats)

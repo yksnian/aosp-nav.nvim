@@ -4,11 +4,7 @@
 
 local M = {}
 
--- [v7] 本会话已就 java.import.exclusions 新发现提示过的 root (避免反复打扰)
-local _excl_notified = {}
-
--- [v7] 已提示过的失效配置键 (避免每次 configure 重复打扰)
-local _deprecated_warned = {}
+local log = require("aosp-nav.util.log")
 
 -- [v9] 已就"工作区存在外部可见工程"提示过的 root (每 root 每会话一次)
 local _blockers_warned = {}
@@ -16,60 +12,26 @@ local _blockers_warned = {}
 -- [v9] 已就"多个 jdtls 共用同一数据目录"提示过的 -data (每目录每会话一次)
 local _instances_warned = {}
 
---- 提示已失效的配置键 (只提示一次)
-local function warn_deprecated(java_cfg)
-  if java_cfg.exclude_self_jars and not _deprecated_warned.exclude_self_jars then
-    _deprecated_warned.exclude_self_jars = true
-    vim.notify("[aosp-nav] java.exclude_self_jars 已失效 (工作区根 = AOSP 根后自排除恒为空), "
-      .. "请改用 exclude_jars / exclude_globs; 该配置可删除", vim.log.levels.WARN)
-  end
-end
-
---- 提示用户应用新的 import.exclusions
---- 已导入的工程持久化在 Eclipse workspace 里, 仅改设置不生效, 必须重启 jdtls;
---- 若那些目录已被导入过, 还得先删掉 ~/.cache/nvim/jdtls/<project>/workspace
---- @param root string jdtls root
---- @param added table 本次新发现的模式
-local function notify_new_exclusions(root, added)
-  -- root 用拼接而非 :format: 路径里若含 % 会被当成格式符
-  vim.notify(("[aosp-nav] java.import.exclusions: %d stale Eclipse metadata dir(s) "
-    .. "found under " .. root .. "; they will no longer be imported.\n"
-    .. "Run :LspRestart to apply. If those projects were already imported, delete "
-    .. "~/.cache/nvim/jdtls/<project>/workspace first (see README).")
-    :format(#added), vim.log.levels.WARN, { timeout = 10000 })
-end
-
 --- [v7] 后台刷新残留 Eclipse 元数据扫描 (eclipseGuardScan.ts 的等价物)
 --- jdt.ls 会把 .project/.classpath 写进导入过的工程目录; 这些目录下次会
 --- 被当成"已存在工程"全量导入。扫描结果写缓存, 下次 configure 生效。
---- 不阻塞 jdtls 启动: 本次启动用缓存里的旧结果, 新结果靠 :LspRestart 应用。
+--- [v10] 静默: 不再弹窗。改排除项只在**导入期**生效, 提醒 :LspRestart 帮不了
+--- 当前会话 (排除项要等下次重建工程才绑定), 所以只落盘 —— :Aosp 诊断面板直接读
+--- 缓存里的 blockers 计数, 状态记录在面板而不打扰用户。首次冷扫的提醒由
+--- import_exclusions.ensure_cached 自己发 (紧贴真正阻塞的那行代码)。
 --- @param java_cfg table java 段配置
 --- @param root string|nil jdtls root_dir
---- @param injected table|nil 本次已注入的模式列表
-local function schedule_exclusions_refresh(java_cfg, root, injected)
+local function schedule_exclusions_refresh(java_cfg, root)
   if not java_cfg.import_exclusions_scan or not java_cfg.import_exclusions_enabled then
     return
   end
-  if not root or root == "" or not injected then return end
+  if not root or root == "" then return end
 
   local mod = require("aosp-nav.java.import_exclusions")
   if not mod.is_stale(root) then return end
 
   mod.scan_async(root, function(patterns)
     mod.save(root, patterns)
-    if _excl_notified[root] then return end
-    local known = {}
-    for _, v in ipairs(injected) do
-      known[v] = true
-    end
-    local added = {}
-    for _, v in ipairs(patterns) do
-      if not known[v] then added[#added + 1] = v end
-    end
-    if #added > 0 then
-      _excl_notified[root] = true
-      notify_new_exclusions(root, added)
-    end
   end)
 end
 
@@ -85,8 +47,13 @@ end
 --- 退路只在"buf 0 根本不是 java 文件"时启用 (任取一个已加载且落在 AOSP 树内的
 --- .java 缓冲)。buf 0 是 java 文件就一律照旧 —— 否则在同一会话里同时开 AOSP 与
 --- 普通 java 工程时, 后者会被拽进 AOSP 配置。
+--- [v10] 一个 .java 缓冲都没有时 (例如 `cd ~/project/aosp && nvim` 无文件启动,
+--- 或从 picker/dashboard 打开): 退回 util.path.start_dir("") = cwd 作为探测起点。
+--- 没有这条, 下游 jar 收集 / sourcePaths / exclusions 全都拿不到根而**整体静默
+--- 失效** (aosp_root=nil -> is_android=false)。注意必须走 path.start_dir: 空串在
+--- Lua 里为真, `cur and cur or cwd` 会返回 ""。
 --- @param root_mod table aosp-nav.java.root
---- @return string fname 绝对路径; 全无候选时原样返回 buf 0 的名字
+--- @return string fname 绝对路径或目录起点; 全无候选时返回 cwd
 local function probe_file(root_mod)
   local cur = vim.api.nvim_buf_get_name(0)
   if cur ~= "" and (cur:sub(-5) == ".java" or root_mod.aosp_root(cur)) then
@@ -101,7 +68,93 @@ local function probe_file(root_mod)
       if n:sub(-5) == ".java" and root_mod.aosp_root(n) then return n end
     end
   end
+  -- 没有任何 java 缓冲: 用 cwd 作为探测起点 (start_dir("") == cwd)
+  if cur == "" then
+    return require("aosp-nav.util.path").start_dir("")
+  end
   return cur
+end
+
+--- 从 jdt:// 反编译缓冲名解析出类的工作区相对源码路径 (.java)。
+--- 形态 (jdt.ls JDTUtils): jdt://contents/<jar>/<package path>/<Class>.class[?query]
+--- package path 可能是 '/' 分隔, 也可能带 '.' (jrt 模块名如 java.base); 内部类
+--- 形如 Bar$Baz.class, 源码文件是 Bar.java。这里只做**尽力**解析: 猜错只会让
+--- 下游磁盘存在性检查落空而保持安静, 不会误报 (R6 要求"拿不准就别出声")。
+--- @param name string buffer 名
+--- @return string|nil rel 形如 "com/foo/Bar.java"
+local function jdt_buffer_source_rel(name)
+  local rest = name:match("^jdt://contents/(.+)$")
+  if not rest then return nil end
+  rest = rest:gsub("[?#].*$", "")                                   -- 去 query/hash
+  rest = rest:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+  -- 第一段是 jar 名 (含 .jar), 丢掉它, 剩余即类路径
+  local classpath = rest:match("^[^/]*/(.+)$")
+  if not classpath then return nil end
+  classpath = classpath:gsub("%.class$", "")
+  if classpath == "" then return nil end
+  local parts = {}
+  for seg in classpath:gmatch("[^/%.]+") do parts[#parts + 1] = seg end
+  if #parts == 0 then return nil end
+  parts[#parts] = parts[#parts]:gsub("%$.*$", "")                   -- 去内部类后缀
+  if parts[#parts] == "" then return nil end
+  return table.concat(parts, "/") .. ".java"
+end
+
+--- [v10] R6: go-to-definition 落进 jdt:// 反编译 jar 时的一次性说明。
+--- 只有当该符号**确实存在**于某个已知源码根 (核心集 / 已累积项目) 时才出声 ——
+--- 否则说明它是纯 jar-only 符号 (源码根本不在工作区), 提示只会是噪声。
+--- 走 log.info 而**不是** log.user: 跳到 jar 不需要用户此刻做任何决定, 而它给的
+--- 建议 (:AospCleanWorkspace) 是一次 13187 文件的重索引 —— 把它顶到 warn 等于
+--- 在每次 gd 之后劝用户做一件破坏性而且昂贵的事。默认阈值 (warn) 下它不可见,
+--- 把 log_level 调到 info 就能看到全部解释; 同样的结论在 :Aosp 面板里也常驻。
+--- 每会话至多一次 (once/id)。
+--- @param buf integer buffer 号
+--- [v11] 把 `phase` 从 indexing 翻成 ready 的钩子 (见 state.lua 的 phase 注释)。
+--- 抽成独立函数是为了可测: tests/t_phase.lua 直接拿一个假 client 调它, 不必真起 jdtls。
+--- 必须**链式**挂在 jdtls 原有的 `language/status` handler 之后 —— nvim-jdtls 自己
+--- 已经装了一个 (用来 echo message), 整个换掉会吞掉它原本的 status 消息。
+--- @param client table 需有 .name == "jdtls" 与可写的 .handlers
+function M.install_phase_handler(client)
+  if not (client and client.name == "jdtls") then return end
+  -- LspAttach **每个 buffer** 都会触发一次: 没有这道闸门的话, N 个 java buffer
+  -- 会把 handler 套 N 层 (第 2 个 buffer 的 prev 是第 1 个的包装), 最内层
+  -- nvim-jdtls 的 status handler 于是每次被重复调用 N 次 (message 重复打印)。
+  if client._aosp_nav_phase_handler then return end
+  client._aosp_nav_phase_handler = true
+  local prev = client.handlers and client.handlers["language/status"]
+  client.handlers = client.handlers or {}
+  client.handlers["language/status"] = function(err, result, ctx, config)
+    if prev then prev(err, result, ctx, config) end
+    if err or type(result) ~= "table" or result.type ~= "ServiceReady" then return end
+    -- 只把 indexing 翻成 ready。no-out / failed 不是"索引中", ServiceReady 到来
+    -- 也不代表那个会话的归类该改 (非 AOSP 文件照样会 attach 到 jdtls)。
+    local state = require("aosp-nav.state")
+    if state.get().phase == "indexing" then state.set({ phase = "ready" }) end
+  end
+end
+
+local function hint_if_jar_jump(buf)
+  if not vim.api.nvim_buf_is_valid(buf) then return end
+  local name = vim.api.nvim_buf_get_name(buf)
+  local rel = jdt_buffer_source_rel(name)
+  if not rel then return end
+  local hit = require("aosp-nav.java.source_inject").source_file_for_rel(rel)
+  if not hit then return end
+  -- !! 为什么只有 :AospCleanWorkspace 能修 !!
+  -- java.project.addToSourcePath 只能 **追加**, 注入的根永远排在 ~1126 个 jar
+  -- 之后; JDT 取类路径上第一个包含该类型的条目, 所以同 FQN 的 jar 必胜。
+  -- 事后重排不可行: java.project.updateClassPaths 在调用方给的条目数与工程自己的
+  -- ~1375 条 raw classpath 不完全相等时会**静默丢条目**, 而 getClasspaths 只返回
+  -- 解析后的输出路径, 客户端重建不出那份 raw 列表。唯一能把注入根排在 jar **之前**
+  -- 的路径是导入期注入, 而 jdt.ls 只在 invisible project 首次创建时采纳它 ——
+  -- 即 :AospCleanWorkspace 删掉 -data 重建。别再试图找运行期的替代方案。
+  log.info(("go-to-definition for %s landed in a decompiled jar (jdt://) instead of "
+    .. "the real source at %s.\nInjected source roots can only win over the jars when "
+    .. "jdtls builds the invisible project's classpath; the runtime command can only "
+    .. "append, so a jar with the same FQN still comes first.\n"
+    .. "Run :AospCleanWorkspace to rebuild the jdtls workspace with the source roots "
+    .. "placed ahead of the jars."):format(rel, hit),
+    { once = true, id = "jdt-jar-jump-hint", timeout = 15000 })
 end
 
 --- 注入 AOSP 特化配置到 jdtls opts
@@ -118,8 +171,6 @@ function M.configure(opts)
   -- 确保 settings/capabilities 表存在
   opts.settings = opts.settings or {}
   opts.capabilities = opts.capabilities or vim.lsp.protocol.make_client_capabilities()
-
-  warn_deprecated(java_cfg)
 
   local root_mod = require("aosp-nav.java.root")
   local bufname = probe_file(root_mod)
@@ -146,10 +197,12 @@ function M.configure(opts)
   local is_android = jar_status.root ~= nil
 
   -- 3. 源码根 (java.project.sourcePaths)。
-  --    显式 java.source_paths 非空时完全接管; 否则 core 模式走
+  --    显式 java.source_paths 非空时完全接管; 否则 mode == "aosp" 走
   --    source_inject (预置核心集 + 打开过的项目, 见 java/source_inject.lua)。
   --    注入这个 key 会关闭 jdt.ls 的逐文件 source root 推断, 所以**空列表绝不
   --    注入** —— 整个 key 缺席, 退回 jdt.ls 自己推断 (infer 模式的行为)。
+  --    注意 "根是 AOSP 根" 与 "开启注入" 是**两个**谓词: 前者 mode ~= "project",
+  --    后者 mode == "aosp"。这里问的是"要不要注入"。
   local source_inject = nil
   local source_paths = nil
   if java_cfg.source_paths and #java_cfg.source_paths > 0 then
@@ -158,7 +211,7 @@ function M.configure(opts)
     -- jdt.ls-java-project 假工程), 用户写绝对路径这里兜住
     source_paths = require("aosp-nav.java.source_inject").to_workspace_relative(
       java_cfg.source_paths, root_path)
-  elseif java_cfg.source_paths_mode == "core" and is_android and aosp_root then
+  elseif java_cfg.mode == "aosp" and is_android and aosp_root then
     source_inject = require("aosp-nav.java.source_inject")
     -- 同步 + 只读缓存: sourcePaths 必须出现在 initialize 请求里
     source_paths = source_inject.inject_sync(java_cfg, aosp_root, bufname)
@@ -209,7 +262,7 @@ function M.configure(opts)
 
   -- 7. 构造 AOSP 特化 settings
   -- sourcePaths 只在确有内容时才出现: 注入这个 key 会关闭 jdt.ls 的逐文件
-  -- source root 推断 (见 config.lua source_paths_mode 注释)
+  -- source root 推断 (见 config.lua java.mode 注释)
   local project_settings = { referencedLibraries = jars }
   if source_paths and #source_paths > 0 then
     project_settings.sourcePaths = source_paths
@@ -253,7 +306,10 @@ function M.configure(opts)
   local excl_mod = require("aosp-nav.java.import_exclusions")
   local injected_exclusions = nil
   if java_cfg.import_exclusions_enabled and is_android then
-    -- 基准恒为 AOSP 根: out/ 与 .repo/ 都在那里, 与 workspace_mode 无关
+    -- 基准恒为 AOSP 根: out/ 与 .repo/ 都在那里, 与 mode 无关
+    -- [v10] 冷缓存的同步扫描 (数秒) 由 effective -> ensure_cached **自己**出声, 紧贴
+    -- 真正阻塞的那行代码, 对任何调用方都成立。这里不再预先提示一遍 —— 曾经两处都
+    -- 提示、两个不同的 once id, 同一个弹窗出现两次。
     injected_exclusions = excl_mod.effective(java_cfg, aosp_root)
     import_extras.exclusions = injected_exclusions
   end
@@ -283,43 +339,109 @@ function M.configure(opts)
   -- 9. 深度合并: AOSP 字段优先, 但不覆盖用户其他 settings (如 completion, signatureHelp 等)
   opts.settings = vim.tbl_deep_extend("force", opts.settings, aosp_settings)
 
-  -- 9b. core 模式的运行时编排。注意运行期**不会**再往 jdt.ls 下发 sourcePaths:
+  -- 9b. mode == "aosp" 的运行时编排。注意运行期**不会**再往 jdt.ls 下发 sourcePaths:
   --     只有导入期注入才能得到 "src 在 lib 之前" 的类路径顺序 (见
   --     java/source_inject.lua 文件头)。这里只装钩子; 新累积的项目落盘缓存,
-  --     下次启动 jdtls 时由 inject_sync 读回来进 initialize 请求。
-  --     !! 但工程一旦建好, 重启时 loadInvisibleProject 会被"已有可见工程"的
-  --     闸门挡掉, 新 sourcePaths 静默失效 —— 累积生效必须要 :AospCleanWorkspace
-  --     重建 jdtls 数据目录。实测三者对比见 source_inject.lua 文件头。
+  --     下次启动 jdtls 时由 inject_sync 读回来进 initialize 请求 —— 但工程一旦
+  --     建好, 重启时 loadInvisibleProject 会被"已有可见工程"的闸门挡掉, 新
+  --     sourcePaths 静默失效 (实测: 4 次启动里工程只在第 1 次被创建)。
+  --     [v9] 所以新累积的根走**运行期增量**路径 java.project.addToSourcePath
+  --     (java/source_apply.lua): 只追加类路径条目, 不重排已有条目, 不需要重建。
   if source_inject then
     source_inject.setup(java_cfg)
     -- 启动文件所属项目: 已有缓存则立即并入, 否则后台扫描 (不阻塞启动)
     if bufname ~= "" then source_inject.on_file(bufname) end
+    -- 存量补注入: 上次会话攒下、还没进工作区的根, jdtls attach 后自动补上
+    -- (累积那一刻的自动注入在 source_inject.apply 里; 关掉用 source_apply_auto)
+    if java_cfg.source_apply_auto ~= false then
+      local grp = vim.api.nvim_create_augroup("aosp_nav_source_apply", { clear = true })
+      vim.api.nvim_create_autocmd("LspAttach", {
+        group = grp,
+        callback = function(args)
+          local c = vim.lsp.get_client_by_id(args.data.client_id)
+          if c and c.name == "jdtls" then
+            require("aosp-nav.java.source_apply").attach()
+          end
+        end,
+      })
+    end
+
+    -- [v10] R6: 跳转落进 jdt:// 反编译 jar 时的一次性提示 (只在注入开启的
+    -- mode == "aosp" 下注册 —— infer/project 模式本来就该落 jar, 提示是噪声)。
+    local hint_grp = vim.api.nvim_create_augroup("aosp_nav_jdt_hint", { clear = true })
+    vim.api.nvim_create_autocmd({ "BufEnter", "BufReadPost" }, {
+      group = hint_grp,
+      pattern = "jdt://*",
+      desc = "aosp-nav: one-time hint when a go-to-definition lands in a decompiled jar",
+      callback = function(args) hint_if_jar_jump(args.buf) end,
+    })
   end
 
-  -- 10. 后台刷新残留 Eclipse 元数据排除 (不阻塞 jdtls 启动)
+  -- 10. 后台刷新残留 Eclipse 元数据排除 (不阻塞 jdtls 启动; 静默, 见函数注释)
   if is_android then
-    schedule_exclusions_refresh(java_cfg, aosp_root, injected_exclusions)
+    schedule_exclusions_refresh(java_cfg, aosp_root)
   end
 
   -- 11. 会话状态 (供 :AospStatus / :AospDiagnostics / statusline 读取)
   require("aosp-nav.state").set({
+    -- phase 由**真信号**驱动 (见下面的 11b): 这里先给出"jdt.ls 即将导入+构建"
+    -- 这个初值, 等 jdt.ls 自己报 ServiceReady 才翻成 "ready"。绝不在 configure
+    -- 就写 "ready" —— 新工作区此刻才开始索引, 那是假绿灯。
     phase = is_android and (#jars > 0 and "indexing" or "no-out") or "failed",
     root = root_path,
     android_root = jar_status.root,
     jars = #jars,
     cache_origin = jar_status.origin,
     source_roots = source_paths and #source_paths or 0,
-    source_paths_mode = java_cfg.source_paths_mode,
-    workspace_mode = java_cfg.workspace_mode,
+    -- [v10] 单一 mode 键; 旧字段 (source_paths_mode / workspace_mode) 已彻底移除,
+    -- 不再派生 —— 所有读者一律读 cfg.java.mode。
+    mode = java_cfg.mode,
     source_projects = source_inject and #source_inject.state().projects or 0,
   })
 
-  -- 12. jar 缓存陈旧提醒 (AOSP 重新编译过)。只提醒不自动重扫: 全树重扫要在
-  --     主循环里跑数秒, 启动期卡 UI 比一条通知更糟; :AospRescan 一条命令解决。
+  -- 11b. phase 的**第二个写入者**: jdt.ls 报导入+构建结束时翻牌 (实现与理由见
+  --      M.install_phase_handler)。信号是 jdt.ls 的 `language/status` 通知, payload
+  --      为 StatusReport { type, message }, 导入完成后 type == ServiceStatus.ServiceReady。
+  --      必须挂在 **LspAttach** 上, 不能挂 LspNotify/LspProgress —— 后两者只有出站
+  --      通知, 收不到服务端发来的 language/status。
+  local phase_grp = vim.api.nvim_create_augroup("aosp_nav_jdtls_phase", { clear = true })
+  vim.api.nvim_create_autocmd("LspAttach", {
+    group = phase_grp,
+    desc = "aosp-nav: flip phase to ready once jdt.ls reports ServiceReady",
+    callback = function(args)
+      M.install_phase_handler(vim.lsp.get_client_by_id(args.data.client_id))
+    end,
+  })
+
+  -- 12. jar 缓存陈旧 (AOSP 重新编译过): 不再打扰用户。安排一次**静默**后台重扫,
+  --     让下次会话开箱即用。绝不在 configure 里同步扫描 —— 那是
+  --     out/soong/.intermediates 的全树 walk, 数秒级, 会卡启动。
+  --     jars.refresh_async 由并行工作流新增, pcall 兜底: 缺函数也不影响启动。
   if is_android and jar_status.origin == "cache" and jar_status.stale then
-    vim.notify("[aosp-nav] AOSP 已重新编译 (out/soong/build.ninja 比 jar 缓存新), "
-      .. "jar 列表可能过期 — 跑 :AospRescan 更新后 :LspRestart 生效",
-      vim.log.levels.WARN, { timeout = 10000 })
+    local stale_root = jar_status.root
+    local function refresh()
+      local ok, fn = pcall(function()
+        return require("aosp-nav.java.jars").refresh_async
+      end)
+      if ok and type(fn) == "function" then
+        pcall(fn, stale_root)
+      else
+        log.debug("jar cache stale, but jars.refresh_async is not available yet")
+      end
+    end
+    -- configure 可能发生在非常早的启动阶段 (VimEnter 之前): 那时挂到 VimEnter,
+    -- 否则直接 defer 一次。
+    if vim.v.vim_did_enter == 1 then
+      vim.defer_fn(refresh, 0)
+    else
+      local grp = vim.api.nvim_create_augroup("aosp_nav_jar_refresh", { clear = true })
+      vim.api.nvim_create_autocmd("VimEnter", {
+        group = grp,
+        once = true,
+        desc = "aosp-nav: silent jar cache refresh (cache was stale)",
+        callback = refresh,
+      })
+    end
   end
 
   -- 13. 工作区污染自检。AOSP 根下只要存在**可见工程**, jdt.ls 的
@@ -330,17 +452,21 @@ function M.configure(opts)
   --     这些工程是**上一次**导入留下的 (源码树里残留的 .project 被 EclipseProject
   --     Importer 捡走, 或树里的 gradle 工程被 Buildship 导入), 且不可逆:
   --     import.exclusions 只挡新导入, 只有 :AospCleanWorkspace 能清掉。
-  if is_android and java_cfg.workspace_mode == "aosp" and root_path then
+  --     [v10] 判据用 "根是 AOSP 根" <=> mode ~= "project" (aosp 与 infer 都成立)。
+  if is_android and java_cfg.mode ~= "project" and root_path then
     local ui = require("aosp-nav.ui")
     local ws_dir = ui._workspace_dir(bufname)
     local blockers = ui.workspace_blockers(ws_dir, root_path)
     if #blockers > 0 and not _blockers_warned[root_path] then
       _blockers_warned[root_path] = true
-      vim.notify(("[aosp-nav] jdtls 工作区里存在 %d 个外部可见工程 (%s) — "
-        .. "它们会让本根下的 invisible project 永远建不出来 (跳转落进假工程)。\n"
-        .. "跑 :AospCleanWorkspace 重建 jdtls 工作区 (排除项已就绪, 下次不会再导入)。")
+      -- must-see 情况 #1: 工作区被占用, 必须让用户跑 :AospCleanWorkspace
+      log.user(("%d externally-visible project(s) exist in the jdtls workspace (%s) — "
+        .. "they keep the invisible project for this root from ever being created "
+        .. "(jumps land in a fake project).\n"
+        .. "Run :AospCleanWorkspace to rebuild the jdtls workspace (exclusions are ready, "
+        .. "so they will not be re-imported).")
         :format(#blockers, table.concat(blockers, ", ")),
-        vim.log.levels.WARN, { timeout = 15000 })
+        { id = "blockers:" .. root_path, timeout = 15000 })
     end
 
     -- 14. 单实例自检。两个 jdtls JVM 共用同一个 -data 会互相覆盖索引与 .classpath,
@@ -349,12 +475,15 @@ function M.configure(opts)
     local others = ui.foreign_jdtls(ws_dir)
     if #others > 0 and not _instances_warned[ws_dir or ""] then
       _instances_warned[ws_dir or ""] = true
-      vim.notify(("[aosp-nav] 已有 %d 个 jdtls 进程 (pid %s) 正在使用同一个数据目录:\n"
+      -- must-see 情况 #2: 外部 jdtls 共用同一 -data 目录
+      log.user(("%d jdtls process(es) (pid %s) are already using the same data directory:\n"
         .. "  %s\n"
-        .. "两个 JVM 共用一份索引会互相覆盖 (症状: 索引被反复删除重建、Java Index broken)。\n"
-        .. "建议只保留一个: 关掉另一个 nvim, 或 kill 掉这些 pid 后 :AospCleanWorkspace 重建。")
+        .. "Two JVMs sharing one index overwrite each other (symptoms: the index is "
+        .. "repeatedly deleted and rebuilt, Java Index broken).\n"
+        .. "Keep only one: close the other nvim, or kill these pids and run "
+        .. ":AospCleanWorkspace to rebuild.")
         :format(#others, table.concat(others, ", "), ws_dir or "?"),
-        vim.log.levels.WARN, { timeout = 20000 })
+        { id = "instances:" .. (ws_dir or "?"), timeout = 20000 })
     end
   end
 

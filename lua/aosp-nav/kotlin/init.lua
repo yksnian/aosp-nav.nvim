@@ -5,6 +5,8 @@
 
 local M = {}
 
+local log = require("aosp-nav.util.log")
+
 --- 获取当前配置 (经 M.kotlin 访问时 metatable 已 ensure setup)
 local function get_cfg()
   return require("aosp-nav").config
@@ -28,7 +30,7 @@ end
 --- @return table|nil extra 供 ensure_script 使用
 local function kls_root_extra(root, fname)
   if type(root) ~= "string" or root == "" then return nil end
-  -- 用 aosp_root 而非 workspace_root: 后者在 java.workspace_mode="project" 下为
+  -- 用 aosp_root 而非 workspace_root: 后者在 java.mode="project" 下为
   -- nil, 而这里的映射要的是 AOSP 根 (KLS 的 workspace root 可能是模块目录)
   local aosp = require("aosp-nav.java.root").aosp_root(fname)
   if not aosp then return nil end
@@ -84,7 +86,7 @@ function M.configure(opts)
   local path, err = require("aosp-nav.kotlin.classpath").ensure_script(
     kls_root_extra(predict_kls_root(buf, opts.root_markers), buf))
   if not path then
-    vim.notify("[aosp-nav] kls-classpath generate failed: " .. (err or "unknown"), vim.log.levels.WARN)
+    log.error("kls-classpath generate failed: " .. (err or "unknown"))
   end
 
   -- 5. all 模式: 预热 java 模块的 jar 缓存 (脚本 all 模式的数据源)
@@ -94,7 +96,7 @@ function M.configure(opts)
       require("aosp-nav.java.jars").find_android_jars()
     end)
     if not ok2 then
-      vim.notify("[aosp-nav] jar cache warm-up failed, kls-classpath(all) may miss cache", vim.log.levels.WARN)
+      log.debug("jar cache warm-up failed, kls-classpath(all) may miss cache")
     end
   end
 
@@ -125,8 +127,7 @@ function M.configure(opts)
             if kc.register_root(extra.root, extra.aosp) then
               local p, e = kc.ensure_script()
               if not p then
-                vim.notify("[aosp-nav] kls-classpath regenerate failed: " .. (e or "unknown"),
-                  vim.log.levels.WARN)
+                log.error("kls-classpath regenerate failed: " .. (e or "unknown"))
               end
             end
           end
@@ -163,7 +164,7 @@ function M.preview_classpath(mode)
   local cfg = get_cfg()
   if mode then
     if mode ~= "curated" and mode ~= "all" then
-      vim.notify("[aosp-nav] invalid mode: " .. mode .. " (curated|all)", vim.log.levels.ERROR)
+      log.error("invalid mode: " .. mode .. " (curated|all)")
       return
     end
     cfg.kotlin.jar_mode = mode
@@ -174,20 +175,18 @@ function M.preview_classpath(mode)
   local path, err = classpath.ensure_script(
     kls_root_extra(cwd, vim.api.nvim_buf_get_name(0)))
   if not path then
-    vim.notify("[aosp-nav] generate failed: " .. (err or "unknown"), vim.log.levels.ERROR)
+    log.error("generate failed: " .. (err or "unknown"))
     return
   end
   local jars = classpath.dry_run(vim.fn.getcwd())
-  vim.notify(
-    "[aosp-nav] kls-classpath (" .. cfg.kotlin.jar_mode .. ") -> " .. #jars .. " jars from " .. vim.fn.getcwd(),
-    vim.log.levels.INFO
-  )
+  log.info("kls-classpath (" .. cfg.kotlin.jar_mode .. ") -> " .. #jars
+    .. " jars from " .. vim.fn.getcwd())
   for i = math.min(#jars, 10), 1, -1 do
-    vim.notify("  " .. jars[i], vim.log.levels.INFO)
+    log.info("  " .. jars[i])
   end
   if cfg.kotlin.jar_mode == "all" then
-    vim.notify("[aosp-nav] all 模式为实验性: KLS 首次索引慢/内存高; 切换模式后建议清理 "
-      .. cfg.kotlin.storage_path, vim.log.levels.WARN)
+    log.warn("jar_mode = \"all\" is experimental: KLS's first index is slow and memory-heavy; "
+      .. "after switching modes, consider clearing " .. cfg.kotlin.storage_path)
   end
 end
 

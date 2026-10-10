@@ -31,15 +31,17 @@ local function has_marker(dir)
   return vim.fn.filereadable(dir .. "/.git") == 1
 end
 
---- 从文件向上找所属项目目录
---- 起点是文件所在目录, 逐级上溯; 到 aosp_root 即停 (aosp_root 自身不算项目 ——
---- 它的 .git 是 repo 的元数据, 不是某个项目)。
---- @param fname string 文件路径
+--- 从文件 (或目录) 向上找所属项目目录
+--- 起点是文件所在目录 (传入目录时就是该目录自身), 逐级上溯; 到 aosp_root 即停
+--- (aosp_root 自身不算项目 —— 它的 .git 是 repo 的元数据, 不是某个项目)。
+--- @param fname string|nil 文件路径或目录路径
 --- @param aosp_root string|nil AOSP 根 (nil = 不限边界, 只回到文件系统根)
 --- @return string|nil project_root 绝对路径; nil = 没找到 (或越过了 AOSP 根)
 function M.find_project_root(fname, aosp_root)
   if not fname or fname == "" then return nil end
-  local dir = normalize(vim.fn.fnamemodify(fname, ":h"))
+  -- 起点归一 (见 util/path.lua): 文件 -> 其所在目录, 目录 -> 自身。
+  -- 传目录进来时不能再用 :h —— 那会把目录本身跳过, 从它的父目录开始找标记。
+  local dir = normalize(require("aosp-nav.util.path").start_dir(fname))
   if dir == "" or dir == "/" then return nil end
 
   local bound = (aosp_root and aosp_root ~= "") and normalize(aosp_root) or nil
@@ -73,11 +75,11 @@ function M.rel(aosp_root, project_root)
   return project_root
 end
 
---- workspace_mode == "project" 时的工作区根: 有用户函数就用用户的 (它自带
+--- java.mode == "project" 时的工作区根: 有用户函数就用用户的 (它自带
 --- .project/.git 就近取根 + 客户端复用逻辑), 否则按 find_project_root 取。
---- 注意此时 sourcePaths 注入被整体关闭 (config 会把 source_paths_mode 降级为
---- "project"), 本函数只决定 jdtls workspace 落在哪。
---- @param fname string
+--- 注意此时 sourcePaths 注入被整体关闭 (java.mode="project" 即不注入),
+--- 本函数只决定 jdtls workspace 落在哪。
+--- @param fname string|nil 文件路径或目录路径
 --- @param user_root string|function|nil
 --- @param aosp_root string|nil
 --- @return string|nil
@@ -91,8 +93,9 @@ function M.workspace_root_project(fname, user_root, aosp_root)
   local static = nil
   if type(user_root) == "string" and user_root ~= "" then
     static = normalize(user_root)
-    local f = normalize(fname)
-    if f:sub(1, #static + 1) == static .. "/" then return static end
+    -- fname 可能是文件, 也可能就是 static 根目录本身
+    local f = normalize(require("aosp-nav.util.path").start_dir(fname))
+    if f == static or f:sub(1, #static + 1) == static .. "/" then return static end
   end
   -- 项目检测优先, 检测不出再退回用户的静态根 (它对树外文件仍是有效兜底)
   return M.find_project_root(fname, aosp_root) or static

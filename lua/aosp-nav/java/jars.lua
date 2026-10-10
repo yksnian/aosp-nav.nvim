@@ -3,11 +3,21 @@
 
 local M = {}
 
+local log = require("aosp-nav.util.log")
+
+-- 缓存格式版本: 过滤算法/缓存布局升级时 bump, 旧缓存自动作废重扫
+local CACHE_VERSION = 6  -- v6: filters 指纹进缓存头 + 目录优先级排序
+                         --      + %-headers 桩家族排除 (默认值在 config.lua)
+
 -- 模块级缓存状态 (从 jdtls.lua 迁移)
 local _jars_cache = nil       -- 缓存的 jar 列表
 local _jars_cache_root = nil  -- 缓存对应的 android_root
 local _jars_computed = false  -- 是否已计算过
 local _jars_origin = nil      -- "cache" | "soong" | "make" | "fallback"
+
+-- 后台刷新状态 (R1: refresh_async)
+local _refresh_inflight = false  -- 有刷新在跑 (防重入)
+local _refresh_last = nil        -- 最近一次刷新结果, 供 :Aosp 面板/诊断读取
 
 --- 获取当前配置 (setup 后有效, __index metatable 保证 setup 已调用)
 local function get_cfg()
@@ -22,6 +32,28 @@ local function cache_file_for(root)
   if not cfg.cache_dir or not root or root == "" then return nil end
   local key = root:gsub("/", "-"):gsub("^-", "")
   return cfg.cache_dir .. "/" .. key .. ".txt"
+end
+
+--- 写 jar 缓存文件 (同步扫描与后台刷新共用的唯一写路径)。
+--- 头部字节必须与读侧校验一致 (# version= / # filters=), 否则下次启动
+--- 读缓存不命中会重扫 —— 所以两条路径都走这里, 不允许各写一份格式。
+--- @param cache_file string
+--- @param android_root string
+--- @param fhash string filters 指纹
+--- @param jars table 已排序的 jar 路径列表
+local function write_cache(cache_file, android_root, fhash, jars)
+  local cache_lines = {
+    "# version=" .. CACHE_VERSION,
+    "# filters=" .. fhash,
+    "# android_root=" .. android_root,
+    "# generated=" .. os.date("%Y-%m-%d %H:%M"),
+    "# count=" .. #jars,
+  }
+  for _, j in ipairs(jars) do
+    cache_lines[#cache_lines + 1] = j
+  end
+  vim.fn.mkdir(vim.fn.fnamemodify(cache_file, ":h"), "p")
+  vim.fn.writefile(cache_lines, cache_file)
 end
 
 --- 按完整路径去重添加 jar
@@ -100,7 +132,9 @@ local function sort_by_dir_priority(jars)
   end)
 end
 
---- 扫描 Soong intermediates 目录 (Android 15+)
+--- 处理已扫出的 Soong intermediates jar 路径 -> 分桶去重 (纯 Lua)。
+--- 同步扫描 (scan_soong_intermediates) 与后台异步刷新 (refresh_async) 共用,
+--- 保证两条路径选出同一份 jar 列表 —— 唯一的差别只是路径从哪来。
 --- jar 路径结构: <base>/<src...>/<module>[.impl]/<variant>[/<type>...]/<name>.jar
 ---   变体: android_common (设备端标准, 首选) | android_common_apexNN (APEX 变体,
 ---         同模块无 android_common 产物时兜底, 如 core-oj 只有 apex31); host
@@ -111,21 +145,15 @@ end
 ---         的真实编译在 <name>.impl 子模块, 剥后缀归一到主模块名参与去重
 ---   排除: repackaged-jarjar/jarjar 类型链; exclude_jars 同时匹配 jar 名与
 ---         模块名 (如 "stubs" 拦住 android-non-updatable.stubs.system 等签名桩)
---- @param base_dir string soong intermediates 根目录
+--- @param base_dir string soong intermediates 根目录 (用于算相对路径)
+--- @param all_matches table 扫描出的 jar 绝对路径列表
 --- @param jars table jar 列表 (追加)
 --- @param seen_paths table 已见路径集合
 --- @return boolean found_any
 --- @return table|nil selected mod_name -> jar_path (v4: 供调用方做 pre-jarjar 后处理)
-local function scan_soong_intermediates(base_dir, jars, seen_paths)
+local function process_soong_matches(base_dir, all_matches, jars, seen_paths)
   local cfg = get_cfg()
   local java_cfg = cfg.java
-  if vim.fn.isdirectory(base_dir) ~= 1 then return false end
-
-  -- 全量列出 jar (产物类型目录层级不固定, 统一扫出后在 Lua 侧解析;
-  -- 全树 ~2600 个路径, 成本可忽略), fd 优先 find 备选
-  local fs = require("aosp-nav.util.fs")
-  local all_matches = fs.scan_files(base_dir, "\\.jar$", { "*.jar" })
-  if not all_matches or #all_matches == 0 then return false end
 
   -- [v3] type_rank 只决定兜底桶内部排序; own/fallback 的归属由 tag 名决定
   local type_rank = {}
@@ -216,6 +244,48 @@ local function scan_soong_intermediates(base_dir, jars, seen_paths)
     end
   end
   return found_any, selected
+end
+
+--- 同步扫描 Soong intermediates 目录 (fd 优先 find 备选), 再走 process_soong_matches
+--- @param base_dir string soong intermediates 根目录
+--- @param jars table jar 列表 (追加)
+--- @param seen_paths table 已见路径集合
+--- @return boolean found_any
+--- @return table|nil selected mod_name -> jar_path
+local function scan_soong_intermediates(base_dir, jars, seen_paths)
+  if vim.fn.isdirectory(base_dir) ~= 1 then return false end
+  -- 全量列出 jar (产物类型目录层级不固定, 统一扫出后在 Lua 侧解析;
+  -- 全树 ~2600 个路径, 成本可忽略)
+  local all_matches = require("aosp-nav.util.fs").scan_files(base_dir, "\\.jar$", { "*.jar" })
+  if not all_matches or #all_matches == 0 then return false end
+  return process_soong_matches(base_dir, all_matches, jars, seen_paths)
+end
+
+--- [v4] pre-jarjar 跨模块去重: soong 对带 jarjar_rules 的模块会导出
+--- <name>-pre-jarjar 独立模块 (改包名前的原包名类), 与基模块产物同 FQN
+--- 重复 (如 framework-wifi-pre-jarjar vs framework-wifi.impl/javac)。
+--- 基模块已入选时丢弃 pre-jarjar 版; 孤立模块 (基模块无其它产物,
+--- 如 service-connectivity-tiramisu-pre-jarjar) 保留兜底。
+--- @param selected table mod_name -> path
+--- @param jars table 待原地剔除的 jar 列表
+--- @param seen_paths table 已见路径集合 (同步剔除)
+--- @return number dropped 被丢弃的模块数
+local function drop_pre_jarjar(selected, jars, seen_paths)
+  local dropped = 0
+  for mod, path in pairs(selected) do
+    local base = mod:match("^(.-)%-pre%-jarjar$")
+    if base and selected[base] then
+      dropped = dropped + 1
+      seen_paths[path] = nil
+      for i, j in ipairs(jars) do
+        if j == path then
+          table.remove(jars, i)
+          break
+        end
+      end
+    end
+  end
+  return dropped
 end
 
 --- 扫描 Make 构建系统 intermediates 目录 (Android 14 及更早)
@@ -318,8 +388,6 @@ function M.find_android_jars(opts)
   -- 手动清除: rm ~/.cache/nvim/aosp_nav/*.txt (AOSP 重新编译后需要)
   local cache_file = nil
   local from_cache = false
-  local CACHE_VERSION = 6  -- v6: filters 指纹进缓存头 + 目录优先级排序
-                           --      + %-headers 桩家族排除 (默认值在 config.lua)
   local fhash = filters_hash(java_cfg)
   if cfg.cache_dir and android_root then
     cache_file = cache_file_for(android_root)
@@ -344,7 +412,7 @@ function M.find_android_jars(opts)
           _jars_cache_root = android_root
           _jars_computed = true
           _jars_origin = "cache"  -- 缓存命中路径也要记来源 (状态/诊断读它)
-          vim.notify("[aosp-nav] JAR loaded from cache (" .. #jars .. " jars)", vim.log.levels.INFO)
+          log.debug("JAR loaded from cache (" .. #jars .. " jars)")
           return jars
         end
       end
@@ -355,30 +423,11 @@ function M.find_android_jars(opts)
   for _, soong_sub in ipairs({ "/out/soong/.intermediates", "/out/.soong/.intermediates" }) do
     local found, selected = scan_soong_intermediates(android_root .. soong_sub, jars, seen_paths)
     if found then
-      -- [v4] pre-jarjar 跨模块去重: soong 对带 jarjar_rules 的模块会导出
-      -- <name>-pre-jarjar 独立模块 (改包名前的原包名类), 与基模块产物同 FQN
-      -- 重复 (如 framework-wifi-pre-jarjar vs framework-wifi.impl/javac)。
-      -- 基模块已入选时丢弃 pre-jarjar 版; 孤立模块 (基模块无其它产物,
-      -- 如 service-connectivity-tiramisu-pre-jarjar) 保留兜底。
-      -- 注意 fallback 目录场景 (尝试 3) 不做此处理: 目录布局镜像自收集脚本,
-      -- 脚本侧已应用同样规则, 且 fallback 下模块名键完整
-      local dropped = {}
-      for mod, path in pairs(selected) do
-        local base = mod:match("^(.-)%-pre%-jarjar$")
-        if base and selected[base] then
-          dropped[#dropped + 1] = mod
-          seen_paths[path] = nil
-          for i, j in ipairs(jars) do
-            if j == path then
-              table.remove(jars, i)
-              break
-            end
-          end
-        end
-      end
-      if #dropped > 0 then
-        vim.notify(("[aosp-nav] dropped %d pre-jarjar duplicates"):format(#dropped),
-          vim.log.levels.INFO)
+      -- 注意 fallback 目录场景 (尝试 3) 不做 pre-jarjar 处理: 目录布局镜像自
+      -- 收集脚本, 脚本侧已应用同样规则, 且 fallback 下模块名键完整
+      local dropped = drop_pre_jarjar(selected, jars, seen_paths)
+      if dropped > 0 then
+        log.debug(("dropped %d pre-jarjar duplicates"):format(dropped))
       end
       table.insert(source_parts, "soong")
       break
@@ -403,12 +452,14 @@ function M.find_android_jars(opts)
   end
 
   -- 通知降噪: 仅首次计算时提示来源
+  -- 通知降噪: 扫描来源/统计属例行进度 (log.debug); 只有"识别出 android 工程
+  -- 却一个 jar 都没有"值得冒泡 (jdtls 会被降级到只剩 JDK 基础库)
   local source_label = #source_parts > 0 and table.concat(source_parts, " + ") or nil
   if not _jars_computed then
     if source_label then
-      vim.notify("[aosp-nav] JAR source -> " .. source_label .. " (" .. #jars .. " jars)", vim.log.levels.INFO)
+      log.debug("JAR source -> " .. source_label .. " (" .. #jars .. " jars)")
     else
-      vim.notify("[aosp-nav] android project detected but no JAR source found", vim.log.levels.WARN)
+      log.warn("android project detected but no JAR source found")
     end
   end
 
@@ -416,18 +467,7 @@ function M.find_android_jars(opts)
   if #jars > 0 and not from_cache and cache_file then
     -- [v6] 固化目录优先级顺序 (桩与真身同 FQN 时真身在前)
     sort_by_dir_priority(jars)
-    local cache_lines = {
-      "# version=" .. CACHE_VERSION,
-      "# filters=" .. fhash,
-      "# android_root=" .. android_root,
-      "# generated=" .. os.date("%Y-%m-%d %H:%M"),
-      "# count=" .. #jars,
-    }
-    for _, j in ipairs(jars) do
-      cache_lines[#cache_lines + 1] = j
-    end
-    vim.fn.mkdir(vim.fn.fnamemodify(cache_file, ":h"), "p")
-    vim.fn.writefile(cache_lines, cache_file)
+    write_cache(cache_file, android_root, fhash, jars)
   end
 
   -- 更新内存缓存
@@ -439,7 +479,117 @@ function M.find_android_jars(opts)
   return jars
 end
 
---- jar 缓存是否已陈旧 (AOSP 重新编译过)
+--- 内部: 旧 make / fallback 树的兜底重扫 (同步, 只在延迟回调里跑)。
+--- soong 异步扫描无果时才会走到这里 —— 这类树没有 out/soong/build.ninja,
+--- 走的是 glob JAVA_LIBRARIES 的老路, 无法用 vim.system 简单表达 (阻塞代价
+--- 见 refresh_async)。
+--- @param android_root string
+--- @return table jars
+--- @return string|nil source "make" | "fallback" | nil
+local function rescan_make_or_fallback(android_root)
+  local java_cfg = get_cfg().java
+  local jars, seen_paths, seen_intermediates = {}, {}, {}
+  if scan_aosp_out(android_root, jars, seen_paths, seen_intermediates) then
+    return jars, "make"
+  end
+  for _, sub in ipairs({ "/.soong/.intermediates", "/soong/.intermediates" }) do
+    if scan_soong_intermediates(java_cfg.jar_fallback_dir .. sub, jars, seen_paths) then
+      return jars, "fallback"
+    end
+  end
+  return jars, nil
+end
+
+--- 完成刷新: 排序 + 经同一条写路径落盘 + 记录结果。全程静默 (自动操作成功
+--- 不通知用户); 结果留给 :Aosp 面板经 M.refresh_status() 读取。
+--- @param android_root string
+--- @param jars table
+--- @param source string|nil
+local function finish_refresh(android_root, jars, source)
+  _refresh_inflight = false
+  if #jars > 0 then
+    sort_by_dir_priority(jars)
+    local cache_file = cache_file_for(android_root)
+    if cache_file then
+      write_cache(cache_file, android_root, filters_hash(get_cfg().java), jars)
+    end
+  end
+  _refresh_last = {
+    root = android_root,
+    at = os.time(),
+    count = #jars,
+    source = source,
+    ok = #jars > 0,
+  }
+end
+
+--- 静默后台刷新 jar 缓存; 结果只供**下一次**会话使用 (jdtls 仅在 initialize
+--- 读一次 jar 列表), 绝不打断当前会话。成功不通知用户。
+---
+--- 并发模型: soong 树的原始扫描 (fd/find 走 out/soong/.intermediates, 全树
+--- 数千目录) 交给 vim.system 真并发, stdout 回主循环再跑 Lua 侧分桶去重。
+--- 唯一的同步残留: soong 目录缺失或扫不出 jar 时 (Android 14 及更早的 make
+--- 树 / 纯 fallback 树), 兜底重扫是延迟到主循环的**同步** glob —— 那一步会
+--- 短暂阻塞 UI (make 树 glob 数百个 intermediates 目录, 实测亚秒级, 但不保证)。
+--- 现代 soong 树 (Android 15+) 全程异步、无阻塞。
+---
+--- @param aosp_root string
+--- @return boolean started false = 已有一个刷新在跑, 或参数不可用/不在 AOSP 树内
+function M.refresh_async(aosp_root)
+  if _refresh_inflight then return false end
+  if not aosp_root or aosp_root == "" or vim.fn.isdirectory(aosp_root) ~= 1 then return false end
+  if not require("aosp-nav.android_root").has_jar_source(aosp_root) then return false end
+
+  -- 存在的 soong intermediates 目录 (与同步路径的探测顺序一致)
+  local soong_base = nil
+  for _, sub in ipairs({ "/out/soong/.intermediates", "/out/.soong/.intermediates" }) do
+    if vim.fn.isdirectory(aosp_root .. sub) == 1 then
+      soong_base = aosp_root .. sub
+      break
+    end
+  end
+
+  _refresh_inflight = true
+
+  if soong_base then
+    local started = require("aosp-nav.util.fs").scan_files_async(
+      soong_base, "\\.jar$", { "*.jar" },
+      function(matches, _tool)
+        -- 已在主循环 (scan_files_async 内部 vim.schedule)
+        local jars, seen_paths, source = {}, {}, nil
+        if matches and #matches > 0 then
+          local found, selected = process_soong_matches(soong_base, matches, jars, seen_paths)
+          if found then
+            drop_pre_jarjar(selected, jars, seen_paths)
+            source = "soong"
+          end
+        end
+        if #jars == 0 then
+          -- soong 无果: 退到同步兜底 (见函数头注释)
+          jars, source = rescan_make_or_fallback(aosp_root)
+        end
+        finish_refresh(aosp_root, jars, source)
+      end)
+    if not started then
+      _refresh_inflight = false
+      return false
+    end
+    return true
+  end
+
+  -- 没有 soong intermediates: 直接走延迟同步兜底
+  vim.schedule(function()
+    local jars, source = rescan_make_or_fallback(aosp_root)
+    finish_refresh(aosp_root, jars, source)
+  end)
+  return true
+end
+
+--- 最近一次后台刷新的结果 (供 :Aosp 面板/诊断展示; nil = 本会话尚未刷新过)
+--- @return table|nil { root, at, count, source, ok }
+function M.refresh_status()
+  return _refresh_last
+end
 --- 判据: out/soong/build.ninja (每次构建都会重写) 或 make 时代 JAVA_LIBRARIES
 --- 目录的 mtime 比缓存文件新。只有一次 getftime, 可在启动路径上调用。
 --- @param root string|nil android_root (nil = 用当前内存缓存对应的 root)

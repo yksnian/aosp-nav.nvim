@@ -3,6 +3,8 @@
 
 local M = {}
 
+local log = require("aosp-nav.util.log")
+
 -- [v7] 排除类列表家族: 这些键按 java.exclude_merge 语义合并 (append = 用户项
 -- 拼在默认项之后), 其余字段走 tbl_deep_extend 的整表替换语义。
 -- import_exclusions 与 exclude_* 同族 (都是"用户几乎只想追加"的清单);
@@ -18,6 +20,10 @@ local EXCLUSION_LIST_KEYS = {
 
 -- 默认配置
 M.defaults = {
+  -- [v10] 插件日志阈值: "debug"|"info"|"warn"|"error"|"off"。init.setup 合并
+  -- 配置后推给 util/log.lua (两模块唯一的连接点; log 不能反向 require config)。
+  -- 非法值只降级提示, 绝不中断 setup。
+  log_level = "warn",
   -- nil = 自动检测 (从打开文件路径向上找含 out 产物的目录)
   android_root = nil,
   -- jar 列表缓存目录 (避免每次打开 java 文件都全盘扫描)
@@ -88,23 +94,30 @@ M.defaults = {
     import_exclusions_enabled = true,
     import_exclusions_scan = true,
     import_exclusions_ttl = 604800,
-    -- [v8] jdtls 工作区根:
-    --   "aosp" (默认) = AOSP 根, 整棵树共用一个索引, 跨模块跳转落到真实 .java
-    --     (代价: 首次索引重, 见 DEVELOPMENT.md 的实测数据)
-    --   "project" = 按项目 (.git/.project 就近) 开工作区 —— 本插件接管之前的
-    --     行为, 索引小启动快, 但跨模块跳转只能落到反编译 jar
-    workspace_mode = "aosp",
-    -- [v8] 源码根 (java.project.sourcePaths) 注入策略:
-    --   "core" (默认) = 预置核心集在导入期注入, 之后按打开文件所属项目
-    --     (.git 边界) 增量累积。跳转落到可编辑的真实 .java。
-    --   "infer" = 完全不注入这个 key, 让 jdt.ls 自己按打开文件的 package 逐文件
-    --     推断源码根。行为与本插件早期版本一致: 跨模块跳转落到反编译 jar。
-    --   "project" = 由 workspace_mode="project" 自动选定, 同样不注入。
+    -- [v10] 单一模式键 (取代旧的 workspace_mode + source_paths_mode 组合):
+    --   "aosp" (默认) = 工作区根是 AOSP 根 **且** 注入 sourcePaths (预置核心集
+    --     + 按打开项目累积)。跨模块跳转落到可编辑的真实 .java。
+    --   "infer" = 工作区根是 AOSP 根, 但**不**注入 —— 让 jdt.ls 按打开文件的
+    --     package 逐文件推断源码根; 跨模块跳转落到反编译 jar。
+    --   "project" = 工作区根是每个项目 (.git/.project 就近) 的目录, 不注入。
     -- 注意 (机制, 见 DEVELOPMENT.md): 注入这个 key 会**整体关闭** jdt.ls 的逐文件
     -- 推断 (BaseDocumentLifeCycleHandler.inferInvisibleProjectSourceRoot 在
     -- getInvisibleProjectSourcePaths() != null 时直接 return), 所以注入的列表
     -- 必须自己维护完整, 且**空列表绝不注入** —— 那会关掉推断又没有替代。
-    source_paths_mode = "core",
+    -- 两个**不同**问题, 别合并成一个谓词:
+    --   根是 AOSP 根  <=>  mode ~= "project"   (aosp 与 infer 都成立)
+    --   开启注入      <=>  mode == "aosp"      (只有 aosp 成立)
+    mode = "aosp",
+    -- [v9] 累积到的源码根**自动**增量注入运行中的 jdtls 工作区
+    -- (java.project.addToSourcePath, 见 java/source_apply.lua)。
+    -- 关掉就退回旧行为: 只累积 + 提示, 手动 :Aosp!。
+    -- 只在 mode = "aosp" 且 jdtls 已在运行时生效。
+    source_apply_auto = true,
+    -- [v10] 单次自动注入的源码根条数上限**不是配置项**, 是 java/source_apply.lua
+    -- 里的常量 MAX_AUTO_ROOTS (=5): 一次注入 = 一次全量 classpath 重建 + 工程
+    -- 索引重算, 所以自动路径每会话一次、单批不超过 5 条, 等索引静默后再出手。
+    -- 想立刻全量注入用 :Aosp!, 想彻底关掉自动注入用上面的 source_apply_auto ——
+    -- 这个数值没有值得调的场景, 不开放成键。
     -- [v8] 预置核心集 (相对 AOSP 根)。这些是几乎每个 AOSP 会话都要读的根,
     -- 在 jdt.ls 导入期就位, 不必等用户逐个打开文件才累积上来。
     -- 语义 = 整表替换 (同 kotlin.curated_modules): 想增减请把默认两条一起写上。
@@ -148,12 +161,6 @@ M.defaults = {
       "integration%-tests",
       "multivalentTests",
     },
-    -- [v7] DEPRECATED / 已失效: 工作区根现在恒等于 AOSP 根 (java/root.lua), 而
-    -- 自排除的判定基准是"root_dir 相对 android_root 的差值", 两者恒等 → 恒为
-    -- 空 → 永远匹配不到任何 jar, 该开关不再产生任何效果。
-    -- 需要剔除某模块的 jar 请用 exclude_jars / exclude_globs。
-    -- 保留此键只为不静默吞掉老配置, 设置后会在启动时提示一次。
-    exclude_self_jars = false,
     -- 显式源码根列表 (相对 AOSP 根或绝对路径)。非空时**完全接管**注入列表,
     -- 不再使用 core_source_roots / 项目累积 —— 想手工钉死一份列表时用它:
     --   source_paths = { "frameworks/base/core/java", "libcore/ojluni/src/main/java" }
@@ -171,9 +178,6 @@ M.defaults = {
     disable_gradle_import = true,
     -- inlay hints: "auto" = 有 jar 时 off (避签名损坏 NPE), 无 jar 时 all
     inlay_hints_mode = "auto",
-  },
-  clang = {
-    enabled = false,
   },
   kotlin = {
     enabled = true,
@@ -219,83 +223,30 @@ M.defaults = {
   },
 }
 
--- [v8] 合法值与历史别名。别名静默归一 (提示一次) 而不是报错中断 setup:
---   scan   = 早期版本的浅层扫描模式 (java/source_paths.lua, 已删除)
---   shallow / attach / full = 未发布的实验模式, 一律落到 core
-local WORKSPACE_MODES = { aosp = true, project = true }
-local SOURCE_PATHS_MODES = { core = true, infer = true, project = true }
-local SOURCE_PATHS_ALIASES = {
-  scan = "core", shallow = "core", attach = "core", full = "core",
-}
+-- [v10] java.mode 合法值 (取代旧的 workspace_mode + source_paths_mode):
+--   aosp    = 工作区根 = AOSP 根 + sourcePaths 注入 (默认)
+--   infer   = 工作区根 = AOSP 根, 不注入 (jdt.ls 逐文件推断源码根)
+--   project = 工作区根 = 项目 .git/.project 目录, 不注入
+local JAVA_MODES = { aosp = true, infer = true, project = true }
 
--- 已提示过的模式归一 (避免每次 setup 重复打扰)
-local _mode_warned = {}
+-- [v10] 日志阈值合法值
+local LOG_LEVELS = { debug = true, info = true, warn = true, error = true, off = true }
 
---- 提示一次
---- @param key string
---- @param msg string
-local function warn_once(key, msg)
-  if _mode_warned[key] then return end
-  _mode_warned[key] = true
-  vim.notify("[aosp-nav] " .. msg, vim.log.levels.WARN)
-end
-
---- [v8] 模式字段归一 (就地修改 cfg.java)。见 M.validate 里的调用说明。
---- @param java_cfg table
-local function normalize_modes(java_cfg)
-  -- workspace_mode
-  local wm = java_cfg.workspace_mode
-  if wm ~= nil and not WORKSPACE_MODES[wm] then
-    warn_once("workspace_mode:" .. tostring(wm),
-      ("java.workspace_mode = %q 不是合法值, 已回落为 'aosp' (可选: 'aosp' | 'project')")
-        :format(tostring(wm)))
-    java_cfg.workspace_mode = "aosp"
+-- [v10] 旧键一律**静默丢弃**, 不迁移也不提示。
+-- 丢的是: java.workspace_mode / java.source_paths_mode (被 java.mode 取代)、
+-- java.exclude_self_jars / java.source_patterns (早已失效)、顶层 clang 桩。
+-- 为什么不写映射表: 本插件用户极少, 维护一张"旧组合 -> java.mode"的对照表外加
+-- 一条迁移提示, 换来的只是让配置面同时存在两种写法。宁可只有一种写法。
+-- @param user_opts table 用户 opts (调用方保证是可安全改写的副本)
+local function drop_legacy_keys(user_opts)
+  local j = user_opts.java
+  if type(j) == "table" then
+    j.workspace_mode = nil
+    j.source_paths_mode = nil
+    j.exclude_self_jars = nil
+    j.source_patterns = nil
   end
-  if java_cfg.workspace_mode == nil then
-    java_cfg.workspace_mode = "aosp"
-  end
-
-  -- source_paths_mode
-  local sm = java_cfg.source_paths_mode
-  if sm ~= nil and SOURCE_PATHS_ALIASES[sm] then
-    warn_once("sp_alias:" .. tostring(sm),
-      ("java.source_paths_mode = %q 是已废弃的写法, 已按 'core' 处理")
-        :format(tostring(sm)))
-    sm = SOURCE_PATHS_ALIASES[sm]
-  end
-  if sm ~= nil and not SOURCE_PATHS_MODES[sm] then
-    warn_once("sp_mode:" .. tostring(sm),
-      ("java.source_paths_mode = %q 不是合法值, 已回落为 'core' (可选: 'core' | 'infer')")
-        :format(tostring(sm)))
-    sm = "core"
-  end
-  java_cfg.source_paths_mode = sm or "core"
-
-  -- workspace_mode = "project" 与 sourcePaths 注入互斥: 那个模式下每个项目
-  -- 自成工作区, 注入列表反而会把所有项目拖进同一个 Eclipse 工程
-  if java_cfg.workspace_mode == "project" and java_cfg.source_paths_mode ~= "project" then
-    if java_cfg.source_paths_mode ~= "infer" then
-      warn_once("project_mode",
-        "java.workspace_mode = 'project' 时 sourcePaths 注入被关闭 "
-        .. "(source_paths_mode 视为 'project')")
-    end
-    java_cfg.source_paths_mode = "project"
-  end
-
-  -- 已删除的键
-  if java_cfg.source_patterns ~= nil then
-    warn_once("source_patterns",
-      "java.source_patterns 已废弃 (浅层扫描实现已删除), 本键不再有任何效果; "
-      .. "请改用 java.core_source_roots / java.source_paths")
-  end
-
-  -- 数值字段
-  local mx = java_cfg.source_paths_max_projects
-  if mx ~= nil and (type(mx) ~= "number" or mx < 0) then
-    warn_once("max_projects:" .. tostring(mx),
-      ("java.source_paths_max_projects = %s 不是非负数字, 已回落为 8"):format(tostring(mx)))
-    java_cfg.source_paths_max_projects = 8
-  end
+  if user_opts.clang ~= nil then user_opts.clang = nil end
 end
 
 --- 校验配置
@@ -312,6 +263,16 @@ function M.validate(cfg)
     return false, "cache_dir must not be empty"
   end
 
+  -- [v10] log_level 归一: 非法值回落 "warn" 并提示一次, 绝不 return false ——
+  -- 一个写错的枚举值不该让 setup 放弃整个插件 (连 jar 收集都不做)。
+  if cfg.log_level ~= nil and not LOG_LEVELS[cfg.log_level] then
+    local bad = tostring(cfg.log_level)
+    log.warn(("log_level = %q is not a valid value, falling back to 'warn' "
+      .. "(one of: debug|info|warn|error|off)"):format(bad),
+      { once = true, id = "log_level:" .. bad })
+    cfg.log_level = "warn"
+  end
+
   -- soong_tag_priority 非空 (java 启用时)
   if cfg.java and cfg.java.enabled then
     if not cfg.java.soong_tag_priority or #cfg.java.soong_tag_priority == 0 then
@@ -325,18 +286,45 @@ function M.validate(cfg)
     return false, "java.exclude_merge must be 'append' or 'replace'"
   end
 
-  -- [v8] 模式归一。
-  -- 校验**绝不返回 false 中断 setup** —— init.lua 的 setup 遇 false 会直接放弃
-  -- 整个插件 (连 jar 收集都不做), 一个写错的枚举值不该有这个后果。
-  -- 策略: 认识的别名静默归一 (提示一次), 不认识的值回落到默认值并提示。
+  -- [v10] java.mode 归一 (同上策略: 只降级提示, 绝不 return false)。
+  -- 不认识的 mode 回落 "aosp", 并通过 log.warn 只提示一次 —— 不是每次启动弹窗。
   if cfg.java then
-    normalize_modes(cfg.java)
+    local m = cfg.java.mode
+    if m == nil then
+      cfg.java.mode = "aosp"
+    elseif not JAVA_MODES[m] then
+      log.warn(("java.mode = %q is not a valid value, falling back to 'aosp' "
+        .. "(one of: 'aosp' | 'infer' | 'project')")
+        :format(tostring(m)), { once = true, id = "java_mode:" .. tostring(m) })
+      cfg.java.mode = "aosp"
+    end
+
+    -- [v8] source_paths_max_projects 须为非负数字 (旧 normalize_modes 的行为, 保留)
+    local mx = cfg.java.source_paths_max_projects
+    if mx ~= nil and (type(mx) ~= "number" or mx < 0) then
+      log.warn(("java.source_paths_max_projects = %s is not a non-negative number, "
+        .. "falling back to 8"):format(tostring(mx)),
+        { once = true, id = "max_projects:" .. tostring(mx) })
+      cfg.java.source_paths_max_projects = 8
+    end
+
   end
 
   -- [v7] import_exclusions_ttl 必须是数字 (秒)
   if cfg.java and cfg.java.import_exclusions_ttl ~= nil
       and type(cfg.java.import_exclusions_ttl) ~= "number" then
     return false, "java.import_exclusions_ttl must be a number (seconds)"
+  end
+
+  -- [v10] import_exclusions_scan 在 enabled=false 时完全失效: 默认值 enabled=true /
+  -- scan=true, 用户只要设 enabled=false 就会静默落入这个组合 (scan 保持默认),
+  -- 于是"扫描"什么也不做。只提示一次, 不做硬报错。
+  if cfg.java and cfg.java.import_exclusions_enabled == false
+      and cfg.java.import_exclusions_scan ~= false then
+    log.warn("java.import_exclusions_scan has no effect: the scan is skipped when "
+      .. "import_exclusions_enabled=false; set enabled back to true to turn it on, "
+      .. "or set scan to false to silence this message",
+      { once = true, id = "scan_inert" })
   end
 
   -- kotlin 段校验 (kotlin 启用时)
@@ -422,13 +410,15 @@ end
 --- @param user_opts table|nil 用户传入的配置
 --- @return table 合并后的配置
 function M.merge(user_opts)
-  user_opts = user_opts or {}
-  local merged = vim.tbl_deep_extend("force", M.defaults, user_opts)
+  -- [v10] 在副本上丢弃旧键, 不改写调用方的表
+  local opts = vim.deepcopy(user_opts) or {}
+  drop_legacy_keys(opts)
+  local merged = vim.tbl_deep_extend("force", M.defaults, opts)
 
   local j = M.defaults.java
   if merged.java and merged.java.exclude_merge == "append" then
     for _, key in ipairs(EXCLUSION_LIST_KEYS) do
-      local user_list = user_opts.java and user_opts.java[key]
+      local user_list = opts.java and opts.java[key]
       local out = append_list(j[key], user_list)
       if out then
         merged.java[key] = out

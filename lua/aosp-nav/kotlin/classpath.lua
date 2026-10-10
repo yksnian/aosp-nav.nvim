@@ -10,8 +10,7 @@ local M = {}
 
 local BS = string.char(92) -- backslash, 避免源码字符串中出现反斜杠 (fs.lua 教训)
 
--- 用户自有 classpath 脚本被备份的提示只发一次 (每次 configure 都发很吵)
-local _user_script_warned = false
+local log = require("aosp-nav.util.log")
 
 --- 获取当前配置 (setup 后有效, 经 M.kotlin 访问时 metatable 已 ensure setup)
 local function get_cfg()
@@ -454,17 +453,13 @@ function M.ensure_script(extra)
       if vim.fn.rename(path, bak) ~= 0 then
         return nil, "cannot move the VSCode classpath script to " .. bak
       end
-      vim.notify(("[aosp-nav] 接管 classpath 脚本 (原 aosp-nav-vscode 版已转存 %s); "
-        .. "未登记的 workspace, 本脚本会 exec 它, 两个插件可共存"):format(bak),
-        vim.log.levels.INFO)
+      log.info(("taking over the classpath script (the original aosp-nav-vscode version "
+        .. "was saved to %s); for an unregistered workspace this script execs it, so both "
+        .. "plugins can coexist"):format(bak))
     else
       -- 用户自己的脚本: 备份 + 警告一次 (与旧行为一致)
       vim.fn.rename(path, path .. ".bak")
-      if not _user_script_warned then
-        _user_script_warned = true
-        vim.notify("[aosp-nav] backed up existing classpath to classpath.bak",
-          vim.log.levels.WARN)
-      end
+      log.warn("backed up existing classpath to classpath.bak", { once = true })
     end
     exists = false
   end

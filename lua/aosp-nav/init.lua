@@ -24,9 +24,14 @@ function M.setup(opts)
     opts = config.merge_lists(M.config, opts)
   end
   M.config = config.merge(opts)
+  -- [v10] 合并成功后把日志阈值推给 util/log.lua —— 这是两者唯一的连接点
+  -- (util/log 故意不 require config, 否则 config 校验失败时要用 log 报错会成环)。
+  -- 放在 validate 之前, 让校验自身的提示也走用户设定的阈值。
+  require("aosp-nav.util.log").set_level(M.config.log_level)
   local ok, err = config.validate(M.config)
   if not ok then
-    vim.notify("[aosp-nav] config invalid: " .. (err or "unknown"), vim.log.levels.ERROR)
+    -- log.error 在默认阈值 (warn) 下可见; log.lua 会自己补 "[aosp-nav] " 前缀
+    require("aosp-nav.util.log").error("config invalid: " .. (err or "unknown"))
     return M
   end
   -- 创建缓存目录
@@ -36,12 +41,12 @@ function M.setup(opts)
 end
 
 -- 子模块 lazy 导出 (metatable: 首次访问才 require, 避免非 java 文件也加载 java 模块)
--- 访问 M.java / M.clang / M.kotlin 时自动 ensure setup, 然后 require 并缓存到表上
+-- 访问 M.java / M.kotlin 时自动 ensure setup, 然后 require 并缓存到表上
 -- M.status / M.statusline 转发到 ui.lua (它们本来就是 ui 的方法, 挂在顶层只是
 -- 为了 lualine 之类的调用点写起来短; 之前缺失导致文档里的用法拿到 nil)
 setmetatable(M, {
   __index = function(t, key)
-    if key == "java" or key == "clang" or key == "kotlin" then
+    if key == "java" or key == "kotlin" then
       -- 未 setup 时用默认配置自动初始化
       if not M._state.setup_done then
         M.setup()

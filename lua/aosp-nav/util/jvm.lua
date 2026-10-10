@@ -69,8 +69,8 @@ function M.assess(args)
   elseif not ok then
     -- 实测口径: 堆不够时 jdtls 的表现是"CPU 打满但索引不动", 而不是报错 ——
     -- 所以这里必须按数值判, 不能按"-Xmx 串存在"判
-    advice = ("-Xmx%s 偏小 (AOSP 全量实测存活集 4G, 建议 >= 8G): 改成 --jvm-arg=-Xmx8G")
-      :format(raw)
+    advice = ("-Xmx%s too small (full AOSP tree measured a 4G live set; use >= 8G): "
+      .. "change to --jvm-arg=-Xmx8G"):format(raw)
   end
 
   return {

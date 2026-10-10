@@ -1,4 +1,4 @@
--- java/source_inject.lua: java.project.sourcePaths 注入编排 (core 模式)
+-- java/source_inject.lua: java.project.sourcePaths 注入编排 (java.mode == "aosp")
 --
 -- 模型: **预置核心集 (导入期就位) + 打开过的项目累积到磁盘缓存, 下次启动生效**。
 --   * 导入期: java/init.lua 调 M.inject_sync —— 核心集 + 累积过的项目 (读磁盘
@@ -71,8 +71,6 @@ local _installed = nil
 local _accumulated = nil
 -- 去抖标志
 local _debounce = false
--- 已提示过"需要重建工作区才生效" (每会话只提示一次)
-local _notified_stale = false
 -- 当前的 AOSP 根 (inject_sync 时确定)
 local _aosp_root = nil
 -- augroup 已安装标记
@@ -275,7 +273,8 @@ end
 --- @param fname string|nil 启动文件
 --- @return table|nil union 非空时才返回 (空列表绝不能注入)
 function M.inject_sync(cfg, aosp_root, fname)
-  if cfg.source_paths_mode ~= "core" then return nil end
+  -- 注入开启 <=> mode == "aosp" (infer/project 模式不下发 sourcePaths)
+  if cfg.mode ~= "aosp" then return nil end
   _aosp_root = aosp_root or _aosp_root
   if not _aosp_root or _aosp_root == "" then return nil end
 
@@ -307,7 +306,7 @@ end
 --- @param fname string
 function M.on_file(fname)
   local cfg = get_cfg().java
-  if cfg.source_paths_mode ~= "core" then return end
+  if cfg.mode ~= "aosp" then return end
   if not fname or fname == "" then return end
 
   -- 热路径: 按目录记忆 AOSP 根与项目根 (两者都是纯路径推断, 与文件内容无关)
@@ -356,14 +355,14 @@ end
 --- @param cfg table java 段配置
 function M.setup(cfg)
   if _setup_done then return end
-  if not cfg or cfg.source_paths_mode ~= "core" then return end
+  if not cfg or cfg.mode ~= "aosp" then return end
   _setup_done = true
 
   local group = vim.api.nvim_create_augroup("aosp_nav_source_inject", { clear = true })
   vim.api.nvim_create_autocmd({ "BufEnter", "BufReadPost" }, {
     group = group,
     pattern = "*.java",
-    desc = "aosp-nav: accumulate project source roots (core mode)",
+    desc = "aosp-nav: accumulate project source roots (mode=aosp)",
     callback = function(args)
       local buf = args.buf
       if buf and vim.api.nvim_buf_is_valid(buf) then
@@ -400,7 +399,7 @@ end
 --- @return number added 本次新增的条目数 (0 = 无变化)
 function M.apply()
   local cfg = get_cfg().java
-  if cfg.source_paths_mode ~= "core" then return 0 end
+  if cfg.mode ~= "aosp" then return 0 end
   if not _aosp_root then return 0 end
 
   local list = M.union(cfg, _aosp_root)
@@ -411,21 +410,11 @@ function M.apply()
   local before = _accumulated and #_accumulated or 0
   _accumulated = list
   local added = #list - before
-  if added > 0 and not _notified_stale then
-    _notified_stale = true
-    vim.schedule(function()
-      -- 说清代价再让用户决定: 这一步是**整库重建**(已注入的源码根全部重索引),
-      -- 实测在 frameworks/base 上以小时计。而只 :LspRestart 不生效 —— invisible
-      -- project 已存在时 InvisibleProjectImporter.loadInvisibleProject 的第一道
-      -- 闸门直接 return, initialize 里新带的 sourcePaths 会被静默忽略
-      -- (实测: 4 次启动里工程只在第 1 次被创建)。
-      vim.notify(
-        ("aosp-nav: 已累积 %d 个源码根 (累积项目: %d 个), 尚未生效。\n"
-          .. "生效需要 :AospCleanWorkspace 重建 jdtls 工作区 —— 代价是整库重新索引 "
-          .. "(当前注入规模下以小时计), 且只 :LspRestart 一定不生效。\n"
-          .. "只想读当前这几个根就别重建; 下次启动新工作区时会自动带上。"):format(added, #_order),
-        vim.log.levels.INFO, { timeout = 12000 })
-    end)
+  if added > 0 then
+    -- [v9] 新累积的根不再需要 :AospCleanWorkspace —— 走运行期增量注入
+    -- (java.project.addToSourcePath, 见 java/source_apply.lua)。做不了
+    -- (jdtls 没起 / 差集算不出来 / 量太大) 时由 source_apply.report 提示一次。
+    require("aosp-nav.java.source_apply").auto_apply()
   end
   return added
 end
@@ -444,7 +433,6 @@ function M.reset()
   _order = {}
   _installed = nil
   _accumulated = nil
-  _notified_stale = false
   _probe = {}
   _aosp_root = nil
   -- 清空磁盘上的累积顺序: :AospRescan 的语义是"忘掉之前攒的项目"
@@ -473,6 +461,24 @@ function M.state()
     pending = M.pending_count(),
     projects = projects,
   }
+end
+
+--- 判断一个 `.java` 的工作区相对路径是否落在**已知源码根**里 (即 union: 核心集
+--- + 已累积项目)。供 java/init.lua 的 jdt:// 一次性提示使用 (R6): 只有当符号
+--- 确实存在于某个已知源码根时才出声, 否则保持安静 (纯 jar-only 符号是噪声)。
+--- 纯磁盘存在性检查, 不发 LSP 请求。
+--- @param rel string 形如 "frameworks/base/core/java/android/os/Handler.java"
+--- @return string|nil abs 命中时的绝对路径
+function M.source_file_for_rel(rel)
+  local root = _aosp_root
+  if not root or root == "" then return nil end
+  if type(rel) ~= "string" or rel == "" then return nil end
+  local cfg = get_cfg().java
+  for _, r in ipairs(M.union(cfg, root)) do
+    local abs = root .. "/" .. r .. "/" .. rel
+    if vim.fn.filereadable(abs) == 1 then return abs end
+  end
+  return nil
 end
 
 return M

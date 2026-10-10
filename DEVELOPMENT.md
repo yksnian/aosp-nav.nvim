@@ -27,8 +27,7 @@ setup(opts)
        │    ├─ java/source_roots.lua   项目源码根扫描 (算法见 §5, 缓存见 §6)
        │    └─ java/source_inject.lua  注入编排: 核心集 + 增量累积 (见 §7)
        ├─ kotlin/init.lua              KLS 接线 (classpath 脚本 + 分发表)
-       ├─ clang/init.lua               clangd (按 compile_commands.json)
-       └─ ui.lua                       :AospStatus / :AospDiagnostics / :AospSourceRoots
+       └─ ui.lua                       :Aosp (信息面板: 状态 / 诊断 / 源码根)
 ```
 
 两条时间线, 贯穿全部设计:
@@ -40,6 +39,57 @@ setup(opts)
 
 "导入期必须同步"是全篇最容易踩的约束: `inject_sync` 因此**只读磁盘缓存, 绝不扫描**。
 真正的扫描一律走 `scan_async`。
+
+**`phase` 是活状态, 有**两个**真信号写入者 (2026-10-10 修)。** 旧 bug 是它只有
+一个写入者 (`java/init.lua` 的 `configure`), 而那个写入者只会写 `indexing` ——
+于是 `indexing` 一旦挂上就再也摘不下来, 连"索引已落盘"的暖启动也照报, 状态栏的
+`(idx)` 永久不消。修法**不是**删掉 `indexing` (它就是新工作区冷启动时的真实状态),
+而是接上第二个写入者:
+
+| 写入者 | 时机 | 写什么 |
+| ---- | ---- | ---- |
+| `configure()` | 每次 configure | `indexing` (AOSP 树且有 jar) / `no-out` / `failed` / `idle` |
+| `aosp_nav_jdtls_phase` 钩子 | `LspAttach` 后收到 jdt.ls 的 `language/status` 且 `type == ServiceReady` | `indexing` → `ready` (仅当当前是 `indexing`) |
+
+信号选型 (有实测支撑, 不是猜的): jdt.ls 用 **`language/status`** 通知回报导入/构建
+进度, payload 是 `StatusReport { type, message }`, 其 `type` 取 `ServiceStatus`
+枚举 (`Starting`/`Started`/`Message`/`Error`/`ServiceReady`/`ProjectStatus`);
+`ServiceReady` 在 import 完成后由 `JDTLanguageServer` 发出。两个实现要点:
+nvim-jdtls **已经**为这个 method 装了 handler (`jdtls/setup.lua`, 用来 echo
+message), 所以插件必须**链在它后面** (`prev` 先调, 再判 `ServiceReady`), 换掉会
+吞掉 jdtls 原本的 status 消息; 而钩子必须挂在 **`LspAttach`** 上 ——
+`LspNotify`/`LspProgress` 只有**出站**通知, 收不到服务端发来的 `language/status`。
+
+以下两条曾被当作"没有便宜可靠信号"的证据, 都是误判, 记下来免得重开:
+jar 缓存的 `origin` 说的是 **jar 清单**的来源, 与 Eclipse **索引**无关
+(`:AospCleanWorkspace` 之后它照样是 `cache`); `index_state()` 的聚合又被 99% 的
+jar 索引缓存淹没。两者确实都不能当"索引完成"信号 —— 但 jdt.ls 自己的
+`ServiceReady` 能, 只是它走的是 handler 路径而非 autocmd。
+"索引到底落盘了没有"仍交给 `:Aosp` 里已诚实化的 `jdtls index` 行 (§8.1);
+`phase` 回答的是另一个问题: jdt.ls 自认为导入+构建完了没有。
+
+### 1.1 jar 收集与 AOSP 兼容补丁 (从 README Features 移入)
+
+**为什么要"喂 jar"**: Android 上"跳转到定义"失效的根因通常不是缺源码, 而是**落点**
+(§2.2) —— jdt.ls 把**自己推断的源码根追加在 1000+ 个 jar 之后**, 于是任何 framework
+类的第一次命中都落在 jar 的只读反编译缓冲。插件的两条对策各管一头:
+
+- **收集**: `java/jars.lua` 从构建产物 (`out/soong/.intermediates` → make
+  intermediates → fallback 目录) 扫出依赖 jar, 灌进 `referencedLibraries`, 让补全 /
+  跳转至少有东西可解析。
+- **抢落点**: `java/source_inject.lua` 把源码根显式注入 `java.project.sourcePaths`,
+  使它们排在 jar **之前** (§2.2、§7)。
+
+Kotlin 侧同理由 KLS 承担: 默认 soong tag 优先级 combined 在前, 导航落在 KLS 自带
+fernflower **反编译出的方法体**里, 而不是空壳签名 (§11)。
+
+**AOSP 兼容补丁** (均默认开, 取证见 §2.11):
+
+| 补丁 | 目的 |
+| --- | --- |
+| 关 foldingRange | 规避 jdtls FoldingRangeHandler 的 `-32603 NegativeArraySizeException` |
+| 关 Gradle/Maven import | 离线机器上不再尝试下载 gradle wrapper 校验和 |
+| inlay-hints 自动切换 | 有 AOSP jar 时强制关 (规避损坏 jar 签名引发的 NPE); 纯 Java 工程放开到 `all` |
 
 ---
 
@@ -126,6 +176,27 @@ if (hasTargetFile(dir)) directories.add(dir);        // 命中 .project/.classpa
 `/home/yangwj12/project/aosp` → `aosp_3f7ad7da` (与本机真实工作区一致)。
 有了它, 一次 `glob` 就能把"本该存在的 invisible project"与"外部可见工程"分开 ——
 前缀匹配会误伤名字恰好以 `aosp_` 开头的正常工程。见 `ui.workspace_blockers`。
+
+**`java.import.exclusions` 的具体常量 (从 README 移入)** —— 上面说的"必须提前排除"
+落到 `java/import_exclusions.lua` 就是这两块:
+
+- **静态排除项** `M.DEFAULT_PATTERNS`: 本插件加的 `**/out/**` + `**/.repo/**`, 外加
+  jdt.ls **自带的四条默认** (`**/node_modules/**`、`**/.metadata/**`、
+  `**/archetype-resources/**`、`**/META-INF/maven/**`)。四条必须**补回**: 一旦显式
+  设置 `java.import.exclusions`, jdt.ls 就**整体替换**掉自己的默认
+  (`Preferences.JAVA_IMPORT_EXCLUSIONS_DEFAULT`), 不补等于静默回退原生行为。
+- **残留元数据扫描**: 后台扫 AOSP 根, 跳过 `SKIP_DIRS = { out, .repo, .git,
+  node_modules, .metadata }`, 深度 `MAX_DEPTH = 6` (以 fd/find 的 entry 计 = VSCode
+  eclipseGuardScan.ts 的 5 层目录 + `.classpath` 那一层)。**判定门槛是"目录同时含
+  `.project` 与 `.classpath`"** —— 只有 `.classpath` 一条不够 (`import_exclusions.lua`
+  的 `to_patterns` 逐个目录查 `.project` 是否存在)。命中目录以**绝对路径 glob** 进
+  排除项 (对齐 §2.1 上文的 `isExcluded`/`PathMatcher` 语义)。
+
+这就是 `.project` 与导入的完整关系 (README 的"About `.project` files" 一节已删, 内容
+并入此处): 目录**同时**有 `.project` + `.classpath` 才被 jdt.ls 当 Eclipse 工程导入,
+而 AOSP 根下**任何**一个可见工程都会永久挡死 invisible project 的创建 (第一条闸门);
+只有 `.project` 而无 `.classpath` 不触发导入。cold cache 下 `ensure_cached` 同步扫一次
+的理由也在此 (§4)。
 
 ### 2.2 类路径顺序决定跳转到哪 (核心结论)
 
@@ -251,8 +322,10 @@ if (!ProjectUtils.getVisibleProjects(rootPath).isEmpty()) return false;   // Inv
 | 重启 (工程已存在) | 核心集 + 累积项目 | `src=2 lib=1276` ❌ 没变 |
 | 删掉 `-data` 重建 | 核心集 + 累积项目 | `src=280 lib=1276 first_src@4 first_lib@284` ✅ |
 
-所以累积生效的路径是 `:AospCleanWorkspace`(删 `-data`) → 再打开 .java 文件。
-UI 上的 `pending` 计数和提示语都按这个写 (§7.4)。
+[v9] 现在有两条生效路径: **运行期增量** `java.project.addToSourcePath` (§2.9, 默认自动,
+秒级、不需要重建, 代价是新条目排在 jar 之后) 与 **`:AospCleanWorkspace` 重建**(删 `-data`
+→ 再打开 .java 文件, 新源码根会排到 lib 之前, 代价是整库重索引)。UI 上的 `pending` 计数
+与提示语按前者写 (§7.4)。
 
 ### 2.6 `sourcePaths` 的注入顺序会被丢弃
 
@@ -345,45 +418,226 @@ AOSP 树内) 时, 退到**任一已加载且落在 AOSP 树内的 `.java` 缓冲
 立即 warn 并指出 `:AospCleanWorkspace`。症状与原因的对应关系否则完全看不出来,
 而它是**不可逆**的 (见 §2.1)。
 
+### 2.9 运行期**增量**加法: `java.project.addToSourcePath` (v9)
+
+§2.5 的结论是"运行期下发 sourcePaths 会把全部 source 排到 lib 之后"。那是**改偏好**
+这条路。jdt.ls 另有一条只追加、不重排的通道: 它自己的运行期命令
+`java.project.addToSourcePath` (VSCode "Add Folder to Source Path" 的实现),
+也就是 `:Aosp!` (以及每会话一次的自动注入) 用的东西。取证全部来自反编译
+`org.eclipse.jdt.ls.core_1.61.0.202609031315.jar` (与本机运行的是同一份):
+
+| 环节 | 事实 |
+| --- | --- |
+| 注册 | `plugin.xml` 的 `org.eclipse.jdt.ls.core.delegateCommandHandler` 扩展点下共 33 个命令, 含 `java.project.addToSourcePath` / `removeFromSourcePath` / `listSourcePaths`; 由 `JDTDelegateCommandHandler.executeCommand` 分发, 走普通 `workspace/executeCommand` |
+| 参数 | `arguments[0]` = **文件夹的 file:// URI** (`ResourceUtils.filePathFromURI`) |
+| 归属判定 | `findBelongedProject` 只在 `project.getLocation().isPrefixOf(path)` 时命中 —— **invisible project 永远不命中** (它的 location 是 `-data/workspace/aosp_*`, 不是 AOSP 树), 于是走 `findBelongedWorkspaceRoot(Preferences.getRootPaths())` 拿到 AOSP 根; `isGeneralJavaProject` 对 maven/gradle 返回 false, 那种工程收到 "Unsupported operation…" |
+| 条目形态 | `getProjectRealFolder(unmanaged)` = `project.getFolder("_").getLocation()`, 所以算出的 workspace 路径是 `_/<相对路径>` —— 与 §2.7 里导入期那 247 条**同形** |
+| 组装 | `ProjectUtils.addSourcePath`: `raw = getRawClasspath()` → `newEntries = raw + [newSourceEntry]` → `setRawClasspath`。**1375 条原顺序一字不动**, 只追加。**不经过** `resolveClassPathEntries` (§2.5 的杀手), 这是它能用的全部理由 |
+| 落盘 | `setRawClasspath` 同步写回 `<data>/<project>/.classpath` ⇒ 重启后 JDT 直接读回, 不需要 `:AospCleanWorkspace` |
+| 返回 | `BuildPathCommand$Result{ status:boolean, message:string, sourcePaths:string[] }`; 已存在时 status=true + "No need to add it to source path again…", 祖先已是源码根时 status=false + "Cannot add the folder … because its parent folder is already in the source path…" (都被 `source_apply.classify` 当正常分支) |
+
+两条边界 (写进 README 的也是这两条):
+
+1. **追加到末尾 ⇒ 新 src 排在 1126 个 lib 之后**。JDT 取类路径上第一个包含该类型的
+   条目, 所以新根独有的类照常跳真实 `.java`, 与某个 jar 重名的类仍落 jar (= 与"没加"
+   等价, 不是退步); 已有 247 条的相对顺序不变 ⇒ **现有跳转零回归**。
+2. **顺序不会自己变好 —— 别承诺"下一轮自愈"**。`ProjectUtils.updateBinaries` 确实是把
+   raw classpath 筛成两张表再写回 (`lambda$8` = `kind != CPE_LIBRARY` 容器 + source,
+   `lambda$10` = `kind == CPE_LIBRARY` 且带已存在 source attachment; 写回的只有前者,
+   `setRawClasspath` at `updateBinaries` 的 297)。**但只有它真跑才会重排**, 而它跑不跑
+   取决于有没有类路径差异。沙箱实测 (同版本 jdt.ls, 一个 jar 的工程):
+
+   | 步骤 | .classpath 顺序 |
+   | --- | --- |
+   | 导入 (`sourcePaths` + 1 个 `referencedLibraries`) | `con, src, lib, output` |
+   | 运行期追加一个新根 | `con, src, lib, src_新, output` |
+   | 重启 jdtls (同一 `-data`, 工程已存在) | **原样**: `con, src, lib, src_新, output` |
+   | 追加后调 `java.project.updateClassPaths` (参数形态见下) | `con, src_新, src, lib, output` —— **能提回 jar 之前** |
+
+   所以增量注入的收益是**有条件的**: 新根独有的类照常跳真实 `.java`; 与某个 jar 重名的类
+   在顺序被重排之前仍落 jar (与"没加"等价, 不是退步)。真机每次启动都重写 classpath
+   (日志 `>> Updating classpath` / `Adding …` 1126 条), 所以真机上下一轮会不会提回 jar
+   之前, 以真机 `.classpath` 实测为准 —— 不要在文档里预先断言。
+
+**`updateClassPaths` 能把追加的 src 提回 jar 之前 —— 但本插件**不用**它**。沙箱实测的
+参数形态: `arguments[0]` = 工程 file:// uri, `arguments[1]` = `ProjectClasspathEntries`
+(`{classpathEntries = {{kind=3, path="_/<相对路径>"}, …}}`, kind 同 JDT:
+1=lib / 3=src / 5=con)。两个坑:
+
+- nvim 的 LSP4J 把对象反序列化成 `Map`, 而 `JSONUtility.toModel` 只认
+  `JsonElement` / 同类型实例 / `String` 三种 —— 传 Lua 表会**静默**得到 null, 报
+  `…getClasspathEntries() because "entries" is null`。必须用
+  `vim.json.encode({classpathEntries = …})` 编成 JSON **字符串**传。
+- JRE 条目的 path 是 `JRE_CONTAINER` + **JDK 安装目录** (不是 VM 名):
+  `…JRE_CONTAINER/usr/lib/jvm/jdk-21.0.8`。`getNewJdkEntry` 拿后半段去比对各
+  `IVMInstall.getInstallLocation()`, 用 `…/StandardVMType/jdk-21.0.8` 只会得到
+  "The select JDK path is not valid."
+
+不用的理由: `ProjectCommand.updateClasspaths` 最终下发的是
+`容器参数 + resolveSourceClasspathEntries(src 参数) + resolveDependencyEntries(工程, 非 src 参数)`。
+而 `resolveDependencyEntries` 只在"传入的非 src 条目数与工程当前类路径的非 src 条目数**完全相等**
+且逐条 path 都对得上"时才返回**工程自己的**条目, 否则**原样返回传入的那份** —— 传漏一条就静默
+丢掉那条 lib (1375 条的类路径, 含 access rules/attributes, 从客户端无法完整重建:
+`java.project.getClasspaths` 只给解析后的输出路径, 不给条目)。另外 src 顺序由服务端排序
+(`resolveSourceClasspathEntries` 里 `Collections.sort`), 实测不保留调用方给的顺序。代价大、
+收益只覆盖"与同名 jar 重名的类", 所以只在这里记录能力。本会话 (2026-10-09) 又补了
+一条实测依据 (§8.2): 一次源码根注入 = 一次 ~1379 条的全量 classpath 重建, 所以自动
+注入被压成"每会话一次、单批 ≤ 5、空闲为闸", 而不是靠 `updateClassPaths` 现场重排。
+
+**基线不是自己记的 `_installed`, 而是磁盘 `.classpath`**: `source_apply.installed` 直接解析
+`<data>/<project>/.classpath` 的 `kind="src"` 条目并剥掉 `_/` 前缀。本机实测:
+该文件 247 条 src, 累积项目 `packages/modules/Wifi` 的 4 个根算出 pending=4
+(与提示里的"已累积 4 个源码根"逐条一致), 且 pending 与磁盘 src 集合交集为 0。
+单次自动注入超过 `MAX_AUTO_ROOTS` (默认 5) 时不自动做 (`:Aosp!` 强制) ——
+那种数量说明基线读错了, 一次性灌注会让 jdt.ls 长时间 build 整棵树 (§8.2 的实测依据)。
+
+**端到端实测 (沙箱, 同一份 jdt.ls, `-data` 与 `cache_dir` 都在 /tmp, 不碰真机工作区)**:
+
+| 用例 | 结果 |
+| --- | --- |
+| `addToSourcePath(新目录)` | `status=true`, message `Successfully added …`, 条目以 `_/<相对路径>` 追加到末尾; 已有条目顺序不变; 磁盘 `.classpath` 立即更新 |
+| 重复添加同一目录 | `status=true` + `No need to add it to source path again…` ⇒ `classify` 归 `present` (幂等) |
+| 添加"已被祖先根覆盖"的子目录 | `status=false` + `Cannot add the folder … because its parent folder is already in the source path of the project…` ⇒ 也归 `present` (语义上已经在了, 记 failed 会白报警) |
+| 添加**不存在**的目录 | `status=true` + `Successfully added …` —— **服务端不校验目录存在性**。所以客户端那个 `vim.fn.isdirectory` 预检是必需的, 不是保险 |
+| 完整自动链路 (configure 注入核心集 → 打开 Wifi 文件 → 累积 → 自动注入) | 两个根都进 `.classpath`, 导入期的两个条目位置不变 |
+| 累积钩子与 attach 钩子同时到 | 没有重入锁时会**同批跑两遍** (两边的 pending 都从同一份旧 `.classpath` 算出), 实测提示重复两次 ⇒ `_running` 串行化 |
+| 命令赶在导入中间发出 | 偶发 `Cannot invoke "PreferenceManager.getPreferences()" because "manager" is null` ⇒ 计为 failed, 静默重试一次 (45s) 后再提示 |
+
+自动路径 (`source_apply_auto`, 默认开) 的两个触发点: 累积那一刻 (`source_inject.apply` 里),
+以及 jdtls attach 后 3s (补上次会话攒下的存量)。状态机: `started`/`none`/`off`/`busy` 静默,
+`no-client` 先按 8s 重试, 其余按 45s 重试, 每会话最多 3 次静默重试, 之后才 `report()` 一次;
+`toomany` 不重试、直接说。
+
+### 2.10 通知策略 (`util/log.lua`)
+
+`util/log.lua` 是插件**唯一**的"对用户说话"出口。它存在之前的乱象就是理由: 历史上
+有 53 处 `vim.notify` 各自决定等级, 启动路径单次就能弹 5 个 WARN, 而**真正需要用户
+动手**的那条 (自动注入失败) 反倒是 INFO —— 音量与重要性脱钩, 用户于是学会一律忽略。
+
+**四档**按重要性排序 `debug < info < warn < error`, 默认可见阈值 `warn`
+(`config.log_level`, 也可由 `vim.g.aosp_nav_log` 回退)。阈值以下的调用**连消息都不
+构造** —— `M.enabled(level)` 专门供调用方提前短路昂贵的入参构造。`off` 关掉全部。
+
+| 档 | 含义 |
+| - | ---- |
+| `debug` | 例行进度与启动杂音: jar 缓存命中/未命中、jar/源码根扫描统计、工作区发现、根探测、排除项发现、模式归一、缓存/TTL 记账 |
+| `info` | 少见、值得知道、不阻塞: 此刻无需做任何事 (如"排除项缓存已更新, 下次启动生效") |
+| `warn` | 确实出了问题, 但不必这一秒动手 |
+| `error` | 操作硬失败 |
+
+**must-see 档 (绕过阈值)**: 四档之上另有一个 `log.user()` —— 必定可见, **不参与等级
+比较**, 故意如此: 这类消息不该因为有人把阈值调到 `error` 就消失。它只留给"必须让用户
+做决定"的场景, 代码注释把它固定成**恰好五个席位**, 别处不得滥用
+(`import_exclusions.lua:159`、`source_roots.lua:512` 都显式标注了这条纪律):
+
+| # | 场景 | 触发点 |
+| - | ---- | ------ |
+| 1 | 工作区里存在外部可见工程, 需要 `:AospCleanWorkspace` (不可逆, §2.1/§2.8) | `java/init.lua:422` |
+| 2 | 有别的 jdtls 进程共用同一个 `-data` 目录 (索引互相覆盖, §8.1) | `java/init.lua:436` |
+| 3 | 破坏性的 `:AospCleanWorkspace` 确认 | `ui.lua:716` |
+| 4 | 自动注入源码根在耗尽重试预算后失败 (§2.9) | `java/source_apply.lua:454` |
+| 5 | 首次运行需同步扫描残留 Eclipse 目录 (排除项冷缓存, 数秒) | `java/import_exclusions.lua:160` |
+
+全仓 `log.user` 一共 **6 个调用点**: 上表 5 个是插件**主动**开口 (席位统计只数这五个);
+第 6 个是 `java/source_apply.lua:361` —— 手动 `:Aosp!` 失败后的回报。用户刚敲了命令,
+结果当然要照实告知, 它不算"主动打扰", 也不占席位。改这块时别只 grep `log.user` 就以为
+多出了一处违规。
+
+**指导原则**: **插件能自动做掉的事就自动做掉, 只就该由用户拍板的事开口。** 一次成功
+的自动操作不是通知 —— 它的结果属于 `:Aosp` 面板。所以 `java/init.lua:106` 那条
+"跳到 jar" 的提示走 `log.info` 而非 `log.user`: 用户此刻不需要做任何决定。
+
+`log.warn(msg, { once = true, id = ... })` 按 id 去重 (§4 的归一告警用它, 避免每次
+setup 刷屏); 被阈值挡下的调用**不登记 id**, 否则调高阈值后再触发就永远看不到了。
+
+### 2.11 jar 分桶去重与 AOSP 兼容补丁 (从 README Features 移入)
+
+**为什么 jar 要"模块级去重"**: soong intermediates 里同一模块可能产出多个 jar ——
+own-source (javac/kotlinc 编出的本模块类)、turbine (只有 API 签名的 stub)、combined
+(类 + 依赖的 fat jar)、以及 repackage 产物。全灌进去会让同一类型在类路径上重复出现。
+规则 (`java/jars.lua` 的 `process_soong_matches`):
+
+- **own-source 桶的 javac/kotlinc jar 永远保留**;
+- **fat/combined jar 只作 fallback** (没有 own-source 时才顶上), 桶内按
+  `java.soong_tag_priority` 排序;
+- **stubs / repackaged 产物排除** (对应 `java.exclude_jars` 的 stubs / `-stub` /
+  `-headers` 家族)。
+
+make 构建 (Android 14 及更早) 的那条路按 `java.make_jar_priority` 在
+`*_intermediates` 里取第一个命中, 模块名进 `java.make_blacklist` 的整体跳过。
+
+**三个兼容补丁的取证**:
+
+- **foldingRange**: jdtls 的 `FoldingRangeHandler` 在某些 token 上抛
+  `NegativeArraySizeException`, LSP 层表现为 `-32603: Internal error`。默认
+  `java.disable_folding_range = true`, 折叠交给 treesitter。
+- **Gradle/Maven import**: AOSP 树里有 `build.gradle` (如
+  `frameworks/base/tests/UiBench/`), 一旦走 Gradle import 就会尝试联网下载 gradle
+  wrapper 校验和, 离线工作站上表现为卡住。`java.disable_gradle_import = true` 把
+  `java.import.gradle.enabled=false` 塞进 `initializationOptions.settings` —— 必须早于
+  导入, attach 期再发已晚 (§2.1、§9.3 闸门 B)。
+- **inlay-hints**: AOSP jar 里损坏的签名会让 inlay-hints 路径抛 NPE, 所以
+  `java.inlay_hints_mode = "auto"` 在有 AOSP jar 时强制关, 纯 Java 工程放开到 `all`。
+
 ---
 
 ## 3. 导航模式
 
-用户可见三种组合, 由 `java.workspace_mode` + `java.source_paths_mode` 两个键表达:
+用户可见三种体验, 由单个键 `java.mode` 表达:
 
 | 体验 | 配置 | 代码路径 |
 | ---- | ---- | ---- |
-| **默认**: 核心集 + 累积 (累积部分下次重建工作区时生效, §2.5.1) | `source_paths_mode="core"`, `workspace_mode="aosp"` | `inject_sync` + `on_file` 全开 |
-| 旧 VSCode 行为 (不注入, 靠推断) | `source_paths_mode="infer"` | 所有注入路径的第一行就 return |
-| VSCode 之前的"按项目开工作区" | `workspace_mode="project"` | `root.workspace_root()` 返回 nil; 模式归一强制 `source_paths_mode="project"` |
+| **默认**: 核心集 + 累积 (累积部分由 `source_apply` 增量注入, §2.9; 也可用 `:AospCleanWorkspace` 重建换取"排在 jar 之前") | `mode="aosp"` | `inject_sync` + `on_file` 全开 |
+| 旧 VSCode 行为 (不注入, 靠推断) | `mode="infer"` | 所有注入路径的第一行就 return |
+| VSCode 之前的"按项目开工作区" | `mode="project"` | `root.workspace_root()` 返回 nil; 该模式下不注入 sourcePaths |
 
-`workspace_mode = "project"` 时 jdtls 的 `root_dir` 落在最近的 `.git`/`.project` 目录,
+`mode = "project"` 时 jdtls 的 `root_dir` 落在最近的 `.git`/`.project` 目录,
 每个模块各自一个 Eclipse workspace (磁盘上就是 `~/.cache/nvim/jdtls/{base,Settings,...}/`)。
 这正是本插件接管之前的行为。
 
-`workspace_mode` 与 `source_paths_mode` 的**职责分工**:
+**一个键, 两个问题 —— 不要合并成同一个谓词:**
 
-- `workspace_mode` 只管 **jdtls 的 root_dir**(索引边界)。
-- `source_paths_mode` 只管 **要不要注入 sourcePaths**。
-- 但 project 模式下注入没有意义 (每个 workspace 里本来就只有一个模块, 推断够用),
-  所以 `normalize_modes` 把它降级为 `"project"` 并短路所有注入。
+- **根是不是 AOSP 根** ⇔ `mode ~= "project"` (`aosp` 与 `infer` 都为真)。
+- **要不要注入 sourcePaths** ⇔ `mode == "aosp"`。
+
+二者在 `aosp` 下一致、在 `infer` 下分道 (根是 AOSP 根, 但不注入)。
+旧的两个键正是把"索引边界"与"是否注入"拆开表达, 结果 `source_paths_mode` 只剩
+一个由 `workspace_mode` 派生的取值 (`project`), 等于一个决定加一个派生值, 于是合并。
+project 模式下注入没有意义 (每个 workspace 里本来就只有一个模块, 推断够用),
+所以该模式下短路所有注入。
 
 ---
 
-## 4. 配置归一 (`config.normalize_modes`)
+## 4. 配置归一 (`config.validate`)
 
 旧版 `validate()` 对非法模式 `return false`, 后果是 `setup()` **直接放弃整个插件** ——
 用户改错一个字符串, 插件静默全灭。现在改为 **warn 一次 + 就近归一, 绝不中断**:
 
 ```
-"scan" | "shallow" | "attach" | "full"  ──warn──▶  "core"
-未知值                                   ──warn──▶  "core" / "aosp"
-workspace_mode == "project"              ────────▶  source_paths_mode = "project"
-source_paths_max_projects 非正整数        ──warn──▶  8
-java.source_patterns 被设置               ──warn──▶  无效果 (浅层扫描实现已删除)
+未知 java.mode 值                        ──warn──▶  "aosp"
+java.source_paths_max_projects 非正整数  ──warn──▶  8
 ```
 
-`warn_once(key, msg)` 用 `_mode_warned` 去重, 避免每次 setup 刷屏。
+旧的两个模式键 (`java.workspace_mode` / `java.source_paths_mode`), 连同
+`java.exclude_self_jars` / `java.source_patterns` / 顶层 `clang` 占位, 在加载时一律
+**静默丢弃** (`drop_legacy_keys`), 不迁移也不提示 —— 本插件用户极少, 维护一张
+"旧组合 -> java.mode" 的对照表再加一条迁移提示, 换来的只是让配置面同时存在两种写法。
+
+被丢掉的每个键的**替代物**(README 的 "Removed keys" 一节已删, 内容并入此处/§11):
+
+- `java.workspace_mode` / `java.source_paths_mode` → 单个 `java.mode`。合并的理由是
+  `source_paths_mode = "project"` 从来不是独立选择, 它由 `workspace_mode = "project"`
+  派生 —— 两个键编码的其实是"一个决定 + 一个派生值"。剩下这一个键仍回答**两个不同
+  问题**: "根是不是 AOSP 根" ⇔ `mode ~= "project"`; "要不要注入 sourcePaths" ⇔
+  `mode == "aosp"`。二者在 `aosp` 下一致、在 `infer` 下分道, **绝不要合并成同一个
+  谓词** (展开见 §3)。
+- `java.exclude_self_jars` → 工作区根变成 AOSP 根之后它成为**永久 no-op**; 要按名/
+  路径排除用 `java.exclude_jars` / `java.exclude_globs`。
+- `java.source_patterns` → 它配置的那条浅扫描已不存在 (见本节末"已砍掉 `full` 模式")。
+- 顶层 `clang = { enabled = false }` 占位 → 插件从不改 clangd 行为, 直接删。
+
+归一告警走 `log.warn(msg, { once = true, id = ... })` —— `util/log.lua` 按 id 去重,
+避免每次 setup 刷屏 (且阈值以下的调用不登记 id, 不会把提示永久吃掉)。
 
 **已砍掉 `full` 模式**: 当年的理由是"全树扫描 19425 文件要 50 分钟", 但实测
 `frameworks/base/core/java` 4638 个文件只要 183 s, 与旧数字严重矛盾 —— 说明那 50 分钟
@@ -476,7 +730,7 @@ frameworks/base 实测(逐根 `find -name '*.java' | wc -l`):
 (它们不是测试), README 里作为"用户自己加一条"的例子。
 
 诊断上这个数字现在可见: `stats.exclude_dropped` → 缓存 header 的 `excl=` →
-`:AospSourceRoots` 的缓存行 `[roots=… files=… excl=… test=… jre=… shadow=…]`。
+`:Aosp` 面板源码根一栏的缓存行 `[roots=… files=… excl=… test=… jre=… shadow=…]`。
 
 **剪枝 4 (影子根) 是控制"同名类跳向哪个实现"的唯一手段。** AOSP 全树实测有 528 个
 重复 FQN, 多来自 `*-fake` / `*-stub` / ravenwood 影子树。JDT 容忍重复 (只给被遮蔽的
@@ -488,7 +742,7 @@ frameworks/base 实测(逐根 `find -name '*.java' | wc -l`):
 
 `analyze()` 返回 `{roots, files, ancestor_dropped, nested_dropped, test_dropped,
 jre_dropped, shadow_dropped, exclude_dropped, dup_fqn, shadow_ratio}`, 用于
-`:AospDiagnostics` 与缓存 header。
+`:Aosp` 面板与缓存 header。
 
 **嵌套/影子根可疑时看 `dup_fqn`**: 它统计最终列表里仍有多个根提供的 FQN。正常项目
 应为个位数 (真树 frameworks/base: 2)。
@@ -533,6 +787,40 @@ frameworks/base/services/core/java
   没有 `out/` (构建产物统一在 AOSP 根下)。源码根本来就不随编译变化, 只有 `repo sync`
   换分支才会变, 那种情况走 `:AospRescan`。
 
+### 6.1 jar 缓存 (`<cache_dir>/<flattened android_root>.txt`)
+
+§6 正文讲的是**源码根**缓存 (`<flattened root>.source-roots.txt`)。jar 列表另有一份
+缓存, 键规则相同 (`/` → `-`, 去前导 `-`, 见 `java/jars.lua` 的 `cache_file_for`),
+无后缀 `.txt`:
+
+```
+# version=6
+# filters=4f4ac43d
+# android_root=/home/.../aosp
+# generated=2026-10-09 17:27
+# count=1126
+out/soong/.intermediates/frameworks/base/framework.jar
+...
+```
+
+- 第 1 行 `# version=<CACHE_VERSION>` (jar 侧现在是 **v6**), 第 2 行 `# filters=` 是
+  排除类配置 (`exclude_jars` / `exclude_paths` / `exclude_globs` 等) 的 djb2 指纹, 与
+  源码根缓存第 2 行的 `# exclude=` **同一个 `util/hash.lua` 算法** (§12)。两行都命中才
+  复用, 否则整树重扫 (§7.2 的同款机制)。
+- 第 3-5 行 `# android_root=` / `# generated=` / `# count=` 是给人看与自检的元信息,
+  解析只跳过 `#` 开头的行, 不依赖它们。
+- **升级免手动**: 改过滤算法只需 bump `CACHE_VERSION`, 老缓存自动失效重扫 —— 用户
+  **不需要**手动清。改 `exclude_globs` 等内容同理靠 `filters` 指纹自动失效, 更不用
+  bump。README 旧文里"rm ~/.cache/nvim/aosp_nav/*.txt"的做法已废弃
+  (`java/jars.lua:388` 仍留着一句历史注释)。
+
+**`:AospRescan` 对 jar 缓存做了什么** (`ui.lua:492-539`): `jm.reset_cache(root)` **只清
+内存**里的 jar 列表, 随后 `find_android_jars({ no_cache = true })` 忽略文件缓存整树重扫,
+扫描路径结束时**重写**缓存文件 (`jars.lua:466-470`)。文件缓存**故意留着** —— 重扫失败
+(如 `out/` 未构建) 时下次启动仍有旧列表可用。它**不**在后台自动跑: 重扫本身很快, 但
+jdt.ls 只在 `initialize` 时建 classpath, 不重启就什么都不会变, 静默重扫只是白烧 CPU
+(§7.6)。
+
 ---
 
 ## 7. 运行时编排 (`java/source_inject.lua`)
@@ -558,8 +846,8 @@ _probe[dir] = {aosp_root, project}     BufEnter 热路径的目录级记忆
 ### 7.2 导入期 (`inject_sync`)
 
 ```
-source_paths_mode == "core"?  ──否──▶ return nil
-_aosp_root 有?                ──否──▶ return nil
+java.mode == "aosp"?  ──否──▶ return nil
+_aosp_root 有?        ──否──▶ return nil
 seed_project(磁盘顺序文件里的每个项目, keep_order=true)  ← 只读缓存, 绝不扫描
 seed_project(启动文件所属项目, 当作"刚用过"排到队尾)
 persist()                     ← 把淘汰后的顺序写回
@@ -603,23 +891,29 @@ end)
 `_scanning[root]` 保证同一项目同时只有一个后台扫描; grep 退出码 0/1 都算成功
 (1 = 无匹配)。
 
-### 7.4 累积 (`schedule_apply` / `apply`) —— 刻意不碰 jdt.ls
+### 7.4 累积 (`schedule_apply` / `apply`) —— 刻意不发 `didChangeConfiguration`
 
 ```
 vim.defer_fn(700ms) 去抖        ← 连续打开同项目多个文件只合并一次
   └─ union() 与 _accumulated 逐项相同? ──是──▶ return 0
-  └─ _accumulated = union(); 首次新增时 vim.notify 提示一次
-       ("需 :AospCleanWorkspace 重建 jdtls 工作区后生效")
+  └─ _accumulated = union(); 新增时 source_apply.auto_apply() (默认自动, §2.9)
 ```
 
-这里**一行 LSP 调用都没有**, 这是整个模块最重要的一条约束 (§2.5):
-任何 `workspace/didChangeConfiguration` 都会把 source 排到 lib 之后, 把已经排好的
-核心集一起废掉。所以累积只有两个出口:
+这里**一行 `didChangeConfiguration` 都没有**, 这是整个模块最重要的一条约束 (§2.5):
+改 `java.project.sourcePaths` 偏好会把 source 排到 lib 之后, 把已经排好的核心集一起废掉。
+累积的出口:
 
 - 内存 `_accumulated` + 磁盘 `source_inject-projects.txt` (下次 `inject_sync` 读回)
-- 用户执行 `:AospCleanWorkspace` 删掉 `-data` 后重开 (只有这条路真能生效, §2.5.1)
+- 用户执行 `:AospCleanWorkspace` 删掉 `-data` 后重开 (新源码根会排到 lib **之前**, §2.5.1)
+- **`java/source_apply.lua` (§2.9)**: jdt.ls 自己的 `java.project.addToSourcePath`, 只追加
+  不重排, 所以它**不违反本节约束** (不是那个偏好)。默认由 `source_apply.auto_apply()`
+  每会话自动调一次 (累积那一刻或 jdtls attach, 以空闲为闸); `:Aosp!` 是手动入口。
+  代价是新源码根落在 lib **之后** (见 §2.9 边界 2)。
 
 `pending_count() = #_accumulated - #_installed` 就是给用户看的"还差多少条没生效"。
+注意 `source_apply.pending()` 是**另算**的 (union − 磁盘 `.classpath` 的 src 条目),
+不复用这个计数: `_installed` 是"我们发出去过什么", 磁盘 `.classpath` 才是"jdt.ls
+此刻真有什么"。
 
 ### 7.5 LRU 淘汰
 
@@ -707,6 +1001,13 @@ reset()  再清一次 (用户真的按了 :AospRescan)
 > (`t=309 s err=nil`)。所以"累计 247 根仍然能跳到真实 .java"是成立的, 之前
 > 的 <nil> 全是被索引期掩盖的。
 
+**为什么有些类**永远**只能跳到反编译视图 (AIDL/proto/aconfig)**: 这些接口的 Java 代码
+(Stub/Proxy) 由构建系统**生成进 `out/`**, 源码树里**没有**对应的 `.java` —— 通篇搜也
+搜不到。它们唯一的来源就是编译出的 jar, 所以对 `INetworkOfferCallback` /
+`IActivityManager` 这类类, 落到反编译视图是**正确结果, 不是 bug**; 这也是插件默认不排
+除任何 jar 的原因之一 (见 `java.exclude_jars` 的默认值只针对 stub/headers/JDK 工具
+jar)。README 的 AIDL FAQ 保留这一段结论, 机制在此。
+
 扫描实测 (剪枝 1b 之前 → 之后, `frameworks/base`):
 
 | 指标 | 修前 | 修后 |
@@ -734,18 +1035,20 @@ reset()  再清一次 (用户真的按了 :AospRescan)
 | `build jobs finished` | 每次启动都有 |
 | 每次启动后的**无日志高 CPU 静默期** | 1h24m / 1h46m / 20m / 5.5m |
 | `.index` 文件 | 1129 个 / 831 MB; **1126 个是 jar 索引**(每个 40–50 MB, 两分钟能全部写完) |
-| **工程源码索引** (`264720899.index`) | **25 字节 = 空**, mtime 停在 20:55 |
+| **工程源码索引** (`264720899.index`) | **25 字节 = 空**, mtime 停在 20:55 — 这是 2026-09-30 的观测; **已被 §8.2 更正**: 2026-10-09 同一文件为 72.5 MB |
 | `savedIndexNames.txt` | 1127 条, 磁盘上一条不缺 (但工程索引本身就是空的) |
 | 末段日志 | `Validated 1. Took 33407 ms` + `206 problems reported for /ConnectivityService.java`, 之后 5.5 分钟无任何输出, 直到 `Parent process stopped running` |
 
 三条结论:
 
 1. **jar 索引是好的、可复用的** (两分钟写完 1126 个文件), 慢的从来不是它。
-2. **注入的源码树索引从没写出来过** —— 25 字节的空文件。根因见下面的 GC 死亡螺旋:
-   JVM 绝大部分时间在做无效 full GC, 根本没走到写索引那一步; 即便走到了, `IndexManager`
-   也只在空闲/退出时 `saveIndexes`, 而会话总是被"用户等不下去 → 关 nvim"结束
-   (`Parent process stopped running, forcing server exit`), 于是下次启动从头再来一遍。
-   表现就是"打开很久了还在索引"。
+2. ~~**注入的源码树索引从没写出来过** —— 25 字节的空文件。~~ **此结论已作废 (见 §8.2)**:
+   2026-10-09 的取证显示工程源码索引确实会落盘 (72.5 MB)。当时这次会话里它是空的,
+   根因是下面的 GC 死亡螺旋 —— JVM 绝大部分时间在做无效 full GC, 没走到写索引那一步;
+   即便走到了, `IndexManager` 也只在空闲/退出时 `saveIndexes`, 而会话被"用户等不下去 →
+   关 nvim"结束 (`Parent process stopped running, forcing server exit`)。正确的表述是:
+   **索引会写, 但会被每次源码根注入触发的全量 classpath 重建反复作废** (§8.2 的推断),
+   所以表现仍是"打开很久了还在索引"。
 3. **每次启动都白跑一遍** classpath 解析 + build: `Updating classpath` 与
    `build jobs finished` 在 4 次启动里各出现 4 次, 没有热启动。
 
@@ -777,7 +1080,7 @@ reset()  再清一次 (用户真的按了 :AospRescan)
 - **`-Xmx6G` 是这台机器上 `-Xmx` 的下限之下的**: 实测存活集 4 G, 需要 ≥ 8 G 才有余量。
   `~/.config/nvim/lua/plugins/jdtls.lua` 里"保持 6G, 8G 会把 swap 拖进来"的判断被实测
   推翻 (8 G 时 RSS 约 8 G, 机器 15.7 G total / 8.1 G available, 不会换页)。
-- 判据必须是**堆的数值**, 不是"-Xmx 串存在"。旧版 `:AospDiagnostics` 的 `jdtls vmargs`
+- 判据必须是**堆的数值**, 不是"-Xmx 串存在"。旧版 `:Aosp` 诊断的 `jdtls vmargs`
   行只查字符串, 对这种配置照样显示绿灯 —— 已改为按 `util/jvm.lua` 的 `assess()` 判数值
   并给出 `-Xmx8G` 的 action。
 
@@ -791,7 +1094,21 @@ reset()  再清一次 (用户真的按了 :AospRescan)
   `Java Index broken - will be automatically deleted to repair`、
   `Failed to save JDT index … (No such file or directory)`, 以及同一次导入里
   `Adding` 计数从 1126 变成 2252。索引被反复删掉重建 = 索引永远追不上。
-  自检入口: `:AospDiagnostics` 的 `jdtls instances` 行与 `jdtls index` 行。
+  自检入口: `:Aosp` 面板的 `jdtls instances` 行与 `jdtls index` 行。
+  判定细节 (2026-10-10 修过, 曾有"一个 nvim 也报 2 instances"的假警报): 本 nvim 自己
+  拉起的 jdtls 是 nvim 的**子进程**, `/proc` 扫描必然命中它 —— 必须排除本进程的后代
+  (`util/proc.is_descendant`)。另外 cmdline 要按 **NUL 拆成参数**再判 (`-data <dir>`
+  精确相等), 不能拿整串做子串搜索: `vim.fn.readfile` 会把 NUL 当换行存, 参数分隔符
+  会消失 (所以读取走 `util/proc.argv`, libuv 原始字节)。
+- **`jdtls index` 行的判据是"磁盘上有没有索引", 不是"最近写没写"** (2026-10-10 修过, 曾
+  把它写成 `mtime < 1h` 从而误报 "index not persisted yet"): jdtls 只在**退出/checkpoint**
+  时写 `.index`, 加载既有索引根本不碰 mtime —— 所以健康的长时间会话 mtime 一样是十几小时前,
+  按时间判等于把正常状态报成故障。现在 `!` 只在索引目录里没有任何非空文件时出现 (>1KB 才算
+  落盘, 见 §4 的 F4)。另外要记住这个目录里 **1129 个 `.index` 里 1126 个是 jar 索引缓存**
+  (§8.1 表), 所以 "927 MB" 是整目录的账, **不代表工程索引有多大** (工程索引是那个 72.5 MB
+  的 `264720899.index`); 面板文案已写明 "index file(s)"。
+  想确认"索引是不是真的存住了", 看 `savedIndexNames.txt`: 它列出所有已落盘的 index 名,
+  与磁盘文件一一对应即说明存住了。
 - **定位静默期的正确手法**: 线程栈顶帧会骗人 (上面那堆 Parser/lombok 帧就是假热点),
   要看 **每个线程的累计 CPU**。`jcmd <pid> Thread.print` 输出的 `cpu=` 字段排序后一眼可见;
   `jcmd <pid> PerfCounter.print | grep '^sun\.gc'` 里的 `invocations` / `time` 给出 GC 占比。
@@ -809,23 +1126,72 @@ reset()  再清一次 (用户真的按了 :AospRescan)
 第三行说明树里的 gradle 工程必须靠 `initializationOptions` 里的
 `java.import.gradle.enabled=false` 挡住, attach 期再发已经晚了 (§9.3 闸门 B)。
 
+### 8.2 本会话取证 (2026-10-09, 真机 workspace)
+
+以下把**测量**与**推断**分开标注。被测对象: 活的
+`~/.cache/nvim/jdtls/aosp/workspace` (本机真实工作区)。
+
+**测量 1 — 工程源码索引这次真的落盘了。**
+`aosp_3f7ad7da/.metadata/.plugins/org.eclipse.jdt.core/264720899.index` 现在 **72.5 MB**,
+mtime 17:27; 而 2026-09-30 同一文件只有 **25 字节** (空)。索引总量: **1129 个 `.index`
+文件 / 931 MB**, 其中 **1126 个是 jar 索引**, 缓存自 10-01。
+方法: `stat` 目标文件 + `find … -name '*.index' | wc -l` 与 `du -sh` 统计全量。
+
+**测量 2 — 一次源码根注入 = 一次全量 classpath 重建。**
+会话 16:51:40 → 17:27:37 的日志里 **2168 条** `Adding <path>.jar to the classpath`
+(类路径约 **1379** 条), 最后一条在 **17:27:20**, 距会话退出仅 **12 秒** —— 第二遍被
+quit 截断 (`2168 ≈ 两遍 1126`)。方法: 对 `-data` 日志按时间轴 grep 计数。
+
+**推断 (明确是推断) — 每次运行期注入都会作废工程索引。** 既然一次注入会触发全量
+classpath 重建, 那么每次注入之后工程索引都要重算; 测量 2 里第二遍没跑完, 说明索引
+刚重建就被下一次注入或退出打断。这解释了"注入之后跳转要等很久才稳"。本机每次启动
+都会重写 classpath, 所以"下一轮会不会自愈"以真机 `.classpath` 实测为准 (§2.9)。
+
+**这条推翻了 §8.1 的旧结论。** §8.1 曾断言"注入的源码树索引从没写出来过" —— 那是
+2026-09-30/10-01 一次会话里的观测 (当时 25 字节空文件), 现已作废: 工程索引确实会
+落盘 (72.5 MB), 是被后续注入反复作废。§8.1 相关措辞已就地更正。
+
+**为什么不采纳 `java.project.updateClassPaths` 作为"把新源码根提回 jar 之前"的杠杆**
+(它看起来正是"跳转落到 jar"的显然解): 调用方必须发送**完整**条目列表, 而
+`resolveDependencyEntries` 只在传入的非 src 条目数与工程自身约 **1375** 条的 raw
+classpath **完全相等**且逐条 path 都对得上时才返回工程自己的条目, 否则原样返回传入
+的那份 —— 传漏一条就**静默**丢掉那条 lib; 且 `getClasspaths` 只给解析后的输出路径,
+客户端无法重建 1375 条 raw 条目。静默丢一个库 = 静默的 classpath 损坏, 比"jar 优先"
+更糟。参数形态与反编译细节见 §2.9。
+
+**测量 3 / 决策 — 每会话注入预算。** 综合测量 2 的"一次注入 = 一次全量重建", 自动注入
+定成 **每会话至多一次成功、单批 ≤ `MAX_AUTO_ROOTS` 个根 (5)、以 jdtls 进入
+空闲为闸 (而非墙上时钟)**, 而不是"越早越好、越多越好"。这是从上面两条测量推出的
+预算决策, 不是拍脑袋 —— 多注入一次 = 多一次全量重建 = 多作废一次工程索引。
+
 ---
 
 ## 9. E2E 复现步骤
 
 ### 9.1 结构断言的快速探针 (不启 jdtls)
 
-```bash
-# 1) 核心集模式: sourcePaths 出现在 initialize 请求的 settings 里
-nvim --headless -l /tmp/aospnav-t/t_configure.lua
+**仓库内**的探针 (见 §10.1):
 
-# 2) 增量累积的异步路径 (BufEnter -> 后台扫描 -> union)
-nvim --headless -l /tmp/aospnav-t/t_onfile.lua
+```bash
+bash tests/run.sh            # 全部; 8 文件 (带 AOSPNAV_LIVE_TEST=1 时共 175 条断言)
 ```
 
-测试树由 `/tmp/aospnav-t/` 下的 shell 片段生成 (frameworks/base 含 core/java、
-services/core/java、tests/src、ravenwood 影子树; packages/modules/Connectivity;
-libcore/ojluni 的 JDK 影子根; `build/make/core/main.mk` + `.repo` 供 AOSP 识别)。
+下面两条**曾**用来单跑核心集与增量累积两条路径, 但只在 `/tmp/aospnav-t/` 下存在过,
+那批文件已随 `/tmp` 被清空而丢失 (§10.2), 现在**跑不了** —— 保留命令形式, 作为补覆盖时
+要重建的两个探针:
+
+```bash
+# 1) 核心集模式: sourcePaths 出现在 initialize 请求的 settings 里
+nvim --headless -l /tmp/aospnav-t/t_configure.lua     # 文件已丢失
+
+# 2) 增量累积的异步路径 (BufEnter -> 后台扫描 -> union)
+nvim --headless -l /tmp/aospnav-t/t_onfile.lua        # 文件已丢失
+```
+
+它们依赖的测试树也由 `/tmp/aospnav-t/` 下的 shell 片段生成, 已一并丢失。树的结构是:
+frameworks/base 含 core/java、services/core/java、tests/src、ravenwood 影子树;
+packages/modules/Connectivity; libcore/ojluni 的 JDK 影子根;
+`build/make/core/main.mk` + `.repo` 供 AOSP 识别。
 
 ### 9.2 真机 (jdtls 起真实 workspace, 读生成的 `.classpath`)
 
@@ -890,44 +1256,89 @@ Buildship 的 gradle-wrapper 校验告警) —— 禁用 gradle 必须进 `initi
 
 ## 10. 测试
 
-全部是 `nvim --headless -l` 的纯 Lua 断言, 不启 jdtls, 位于 `/tmp/aospnav-t/`:
+### 10.1 仓库内的套件 (维护入口)
+
+`tests/` 是本仓库**唯一被跟踪**的测试, 一条命令跑全部:
+
+```bash
+bash tests/run.sh                                   # 跑全部 (跳过真树检查)
+AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
+```
+
+`run.sh` 逐文件起 `nvim --headless -u NONE --cmd "set rtp+=$PWD" -l tests/t_<name>.lua`,
+不启 jdtls, 不依赖任何测试框架 (断言宏就在 `tests/helper.lua` 的 ~50 行里)。
+
+**默认跳过真树检查**: 带 `AOSPNAV_LIVE_TEST=1` 时才会去**读** `~/.cache/nvim/jdtls/`
+下的活工作区与 `/home/yangwj12/project/aosp` —— 只读, 不写不删 (§硬约束)。没有那棵树/
+那个工作区时相关断言自动 SKIP, 不会失败。
 
 | 套件 | 断言 | 覆盖 |
 | ---- | ---- | ---- |
-| `t_root.lua` | 15 | 两种 workspace_mode / 树外回落 / 用户函数透传 |
-| `t_projects.lua` | 10 | 真实 AOSP 路径 → `frameworks/base`; 越过 AOSP 根即停 |
-| `t_source_roots.lua` | 49 | 深层根保留 / test / JDK / shadow / **嵌套根** 剪枝 / **7 条默认排除模式** / append 后默认项仍生效 / header 三行 / `excl=` 统计 / 改排除配置即失效 / 版本失效 |
-| `t_inject.lua` | 44 | union 去重与 core 在前 / LRU 淘汰与重纳入 / 空集不注入 / **绝不下发** / 顺序落盘与重启读回 / reset 后丢弃在飞扫描 |
-| `t_config.lua` | 29 | 别名 warn 不中断 / 未知值回落 / 上限校验 / 老校验仍生效 / `source_root_exclude` 默认 7 条 + append/replace/去重 |
-| `t_hash.lua` | 14 | 与 jar 侧旧 `filters_hash` **逐字节对拍** / djb2 边界 (空串、长串、非 ASCII) / 同输入同输出 / 两处缓存头共用同一指纹 |
-| `t_configure.lua` | 26 | `infer` → key 缺席; `core` → 三处 settings; 核心集全不存在 → 缺席; **buf 0 不是 java 文件时仍注入 / buf 0 是外部 java 文件时不注入**; invisible project 名复算 + 外部工程识别 |
-| `t_onfile.lua` | 13 | BufEnter → 异步扫描 → 累积 → 落缓存, 热路径时延 |
-| `t_exclusions.lua` | 14 | 冷缓存同步扫描 / `.project`+`.classpath` 双文件规则 / 空结果也落盘 |
+| `t_commands.lua` | 13 | 命令面冻结契约: 恰好 4 个 `:Aosp*` 命令, 且删掉的那 7 个一个都不在 |
+| `t_config.lua` | 18 | 本轮重构引入/删除的键: 死键静默丢弃 (不映射、不告警) / `merge` 不改调用方的表 / `source_apply_max_roots` 不再是配置键 |
+| `t_log.lua` | 54 | `util/log.lua`: 四档阈值比较 / `log.user` 绕过阈值 / 会话内 `once` 去重 / `once` 被阈值挡下时**不消费**登记 / 消息前缀 |
+| `t_path.lua` | 14 | `util/path.start_dir`: `nil`/`""` 归一成 cwd, 绝不能给 `"."` (§7 痛点 4 的根因) |
+| `t_proc.lua` | 10 | `util/proc`: `/proc/<pid>/cmdline` 必须**真的按 NUL 切开参数** (回归"一个 nvim 报 2 个 jdtls 实例") / `is_descendant` 自反与否定 |
+| `t_root_from_cwd.lua` | 20 | 痛点 4 的**端到端**回归: 起在 AOSP 根、不打开任何 `.java` 文件时 `aosp_root(nil/"")` 仍拿到树根 (真树断言部分需 `AOSPNAV_LIVE_TEST=1`) |
+| `t_phase.lua` | 18 | `phase` 是活状态的冻结契约: `ui.statusline()` 对 `idle`/`ready`/`indexing`/`no-out`/`failed` 五态各自的渲染 (`indexing` 必须带 `(idx)`) / `install_phase_handler` **链式**调用原有 handler (不吞掉 nvim-jdtls 的 status 消息) / 只有 `ServiceReady` 翻牌, 其余 `ServiceStatus` 不动 / `no-out`/`failed` 不被覆盖 / `err` 非空不翻牌 / 非 jdtls client 不包装 |
+| `t_source_apply.lua` | 28 | `java/source_apply.lua`: `abs_of` 归一 / `installed` 解析 `.classpath` (去重、带 `excluding`、剥 `_/` 前缀、读不到返回 nil 而非空集) / 真机 `pending` 与磁盘 src 交集为 0 且有序 / 累积根"要么已装要么待装, 绝不丢弃" / 已装与待装不相交 / 非 core 模式拒绝 / `classify` 三类真实返回值 / 无 client 时 `auto()` 惰性 / `source_apply_auto=false` → `off` / `report()` 每会话只提示一次 |
 
-合计 **214** 条断言。
+合计 **175** 条断言 (上表各文件是带 `AOSPNAV_LIVE_TEST=1` 的行数; 默认跑法则
+`t_root_from_cwd` 13 / `t_source_apply` 22, 共 **162**)。
 
-`t_inject.lua` 的第 10 组是本模块的"宪法测试": 它把 `vim.lsp.get_clients` 换成假
-client, 断言 `inject_sync` 与 `apply` 全程 **一条消息都没发**。任何人日后想"顺手把
-累积下发一下", 这条会立刻红 (§2.5)。
+`source_apply` 的分界是明的: `pending()` **不发任何请求** (纯读 `.classpath` + 算差集);
+发请求的只有 `add_serial` —— 手动经 `:Aosp!`, 或自动经 `source_apply.auto_apply()`
+(§2.9)。`t_source_apply.lua` 全部断言都走 `pending()` 及以下, **不触网**。
 
 注意两个易踩点:
 
 - `si.setup(cfg)` 收的是 **java 段**, 传整份 config 会因 `_setup_done` 之外的分支
   报 `Invalid 'group'`。
 - 测"core 模式是否生效"必须用**全新的 `cache_dir`**, 否则上一次测试留下的项目缓存
-  会被 `inject_sync` 读进来, 让核心集这件事没法判定 (`t_configure.lua` 的做法)。
+  会被 `inject_sync` 读进来, 让核心集这件事没法判定。
+
+真树断言不要写成"某个根现在一定还 pending": 自动注入真的在活工作区生效之后, 这些根
+就已经进 `.classpath` 了 —— 那正是本插件想要的结果, 断言状态等于把"功能正常工作"判成
+失败 (2026-10-10 修过一次)。要断言的是**不变式** (已装 ∪ 待装 = 全集且不相交)。
+
+### 10.2 已丢失的 scratch 套件 (`/tmp/aospnav-t/`) —— 待补回的覆盖清单
+
+2026-10-09 之前有一批临时测试放在 `/tmp/aospnav-t/` (**10 个文件 / 242 条断言**), 从未
+进仓库; `/tmp` 被清空后 9 个文件已丢失, 只剩 `t_source_apply.lua` 一份 (其覆盖已在
+10.1 里, 断言数从 28 微调)。
+
+下表记录它们**曾经覆盖过**的东西, 当作**待补回的覆盖清单** —— 不要再当成"现有测试"读:
+
+| 套件 | 断言 | 覆盖 (已丢失) |
+| ---- | ---- | ---- |
+| `t_root.lua` | 15 | 两种 java.mode / 树外回落 / 用户函数透传 |
+| `t_projects.lua` | 10 | 真实 AOSP 路径 → `frameworks/base`; 越过 AOSP 根即停 |
+| `t_source_roots.lua` | 49 | 深层根保留 / test / JDK / shadow / **嵌套根** 剪枝 / **7 条默认排除模式** / append 后默认项仍生效 / header 三行 / `excl=` 统计 / 改排除配置即失效 / 版本失效 |
+| `t_inject.lua` | 44 | union 去重与 core 在前 / LRU 淘汰与重纳入 / 空集不注入 / **绝不下发** / 顺序落盘与重启读回 / reset 后丢弃在飞扫描 |
+| `t_hash.lua` | 14 | 与 jar 侧旧 `filters_hash` **逐字节对拍** / djb2 边界 (空串、长串、非 ASCII) / 同输入同输出 / 两处缓存头共用同一指纹 |
+| `t_configure.lua` | 26 | `infer` → key 缺席; `core` → 三处 settings; 核心集全不存在 → 缺席; **buf 0 不是 java 文件时仍注入 / buf 0 是外部 java 文件时不注入**; invisible project 名复算 + 外部工程识别 |
+| `t_onfile.lua` | 13 | BufEnter → 异步扫描 → 累积 → 落缓存, 热路径时延 |
+| `t_exclusions.lua` | 14 | 冷缓存同步扫描 / `.project`+`.classpath` 双文件规则 / 空结果也落盘 |
+
+其中 `t_inject.lua` 的第 10 组是 `source_inject` 的"宪法测试": 它把 `vim.lsp.get_clients`
+换成假 client, 断言 `inject_sync` 与 `apply` 全程 **一条消息都没发** (§2.5)。**这条现在
+没有仓库内的对应物** —— 任何人日后想"顺手把累积下发一下", 已经没有测试会立刻变红, 补
+覆盖时优先把它搬回来。
+
+另有一批**端到端沙箱脚本**在 `/tmp/aospnav-e2e/` (§9.3), 它们自带一份 jdtls 与 `-data`,
+是用来验证"发请求那条路"的唯一场地; 同样不在仓库里, `/tmp` 一清就没。
 
 ---
 
 ## 11. 与 VSCode 版的历史关系
 
-本插件的 java 模型演进过三代, 现存的 `workspace_mode` / `source_paths_mode` 就是这段
-历史的两个开关:
+本插件的 java 模型演进过三代, 现在的单一键 `java.mode` 就是这段历史的归一
+(旧键在加载时静默丢弃, 见 §4):
 
 | 代 | jdtls root_dir | sourcePaths | 结果 |
 | - | - | - | - |
-| **按项目开工作区** | 最近的 `.git` 目录 | 不注入 | 每个模块一个小 workspace, 模块间索引互不可见。对应 `workspace_mode="project"` |
-| **VSCode 模型** (= `0f27e15`) | AOSP 根 | 不注入 | 整树一个索引, 但跨模块跳转落到反编译 jar。对应 `source_paths_mode="infer"` |
+| **按项目开工作区** | 最近的 `.git` 目录 | 不注入 | 每个模块一个小 workspace, 模块间索引互不可见。对应 `mode="project"` |
+| **VSCode 模型** (= `0f27e15`) | AOSP 根 | 不注入 | 整树一个索引, 但跨模块跳转落到反编译 jar。对应 `mode="infer"` |
 | **当前 (默认)** | AOSP 根 | 注入核心集 + 累积 | 跨模块跳转落到真实 `.java` |
 
 中间还有一次失败的尝试: **`attach`** —— 给 `referencedLibraries` 的对象形态挂
@@ -940,6 +1351,34 @@ Kotlin 侧 (KLS) 从一开始就是另一条线: KLS 不认 `sourcePaths`, 它�
 分发表 (`.../aosp-nav/nvim-roots.txt`) 命中正确的 AOSP 根。注意 `kls_root_extra`
 现在用的是 `java/root.aosp_root()` 而**不是** `workspace_root()` —— 后者在
 `project` 模式下返回 nil。
+
+KLS 进程的孤儿/残留清理现在是**自动的** (旧的 `:AospKillOrphanKls` 命令已删除):
+插件在启动/attach 阶段自行回收残留的 KLS 进程, 不再需要用户手动敲命令。
+
+**`kls configure()` 到底往里塞了什么, 以及为什么** (README 的 "configure will:"
+四条已压缩成一句, 依据在此):
+
+- `init_options.storagePath` —— KLS 的 `init_options` **必须是非空对象**: 空表序列化成
+  数组会让 KLS 的 gson 报 JSON 解析错, 所以至少要塞 storagePath 进去。
+- 关 `documentHighlight` handler —— KLS 在没有 gradle 的 AOSP 下退回降级模式, 该
+  handler 会抛 `NoTopLevelDescriptorProvider` → LSP 层 `-32603` (`kotlin.
+  disable_document_highlight = true`)。
+- **扩展 `root_markers`** (追加 `.git`) —— AOSP 模块目录没有 gradle/maven 根文件,
+  默认 `root_dir = nil`(或空)会让 KLS 永远不解析 classpath。
+- **生成 `~/.config/kotlin-language-server/classpath` 脚本** —— KLS 的
+  `ShellClassPathResolver` 在启动时执行它, 输出 soong intermediates 里的 AOSP framework
+  jar 列表, 这就是"Kotlin → Java"跳转的依赖来源。
+
+**Kotlin 导航落到测试桩 (known KLS limitation) 的机制**: KLS 会把工作区里**每一个**
+`.java` 文件加进自己的源码路径, 没有排除配置。AOSP 里有与 framework 类同包同名的测试
+桩 (如 `tools/systemfeatures/tests/.../Context.java`), 于是跳 `Context` 可能落到桩而不是
+`core/java/.../Context.java`。多数类不受影响, 遇到时用 grep/搜索定位真实源码。
+
+**旧的 `.project` 技巧已废弃** (README 的 "About `.project` files" 一节已删): 早期版本
+教你往模块根丢一个空 `.project`, 让 jdtls 的 `root_dir` 从 AOSP 根降回该模块 —— 现在
+默认模式下工作区根**就是** AOSP 根, 该技巧只会让 jdt.ls 把那个目录当成工程导入, 既不
+加速还可能引入重复类。要"只索引一个模块", 用 `java.mode = "project"`; 把 `android_root`
+直接指向该模块也有效, 并能顺带缩小 jar 扫描范围。导入闸门与常量见 §2.1。
 
 ---
 
@@ -954,7 +1393,7 @@ Kotlin 侧 (KLS) 从一开始就是另一条线: KLS 不认 `sourcePaths`, 它�
 - **绝不在运行期下发 `sourcePaths`** → §2.5。想"让累积立刻生效"的冲动只有一个正确
   出口: 让用户重建 jdtls 数据目录。`t_inject.lua` 第 10 组会拦住任何下发。
 - **加一个注入点** → 记住 §2.3 (空数组会关掉推断) 和 §2.7 (必须工作区相对路径)。
-- **加一个配置键** → 走 `config.lua` 的默认值 + `normalize_modes` 归一, 不要
+- **加一个配置键** → 走 `config.lua` 的默认值 + `validate()` 就近归一, 不要
   `return false` 中断 setup。
 - **碰 BufEnter 路径** → 必须保持毫秒级; 任何扫描都异步 (`scan_async`), 结果进缓存。
 - **碰 `inject_sync`** → 它只能**同步读缓存**, 一旦引入扫描, sourcePaths 就赶不上
