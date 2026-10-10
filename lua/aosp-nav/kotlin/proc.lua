@@ -2,8 +2,9 @@
 -- 身份判定: /proc/<pid>/status 的 PPid 链回溯 — KLS 是本 nvim 进程的后代
 --   (nvim-lsp 直接 fork, 可能经 cmd 的 shell wrapper 中转) 则属于本会话。
 --   祖先链是内核事实, 多 nvim 会话并发互不误伤 (替代 v1 的 pid 快照推断)。
--- 崩溃孤儿: PPid=1 且 cmdline 含 mason 的 KLS = 客户端已死的孤儿
+-- 崩溃孤儿: PPid=1 且 cmdline 含 MainKt 的进程 = 客户端已死的孤儿
 --   (nvim 崩溃时 VimLeavePre 不触发), 由巡检 timer 与 kill 入口顺带清理。
+--   判据故意**不要求** mason 路径 —— 手动装的 KLS 同样需要清 (见 is_orphan)。
 -- 非 Linux 平台: /proc 不存在 → 退回 pgrep 快照方案 (功能可用, 会话归属
 --   不精确, 与 v1 行为一致)。
 
@@ -67,16 +68,15 @@ local function is_ours(pid)
   return false
 end
 
---- pid 是否为孤儿: PPid=1 (父已死) 且 cmdline 含 mason 路径 (收窄到
---- 我们生态的 KLS, 防误伤其它 daemon 化 java 进程)
+--- pid 是否为孤儿: PPid=1 (父已死) 且 cmdline 含 MainKt (收窄到 KLS)。
+--- 判据**只看这两条**, 不要求 mason 路径 — 手动安装的 KLS 同样需要清理;
+--- MainKt 这个入口类别的 daemon 化 java 进程极少, 误伤面可接受。
 local function is_orphan(pid)
   local ppid = read_ppid(pid)
   if not ppid or tonumber(ppid) ~= 1 then return false end
   local cmdline = read_cmdline(pid)
   if not cmdline or not cmdline:find("MainKt", 1, true) then return false end
-  -- PPid=1 的 MainKt: 孤儿 (KLS 非 daemon)。mason 路径仅作为额外置信,
-  -- 不作硬条件 — 手动安装 KLS 的用户同样需要清理
-  return true
+  return true   -- PPid=1 的 MainKt: 孤儿 (KLS 非 daemon)
 end
 
 --- 杀单个 pid: TERM → 等 500ms → 存活则 KILL

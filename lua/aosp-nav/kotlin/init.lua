@@ -158,36 +158,4 @@ function M.configure(opts)
   return opts
 end
 
---- 重生成脚本并 dry-run 预览 (供 :AospKlsClasspath 命令)
---- @param mode string|nil "curated"/"all" (nil = 用当前配置)
-function M.preview_classpath(mode)
-  local cfg = get_cfg()
-  if mode then
-    if mode ~= "curated" and mode ~= "all" then
-      log.error("invalid mode: " .. mode .. " (curated|all)")
-      return
-    end
-    cfg.kotlin.jar_mode = mode
-  end
-  local classpath = require("aosp-nav.kotlin.classpath")
-  -- 顺带登记 cwd: 手动预览通常就在目标工作区里跑
-  local cwd = vim.fn.getcwd()
-  local path, err = classpath.ensure_script(
-    kls_root_extra(cwd, vim.api.nvim_buf_get_name(0)))
-  if not path then
-    log.error("generate failed: " .. (err or "unknown"))
-    return
-  end
-  local jars = classpath.dry_run(vim.fn.getcwd())
-  log.info("kls-classpath (" .. cfg.kotlin.jar_mode .. ") -> " .. #jars
-    .. " jars from " .. vim.fn.getcwd())
-  for i = math.min(#jars, 10), 1, -1 do
-    log.info("  " .. jars[i])
-  end
-  if cfg.kotlin.jar_mode == "all" then
-    log.warn("jar_mode = \"all\" is experimental: KLS's first index is slow and memory-heavy; "
-      .. "after switching modes, consider clearing " .. cfg.kotlin.storage_path)
-  end
-end
-
 return M

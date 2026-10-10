@@ -94,4 +94,24 @@ H.check(vim.tbl_contains(nav.config.java.exclude_jars, D.java.exclude_jars[1]),
 nav.setup({})                                 -- 空表与 nil 同样不能清空用户配置
 H.eq(nav.config.kotlin.jar_mode, "all", "空表 setup({}) 之后 jar_mode 仍是用户值")
 
+-- ---------------------------------------------------------------------------
+-- [v11] merge 的输入必须被完全保护: tbl_deep_extend 会把**没被 opts 覆盖的子表
+-- 按引用共享**, 于是 base = M.defaults 时 validate 的就地归一化
+-- (cfg.java.mode="aosp") 会写进默认值表, 污染整个 session。
+-- ---------------------------------------------------------------------------
+local scratch = config.merge({})
+H.check(not rawequal(scratch.java, D.java), "merge 结果不与 defaults 共享 java 子表")
+H.check(not rawequal(scratch.kotlin, D.kotlin), "merge 结果不与 defaults 共享 kotlin 子表")
+local first_jar = D.java.exclude_jars[1]
+scratch.java.exclude_jars[1] = "MUTATED"
+H.check(D.java.exclude_jars[1] == first_jar, "就地改合并结果不污染 defaults 的列表")
+scratch.kotlin.jar_mode = "MUTATED"
+H.check(D.kotlin.jar_mode == "curated", "就地改合并结果不污染 defaults 的标量")
+
+-- 两次 setup 之间同样不许共享子表 (旧表被就地改写会让"上一次配置"变成幽灵)
+local a = nav.config
+nav.setup()
+H.check(not rawequal(a.java, nav.config.java), "两次 setup 的 config 不共享 java 子表")
+H.check(not rawequal(a.kotlin, nav.config.kotlin), "两次 setup 的 config 不共享 kotlin 子表")
+
 H.finish("t_config")

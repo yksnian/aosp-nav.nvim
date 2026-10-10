@@ -762,17 +762,45 @@ setup()                                            ->  jar_mode=curated log_leve
 
 **修法**: `M.merge(user_opts, base)` 增加 `base` 参数 (默认 `M.defaults`; 顶层 setup 在
 重复调用时传**已生效的** `M.config`), 排除名单 append 语义的参照表跟着 `base` 走。
-`M.merge` 仍返回新表、不改动 `user_opts` 与 `base` (后者现在是活配置, 由
-`t_config.lua` 断言钉住)。原先那个只救列表的 `merge_lists` 随之删除 —— 它解决的正是
-这件事, 而 `base` 一次做全, 不留两套合并路径。
+`M.merge` 仍返回新表、不改动 `user_opts` 与 `base`。原先那个只救列表的 `merge_lists`
+随之删除 —— 它解决的正是这件事, 而 `base` 一次做全, 不留两套合并路径。
 
 **为什么不能只加"空参就 return"**: 那能治好面板这一例, 但 `setup{a}` 再 `setup{b}`
 照样丢 `a` 的键。真正该消灭的是"以默认值为底"这个默认假设。
 
-覆盖: `tests/t_config.lua` 新增 13 条 (合计 31) —— 空参 `setup()` 后用户值仍在 /
+### 附: 顺手堵掉的"底表被就地污染" (`base` 深拷贝)
+
+改 `base` 时发现的**既存**问题 (与本 bug 同源, 一并修了): `vim.tbl_deep_extend`
+把**没被 `opts` 覆盖的子表按引用共享**, 而 `M.merge` 原样返回它 —— 于是
+
+```
+首次 setup (无 opts): rawequal(config.java, M.defaults.java) == true
+```
+
+`validate` 的就地归一化 (`cfg.java.mode = "aosp"`, 未知值降级) 与
+`kotlin/init.lua` 里 `cfg.kotlin.jar_mode = mode` 这类写入, 都会顺藤写进**默认值表**,
+污染这个 session 之后所有合并结果的底座。修法是一行 `base = vim.deepcopy(base or
+M.defaults)`, 让"merge 不改输入"成为真正的不变量, 也顺带让两次 setup 之间的旧配置
+表彻底变成一次性对象 (不再共享子表)。
+
+**语义变化的取舍** (改 `base` 带来的, 都是刻意的):
+
+- "缺省"从"回默认值"变成"保持不变" —— 好处是 `:Aosp*` 不再剪掉用户配置; 代价是
+  `setup()` 不能当"恢复出厂设置"用了 (要回默认得重启 nvim)。
+- validate 的就地归一化结果会留在活配置里 (以前会被下一条命令的 setup 冲掉);
+  也就是"用户字面值"与"生效值"的差异会持续到重启。
+- 排除名单 append 的参照表从默认值换成活配置: 结果集合不变 (活配置里已是 默认∪用户,
+  再∪一次用户是幂等的), 但 `exclude_merge="replace"` 这类值现在也会粘住。
+
+同一轮还清掉两个随"命令面 10→4"一起失去调用方、却漏删的死函数:
+`kotlin/init.lua` 的 `M.preview_classpath` (原 `:AospKlsClasspath` 的后端) 与
+`kotlin/classpath.lua` 的 `M.dry_run` (只被前者调用)。
+
+覆盖: `tests/t_config.lua` 新增 19 条 (合计 37) —— 空参 `setup()` 后用户值仍在 /
 第二次带参 setup 新值生效且旧键不丢 / `setup({})` 同样不清空 / 新表产出且旧表不被就地
-改写 / 排除名单 append 语义未回归 / **前置断言代码默认值确实是 `curated`** (否则这组
-测试会因为"默认值恰好等于用户值"而假通过)。
+改写 / 排除名单 append 语义未回归 / **merge 结果与 `M.defaults` 不共享 java·kotlin
+子表, 就地改它不污染默认值 (标量与列表各一条)** / 两次 setup 之间不共享子表 /
+**前置断言代码默认值确实是 `curated`** (否则这组测试会因为"默认值恰好等于用户值"而假通过)。
 
 ---
 
@@ -1473,7 +1501,7 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | 套件 | 断言 | 覆盖 |
 | ---- | ---- | ---- |
 | `t_commands.lua` | 13 | 命令面冻结契约: 恰好 4 个 `:Aosp*` 命令, 且删掉的那 7 个一个都不在 |
-| `t_config.lua` | 31 | 本轮重构引入/删除的键: 死键静默丢弃 (不映射、不告警) / `merge` 不改调用方的表 / `source_apply_max_roots` 不再是配置键 / **重复 setup 不得打回默认值** (见 §2.14): 空参 `setup()` 后 `kotlin.jar_mode`·`log_level` 仍是用户值 / 第二次带参 setup 不丢上一次的键 / 新表产出且旧表不被就地改写 / 排除名单 append 语义未回归 |
+| `t_config.lua` | 37 | 本轮重构引入/删除的键: 死键静默丢弃 (不映射、不告警) / `merge` 不改调用方的表 / `source_apply_max_roots` 不再是配置键 / **重复 setup 不得打回默认值** (见 §2.14): 空参 `setup()` 后 `kotlin.jar_mode`·`log_level` 仍是用户值 / 第二次带参 setup 不丢上一次的键 / 新表产出且旧表不被就地改写 / 排除名单 append 语义未回归 / **合并结果不与 `M.defaults` 共享子表**, 就地改它不污染默认值 (标量+列表) |
 | `t_log.lua` | 54 | `util/log.lua`: 四档阈值比较 / `log.user` 绕过阈值 / 会话内 `once` 去重 / `once` 被阈值挡下时**不消费**登记 / 消息前缀 |
 | `t_path.lua` | 14 | `util/path.start_dir`: `nil`/`""` 归一成 cwd, 绝不能给 `"."` (§7 痛点 4 的根因) |
 | `t_proc.lua` | 10 | `util/proc`: `/proc/<pid>/cmdline` 必须**真的按 NUL 切开参数** (回归"一个 nvim 报 2 个 jdtls 实例") / `is_descendant` 自反与否定 |
@@ -1483,8 +1511,8 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_root_fallback.lua` | 22 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 |
 | `t_workspace.lua` | 31 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 | 
 
-合计 **242** 条断言 (上表各文件是带 `AOSPNAV_LIVE_TEST=1` 的行数; 默认跑法则
-`t_root_from_cwd` 13 / `t_source_apply` 22, 共 **229**)。
+合计 **248** 条断言 (上表各文件是带 `AOSPNAV_LIVE_TEST=1` 的行数; 默认跑法则
+`t_root_from_cwd` 13 / `t_source_apply` 22, 共 **235**)。
 
 `source_apply` 的分界是明的: `pending()` **不发任何请求** (纯读 `.classpath` + 算差集);
 发请求的只有 `add_serial` —— 手动经 `:Aosp!`, 或自动经 `source_apply.auto_apply()`

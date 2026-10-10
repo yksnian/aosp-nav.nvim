@@ -487,18 +487,4 @@ function M.ensure_script(extra)
   return path, nil
 end
 
---- 在指定 cwd 模拟 KLS 执行脚本 (诊断/验证用)
---- @param cwd string workspace root
---- @return table jars 冒号分割后的 jar 列表
-function M.dry_run(cwd)
-  local path = M.script_path()
-  local cmd = "cd " .. vim.fn.shellescape(cwd) .. " && bash " .. vim.fn.shellescape(path) .. " 2>/dev/null"
-  local out = vim.fn.system(cmd)
-  local jars = {}
-  for _, j in ipairs(vim.split(out, ":", { plain = true })) do
-    if j ~= "" then table.insert(jars, j) end
-  end
-  return jars
-end
-
 return M

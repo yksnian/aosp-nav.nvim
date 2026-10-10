@@ -382,16 +382,20 @@ end
 ---   重复 setup 时必须传**已生效的** M.config —— 否则一个空参 setup() (命令回调里
 ---   到处都是) 会把用户配置整体打回默认值: 实测 kotlin.jar_mode 配了 "all",
 ---   跑一次 :Aosp 就变回 "curated" (面板显示、日志阈值一起错)。
---- @return table 合并后的配置 (新表, 不改动 user_opts 与 base)
+--- @return table 合并后的配置 (新表; 与 user_opts / base / M.defaults **不共享任何子表**)
 function M.merge(user_opts, base)
   -- [v10] 在副本上丢弃旧键, 不改写调用方的表
   local opts = vim.deepcopy(user_opts) or {}
   drop_legacy_keys(opts)
-  base = base or M.defaults
+  -- [v11] base 也要深拷贝: tbl_deep_extend 把**没被 opts 覆盖的子表按引用共享**,
+  -- 于是 validate 的就地归一化 (cfg.java.mode="aosp") 会写进底表 —— base 是
+  -- M.defaults 时就等于污染了整个 session 的默认值 (实测 rawequal(config.java,
+  -- defaults.java) == true)。拷一份, "merge 不改输入"才是不变量而不是口号。
+  base = vim.deepcopy(base or M.defaults)
   local merged = vim.tbl_deep_extend("force", base, opts)
 
   -- 追加语义的参照表 = 底 (默认值, 或上次已生效的配置)
-  local j = base.java or M.defaults.java
+  local j = base.java
   if merged.java and merged.java.exclude_merge == "append" then
     for _, key in ipairs(EXCLUSION_LIST_KEYS) do
       local user_list = opts.java and opts.java[key]
