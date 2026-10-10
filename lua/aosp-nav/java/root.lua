@@ -19,6 +19,9 @@
 -- 模块的文件都换 workspace, 跨模块跳转只能落到反编译 jar。
 --
 -- 非 AOSP 工程: 本模块返回 nil, 插件不接管 root_dir, 原样交还用户配置。
+--
+-- 唯一的例外是**取不到根的反编译视图**: 它注定没有自己的根, 若照旧交还, LazyVim
+-- 会让 jdtls wrapper 拿 cwd 开一个新工作区 —— 见 M.reuse_root。
 
 local M = {}
 
@@ -80,10 +83,62 @@ function M.workspace_root(fname)
   return M.aosp_root(fname)
 end
 
+--- 最后的兜底: 常规取根 (AOSP 根 / 用户的 root_dir) 都答不上来时, 复用**已经在跑的
+--- 那台** jdtls, 而不是让 LazyVim 拿一个错位的默认工作区另起一台。
+---
+--- 为什么需要 —— 实测有**两条**独立的路会送来"没有自己的根、却带 java filetype"的
+--- 缓冲, 各自都攒过垃圾工作区:
+---   1. 跳进 jar 里的类: nvim-jdtls 的 open_classfile 开 `jdt://contents/…` 缓冲并把
+---      filetype 设成 java —— 这个赋值**同步**触发 LazyVim 的 FileType autocmd。
+---   2. Kotlin LS (mason 的 kotlin-language-server) 的反编译视图: kls 把反编译结果
+---      写到 `/tmp/kotlinlangserver…/Handler….java`, 定义跳转落在那个**普通路径**的
+---      缓冲上 (buftype="", 名字看着完全像个文件)。实测一天里 /tmp 就攒了 6 个
+---      kotlinlangserver 目录, 每跳一次一个。
+--- 两种情况下项目根都必然取不到。而 LazyVim 的 java extra 在 root_dir 为 nil 时
+--- **不传** -data/-configuration, mason 的 jdtls wrapper 于是拿默认值
+--- `~/.cache/jdtls/jdtls-<sha1(cwd 的 basename)>` 建工作区 (实测 cwd=$HOME 与
+--- cwd=~/.cache/jdtls 各中过一次), nvim-jdtls 再把 root_dir 兜成 `getcwd()`。
+--- 净效果: 每跳一次就多一台工作区错位、8G 堆、**不带任何 AOSP 配置**的 jdtls, 而且它
+--- 不共用 -data, 第 14 步的单实例自检根本看不见它 —— 只有 ps 能发现。
+---
+--- 判据刻意**不**去看缓冲是不是"虚拟"的: 上面第 2 条证明"看着像文件"不等于"有自己
+--- 的工程" —— 早先按 jdt:///buftype=nofile 设的那道闸就因此漏掉了 kls 这条。真正
+--- 该问的是"常规两条路有没有给出根": 既然都没给出, 这个缓冲就没有自己的根可言, 挂到
+--- 在跑的 workspace 里, jdt.ls 也只是把它放进 jdt.ls-java-project (invisible project),
+--- 与另起一台的结果相同, 却省掉一个 JVM。反过来, **没有** jdtls 在跑时一律返回 nil,
+--- 绝不干涉 LazyVim 起第一台。
+---
+--- 返回现有 client 的 root_dir **原样** (不做规整): Neovim 判复用是比 workspace
+--- folder 字面量, 自己拼一个"等价路径"反而不复用。
+--- @return string|nil root; nil = 没有可复用的 (照旧交还 LazyVim 的兜底)
+function M.reuse_root()
+  local clients = vim.lsp.get_clients({ name = "jdtls" })
+  if #clients == 0 then return nil end
+
+  local function root_of(c) return c.root_dir or (c.config and c.config.root_dir) end
+
+  -- 优先"上一个 buffer 挂着的那个" —— 它是这次跳转的出发方, 与 nvim-jdtls
+  -- open_classfile 挑 client 的口径一致; 挑不出来就退到最新的一台, 这种缓冲
+  -- 通常正是它取回来的。
+  local prev = vim.fn.bufnr("#", -1)
+  if prev and prev > 0 then
+    for _, c in ipairs(clients) do
+      if c.attached_buffers and c.attached_buffers[prev] and root_of(c) then
+        return root_of(c)
+      end
+    end
+  end
+  for i = #clients, 1, -1 do
+    if root_of(clients[i]) then return root_of(clients[i]) end
+  end
+  return nil
+end
+
 --- 包装用户原有的 root_dir, 交给 jdtls opts.root_dir 使用
 ---   "aosp"/"infer": AOSP 树内插件说了算, 树外回落用户语义 (string 或 function)
 ---   "project":      用户给了函数就用用户的 (保留其就近取根与客户端复用逻辑),
 ---                   否则按项目目录取根
+--- 两条路都答不上来时走 M.reuse_root 兜底 (反编译视图不能另起一台 jdtls)。
 --- 用户配置无需改动即可生效, 也不会影响非 AOSP 工程
 --- @param user_root string|function|nil 用户原本的 opts.root_dir
 --- @return function fn function(fname) -> string|nil
@@ -91,18 +146,19 @@ function M.jdtls_root_fn(user_root)
   return function(fname)
     local cfg = require("aosp-nav").config
     if cfg.java.mode == "project" then
-      return require("aosp-nav.java.projects").workspace_root_project(
+      local r = require("aosp-nav.java.projects").workspace_root_project(
         fname, user_root, M.aosp_root(fname))
+      return r or M.reuse_root()
     end
 
     local r = M.workspace_root(fname)
     if r then return r end
     if type(user_root) == "function" then
       local ok, v = pcall(user_root, fname)
-      if ok then return v end
-      return nil
+      if ok and v then return v end
+      return M.reuse_root()
     end
-    return user_root
+    return user_root or M.reuse_root()
   end
 end
 

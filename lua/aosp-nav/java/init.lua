@@ -505,6 +505,9 @@ function M.configure(opts)
     -- 14. 单实例自检。两个 jdtls JVM 共用同一个 -data 会互相覆盖索引与 .classpath,
     --     实测症状是 "Java Index broken - will be automatically deleted to repair"
     --     与索引被反复删除重建 —— 正是"索引不动"的一大来源。只提示, 不杀进程。
+    --     注意这里只能看见**共用同一 -data** 的那种; 不带 -data 的第二台
+    --     (~/.cache/jdtls/jdtls-<sha1>) 由 java/root.lua 的 reuse_root 从
+    --     源头挡掉 —— 见 DEVELOPMENT.md §2.13。
     local others = ui.foreign_jdtls(ws_dir)
     if #others > 0 and not _instances_warned[ws_dir or ""] then
       _instances_warned[ws_dir or ""] = true

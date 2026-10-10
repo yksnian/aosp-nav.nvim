@@ -534,7 +534,7 @@ AOSP 树内) 时, 退到**任一已加载且落在 AOSP 树内的 `.java` 缓冲
 | # | 场景 | 触发点 |
 | - | ---- | ------ |
 | 1 | 工作区里存在**活**的外部可见工程 (空壳已自清, §2.12); 仅在有 Gradle 下载证据时才追加 `:AospCleanWorkspace` 指引 | `java/init.lua:470` |
-| 2 | 有别的 jdtls 进程共用同一个 `-data` 目录 (索引互相覆盖, §8.1) | `java/init.lua:512` |
+| 2 | 有别的 jdtls 进程共用同一个 `-data` 目录 (索引互相覆盖, §8.1); 不带 `-data` 的那种第二台已由 §2.13 从源头挡掉, 走不到这里 | `java/init.lua:515` |
 | 3 | 破坏性的 `:AospCleanWorkspace` 确认 | `ui.lua:876` |
 | 4 | 自动注入源码根在耗尽重试预算后失败 (§2.9) | `java/source_apply.lua:454` |
 | 5 | 首次运行需同步扫描残留 Eclipse 目录 (排除项冷缓存, 数秒) | `java/import_exclusions.lua:160` |
@@ -638,6 +638,105 @@ argv 里带着这个 `-data`** (`util/proc.argv` 逐参数匹配, 不是子串�
 覆盖: `tests/t_workspace.lua` (31 条) —— 用临时目录造一个假工作区, 断言空壳判定的正反
 例 (含"名字只作为树里某条路径的片段出现仍算空壳"这个 `grep -x` 整行语义)、删除的越界
 防护、Gradle 证据的三种日志变体、以及持有者探测。
+
+### 2.13 取不到根的反编译视图会引出第二台 jdtls (`M.reuse_root` 兜底)
+
+**症状**: 同一个 nvim 下 `ps` 出现两台 jdtls —— 一台 `-data …/jdtls/aosp/workspace`
+(带 `-configuration`), 另一台 **既没有 `-configuration` 也没有我们那份 `-data`**, 而是
+`~/.cache/jdtls/jdtls-<sha1>`。2026-10-10 实测 (从 .kt 跳到一个只在 jar 里的类)。
+
+**链路 (每一环都有证据)**:
+
+1. 一个"背后没有自己的工程、却带 `filetype=java`"的缓冲被打开。**实测有两条独立的
+   路会送来它**, 第一条只堵住了一半, 是用户复测又攒出一个垃圾工作区才把第二条挖出来:
+
+   | 来源 | 缓冲名 | buftype |
+   | ---- | ------ | ------- |
+   | nvim-jdtls `open_classfile` (跳进 jar 里的类) | `jdt://contents/…` 或 jdt.ls 服务端的合成名 `/Handler882983541859431937.java` | `nofile` |
+   | **mason 的 kotlin-language-server 反编译视图** | `/tmp/kotlinlangserver…/Handler15214233643908894705.java` | `""` (**看着完全像个普通文件**) |
+
+   kls 那条的形状: 定义跳转落在 kls 写在 `/tmp` 的反编译结果上, 于是 LazyVim 的
+   FileType autocmd 照常为它启动 jdtls。实测一天里 `/tmp` 攒了 6 个
+   `kotlinlangserver*` 目录 (每跳一次一个)。
+2. `vim.bo[buf].filetype = "java"` 这个赋值**同步触发** LazyVim java extra 的
+   FileType autocmd → `attach_jdtls()`; 它和 `full_cmd()` 都用
+   `nvim_buf_get_name(0)` 调 `opts.root_dir`。
+3. 两条路的名字都注定取不到根: `jdt://` 不是路径, `/tmp/kotlinlangserver…/…java`
+   虽是真路径却在任何工程之外。于是 `root_mod.workspace_root` 与用户自己的
+   `root_pattern(".project", ".git")` 双双落空 (实测: `start_dir("jdt://…")` →
+   `jdt://contents/jar/android/os`, `start_dir("/Handler….java")` → `/`, 两者
+   `aosp_root` 均为 nil)。
+4. LazyVim 的 `full_cmd` 在 `project_name` 为 nil 时**既不传 `-data` 也不传
+   `-configuration`**; nvim-jdtls 随后把 `root_dir` 兜成 `vim.fn.getcwd()`
+   (`setup.lua:325`)。
+5. `-data` 缺席 → mason 的 jdtls python wrapper 用它自己的默认值
+   `~/.cache/jdtls/jdtls-<sha1(cwd 的 basename)>` (`jdtls.py:99`)。
+   **闭合验证两次**, 两次都靠 `sha1` 反查 cwd 的 basename 对上:
+   `sha1("yangwj12") == feb416b998b9c9b946d6d1bf6c8319eed8a3574e` (第一次, cwd=$HOME) 与
+   `sha1("jdtls") == 6577a689d38cf4eb6f3b1b0a9ab5863258a9a0b5` (第二次, cwd=`~/.cache/jdtls`)。
+   第二次的线索还来自那台垃圾 jdtls 自己的日志:
+   `Failed to create linked resource from file:///tmp/kotlinlangserver…/Handler….java
+   to jdt.ls-java-project` —— 它确实收到了这个缓冲的 `didOpen`, 正是 kls 那条路的铁证。
+
+**代价**: 一台 workspace 错位、8G 堆、**不带任何 AOSP 配置** (无 jar/sourcePaths/
+exclusions/gradle 禁用) 的 jdtls; 每跳一次攒一个 ~45 MB 的垃圾工作区 (实测一次攒到 8 个,
+共约 360 MB)。它**不共用 `-data`**, 所以第 14 步的单实例自检看不见它 —— 只有 `ps` 能发现。
+而那个缓冲本来就已经挂在正确的 client 上了 (jdt:// 那条由 `open_classfile` 的
+`buf_attach_client` 接管), 这台纯属白烧。
+
+**修法** (`java/root.lua`): `jdtls_root_fn` 的兜底链末尾接一个 `M.reuse_root()` ——
+常规两条路 (AOSP 根 / 用户的 `root_dir`) 都答不上来时, 返回**已在跑的那台 client 的
+`root_dir`**(哪个 client 见下), 于是:
+
+- LazyVim 能算出 `project_name`, 补上 `-data …/jdtls/aosp/workspace` 与 `-configuration`;
+- Neovim 的复用判据只比 **name + workspace folder 的 URI** (不比 cmd,
+  `vim/lsp.lua` 的 `reuse_client_default`) → 直接复用现有 client, **不再起 JVM**。
+  这也是为什么必须**原样**返回 `client.root_dir` 而不规整: URI 不一致就不复用。
+
+**判据刻意不看缓冲"像不像虚拟的"**。第一版按 `name 带 :// || buftype ~= ""` 设闸,
+被 kls 那条 (真路径 + `buftype=""`) 整个绕过 —— 用户的复测就是这么失败的。真正该问的是
+"常规两条路有没有给出根": 既然都没给出, 这个缓冲就没有自己的根可言; 挂到在跑的 workspace
+里, jdt.ls 也只是把它放进 `jdt.ls-java-project` (invisible project), 与另起一台结果相同,
+却省掉一个 JVM。反过来, **没有** jdtls 在跑时一律返回 nil, 绝不干涉 LazyVim 起第一台;
+而**有**自己的工程的文件 (含树外 `.git` 工程) 在更早的一步就被用户 `root_dir` 接走了,
+根本走不到兜底 —— 这是"不劫持"的真正保证, 由 `tests/t_root_fallback.lua` 第 3 组钉住。
+
+**这是一处刻意的语义变化, 值得知道**: 一个**没有任何工程标记** (无 `.git`/`.project`) 的
+本地 java 工程, 在已有 jdtls 在跑时也会被折进在跑的 workspace, 而不是像以前那样自成一
+个工作区。代价换的是"再也不会因为这个多起一台 8G JVM"; 真要独立工作区, 给工程加个标记
+即可 (那一步用户 `root_dir` 就会答上来)。
+
+多台 client 时优先"上一个 buffer 挂着的那个" (跳转的出发方, 与 nvim-jdtls
+`open_classfile` 挑 client 的口径一致), 挑不出来就用最新的一台; `config.root_dir` 里
+也有根的 client 同样认。实测确认 `client.attached_buffers` 在 0.12.5 里是真字段
+(`runtime/lua/vim/lsp/client.lua:1201` attach 时写入), 这条偏好不是死代码。
+
+三条**已知边界** (都不打算再堵, 记下来免得当成 bug 重查):
+
+1. 兜底的前提是"**已经在跑**一台 jdtls" —— 若这种反编译视图是本次会话的**第一个**
+   java 缓冲, 没有可复用的 client, 仍会起一台错位工作区的 jdtls。要根治得让那个缓冲
+   干脆不触发 jdtls (改 filetype 或 LazyVim 的 autocmd), 那已越出本插件的边界。
+2. 已经存在的**旧垃圾 server** (root_dir = `$HOME` 那种) 会被继续复用 —— 判据是
+   "复用现有 client", 不看它自己干不干净。这是刻意的: 复用比再起一台好。重启 nvim
+   后它就消失了。
+3. 复用之后, AOSP 工作区里 jdt.ls 会为这些树外缓冲建 fake CU, 日志里可能出现
+   `Failed to create linked resource from file:///tmp/kotlinlangserver…/…java to
+   jdt.ls-java-project` (`Resource '/jdt.ls-java-project/src/android/os' already exists`)
+   —— 因为 kls 反编译出的 `android.os.Handler` 与 jar 里的同名类在 invisible project 里
+   撞了同一个路径。**这是 jdt.ls 自己的噪声, 无害**, 与另起一台时它干的是同一件事。
+
+覆盖: `tests/t_root_fallback.lua` (22 条) —— 把 `vim.lsp.get_clients` 换成假 client,
+断言: 两条真实触发路径 (jdt:// 与 kls 的 `/tmp/…java`, 逐字取自实测) 都复用现有根 /
+无 client 时一律不接管 / **有 `.git` 的树外工程听用户的** / 树外无工程标记的真实文件
+也复用 (它没有可用的根) / 用户 `root_dir` 有结果时一律让位 / 用户函数抛错时不炸 /
+多台 client 的优先级 / 无根 client 跳过 / `mode="project"` 同样挡住。不启任何进程。
+
+> 写这条测试时踩过一个坑, 记下来免得再犯: 最初用
+> `require("lspconfig.util").root_pattern(...)` 当假 `root_dir`, 而 headless 测试的
+> rtp 里**没有 lspconfig** —— require 抛错被 `jdtls_root_fn` 的 `pcall` 吞掉,
+> "用户答不上来"与"用户答了"两种情况长得一模一样, 于是断言假通过 (旧版
+> `t_virtual_root.lua` 的"真实文件不劫持"那一组就是这么绿的)。现在用
+> `vim.fs.root` + `isdirectory` 自足实现, 并单独断言抛错的情形。
 
 ---
 
@@ -1345,10 +1444,11 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_root_from_cwd.lua` | 20 | 痛点 4 的**端到端**回归: 起在 AOSP 根、不打开任何 `.java` 文件时 `aosp_root(nil/"")` 仍拿到树根 (真树断言部分需 `AOSPNAV_LIVE_TEST=1`) |
 | `t_phase.lua` | 19 | `phase` 是活状态的冻结契约: `ui.statusline()` 对 `idle`/`ready`/`indexing`/`no-out`/`failed` 五态各自的渲染 (`indexing` 必须带 `(idx)`) / `install_phase_handler` **链式**调用原有 handler (不吞掉 nvim-jdtls 的 status 消息) / 只有 `ServiceReady` 翻牌, 其余 `ServiceStatus` 不动 / `no-out`/`failed` 不被覆盖 / `err` 非空不翻牌 / 非 jdtls client 不包装 |
 | `t_source_apply.lua` | 28 | `java/source_apply.lua`: `abs_of` 归一 / `installed` 解析 `.classpath` (去重、带 `excluding`、剥 `_/` 前缀、读不到返回 nil 而非空集) / 真机 `pending` 与磁盘 src 交集为 0 且有序 / 累积根"要么已装要么待装, 绝不丢弃" / 已装与待装不相交 / 非 core 模式拒绝 / `classify` 三类真实返回值 / 无 client 时 `auto()` 惰性 / `source_apply_auto=false` → `off` / `report()` 每会话只提示一次 |
+| `t_root_fallback.lua` | 22 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 |
 | `t_workspace.lua` | 31 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 | 
 
-合计 **207** 条断言 (上表各文件是带 `AOSPNAV_LIVE_TEST=1` 的行数; 默认跑法则
-`t_root_from_cwd` 13 / `t_source_apply` 22, 共 **194**)。
+合计 **229** 条断言 (上表各文件是带 `AOSPNAV_LIVE_TEST=1` 的行数; 默认跑法则
+`t_root_from_cwd` 13 / `t_source_apply` 22, 共 **216**)。
 
 `source_apply` 的分界是明的: `pending()` **不发任何请求** (纯读 `.classpath` + 算差集);
 发请求的只有 `add_serial` —— 手动经 `:Aosp!`, 或自动经 `source_apply.auto_apply()`
