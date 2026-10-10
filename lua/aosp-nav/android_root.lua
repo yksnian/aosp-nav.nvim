@@ -7,6 +7,8 @@
 -- 关键: android_root 必须自带 out 产物目录 (后续从 out/.soong/.intermediates 取 jar)
 local M = {}
 
+local path_util = require("aosp-nav.util.path")
+
 -- 兄弟子项目优先级 (文件不在自带 out 的子项目内时, 在顶层根下按此顺序查找)
 -- 越靠前越优先; 按需调整
 local sibling_project_order = {
@@ -23,11 +25,23 @@ function M.has_jar_source(dir)
     or vim.fn.isdirectory(dir .. "/out/target/common/obj/JAVA_LIBRARIES") == 1
 end
 
---- 根据当前打开文件路径, 识别它所属的 android 源码根目录
---- @param fname string 当前文件路径
+--- 根据当前打开文件 (或目录) 路径, 识别它所属的 android 源码根目录
+--- @param fname string|nil 文件路径或目录路径 (nil/空 = 用 cwd)
+--- @param opts table|nil { sibling = false } 关闭兄弟子项目回退 (见下)
 --- @return string|nil android_root 路径, nil 表示未找到
-function M.find_android_platform_root(fname)
-  local path = fname and vim.fs.dirname(fname) or vim.fn.getcwd()
+function M.find_android_platform_root(fname, opts)
+  -- sibling = false: 只认文件真实祖先里带 out/ (或 main.mk / .repo) 的那一层,
+  -- 不再回退到兄弟子项目。取 jar 时兄弟回退是对的 (厂商目录自身不编译, jar
+  -- 在兄弟项目里), 但当"工作区根"用就错了 —— 会把 jdtls 的 workspace 指到
+  -- 一个根本不含当前文件的树。java/root.lua 走这个分支。
+  local allow_sibling = not (opts and opts.sibling == false)
+  -- 起点归一 (见 util/path.lua): nil/"" -> cwd, 目录 -> 自身, 文件 -> 其目录。
+  -- 这些分支缺一不可 —— 空串在 Lua 里为真, 旧写法 `fname and dirname(fname)
+  -- or getcwd` 会把无文件启动的 "" 变成 dirname("") == "."。同时显式支持
+  -- "直接把 AOSP 根目录作为起点"(从根目录打开): 此时 fname 是目录而非文件。
+  -- 绝对化后循环里的 :h 上溯与 "/" 终止判定才可靠。
+  local path = vim.fn.fnamemodify(path_util.start_dir(fname), ":p"):gsub("/+$", "")
+  if path == "" then path = "/" end
 
   -- fallback 候选, 越靠后越弱
   local fallback_mk = nil    -- build/make/core/main.mk 存在 = android 源码根 (可能未编译)
@@ -54,7 +68,7 @@ function M.find_android_platform_root(fname)
   -- 走到顶层都没找到带 out 的根 (典型: 在 AOSP同级的目录下由ODM或者厂商拓展的代码目录下打开 , 自身无 out)
   -- 在最近的顶层根下, 按优先级查找兄弟子项目
   local top = fallback_mk or fallback_repo
-  if top then
+  if top and allow_sibling then
     for _, sub in ipairs(sibling_project_order) do
       local cand = top .. "/" .. sub
       if M.has_jar_source(cand) then
