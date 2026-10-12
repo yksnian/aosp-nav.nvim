@@ -151,6 +151,7 @@ For unbuilt projects — e.g. you have multiple Android checkouts, some built an
 | ------- | ------------ |
 | `:Aosp` | Open the info panel (session status + diagnostics + injected source roots, merged into one scratch buffer) |
 | `:Aosp!` | Force-apply every accumulated source root, past the automatic per-session cap |
+| `:AospDebug` (or `!`) | Live GC / heap / threads of the running jdtls, read from the JVM itself (`:AospDebug!` also writes a thread dump) |
 | `:AospRescan [dir]` | Invalidate the jar cache, rescan, and refresh `import.exclusions` |
 | `:AospCleanWorkspace` (or `!`) | Delete the jdtls/Eclipse workspace dir so it re-imports (destructive; `:AospCleanWorkspace!` skips the confirmation) |
 | `:AospCollectJars` | Collect AOSP jars into the fallback dir |
@@ -159,12 +160,26 @@ For unbuilt projects — e.g. you have multiple Android checkouts, some built an
 
 One panel with two sections:
 
-- **diagnostics** — a checklist, each row marked `v`/`!` with a suggested next action: plugin version / jdtls clients and their root_dir / whether the JVM `-Xmx` looks adequate (by value, not by string) / `referencedLibraries` count / whether `java.project.sourcePaths` was injected (expected when `mode == "aosp"`; the row is a failure if it is missing there) / `java.import.exclusions` count / gradle+maven disabled / AOSP root and workspace root with the active mode / session phase / jar cache freshness / stale Eclipse blockers / jdtls workspace directory and the "jdtls index" row / Kotlin script ownership and KLS client count / whether a foreign jdtls shares the same `-data`.
+- **diagnostics** — a checklist, each row marked `v`/`!` with a suggested next action: plugin version / jdtls clients and their root_dir / `referencedLibraries` count / whether `java.project.sourcePaths` was injected (expected when `mode == "aosp"`; the row is a failure if it is missing there) / `java.import.exclusions` count / gradle+maven disabled / AOSP root and workspace root with the active mode / session phase / jar cache freshness / stale Eclipse blockers / jdtls workspace directory and the "jdtls index" row / Kotlin script ownership and KLS client count / whether a foreign jdtls shares the same `-data` and who owns it (`nvim <pid>`, or an orphan). **The JVM `-Xmx` check is not here** — it moved to `:AospDebug` (below), which reads the live process instead of the launch command.
 - **source roots** — every source root currently injected into `java.project.sourcePaths`: the configured core set (with an `x` marking entries that exist on disk), and for each accumulated project its roots in LRU order. Useful when navigation lands in an unexpected implementation of a duplicated class.
 
 Run it first when something is off.
 
 `phase` is a live state: `idle` (nothing configured yet) / `indexing` (AOSP tree, jars found, jdt.ls still importing and building — the statusline shows `AOSP:n(idx)`) / `ready` (jdt.ls reported `ServiceReady`) / `no-out` (AOSP tree has no build output, running off the fallback dir) / `failed` (non-AOSP file).
+
+### :AospDebug
+
+Reports what the **running** jdtls is actually doing, read straight from the JVM with `jcmd`
+(read-only): heap, GC and threads. `:Aosp` shows what your launch command says — a correct
+`-Xmx` there is not evidence that the process is healthy.
+
+- **what it shows** — pid and the `jcmd` binary used / uptime / RSS and thread count / GC policy and the share of uptime spent in GC / young and full GC counts with their real average interval / promotion per young GC / young and old generation used-committed-max / the live set measured at the last full GC / the verbatim `GC.heap_info` / `vm flags`.
+- **what it checks** — the `-Xmx` in the launch command (by value; this row moved here from `:Aosp`), plus the live pathologies: a young generation the adaptive size policy squeezed far below the heap, GC eating the wall clock, a full GC every few seconds, a live set that will not fit the old generation, RSS above `-Xmx`.
+- **verdicts** flag only what needs action; "elevated but normal while importing" shapes are listed separately, each with a concrete suggestion.
+- **`:AospDebug!`** additionally writes a thread dump to `~/.cache/nvim/aosp_nav/` and tells you the path — use it when the UI looks stuck; read the file afterwards instead of holding nvim hostage.
+- **per tree** — the header names the tree and its `-data`, so with two AOSP checkouts in one session you know which one is reported.
+- **no jdtls** — one line saying so, plus the reason when the JVM, `jcmd` or `/proc` cannot be read.
+- **read-only** — never writes to the jdtls workspace; the thread dump goes to the plugin's own cache dir.
 
 ### :Aosp!
 
@@ -246,6 +261,7 @@ Collects jars from a built project's `out/` directory into the fallback dir (`~/
 | java.import_exclusions            | {}                                                           | Extra jdt.ls glob patterns, appended after the defaults; a leading `!` negates (order matters) |
 | java.import_exclusions_scan       | true                                                         | Background-scan the source tree for stale `.project`+`.classpath` dirs and exclude them automatically |
 | java.import_exclusions_ttl        | 604800                                                       | Scan-cache lifetime (seconds); ≤0 = never expires, rescan only via `:AospRescan` |
+| java.kill_orphan_jdtls            | true                                                         | SIGTERM the jdtls JVM left behind by a dead nvim (it still holds your `-data`, so every later session fights it for the index). Only kills one that is both truly orphaned and pointed at this plugin's cache root; `false` = report only |
 | java.inlay_hints_mode             | auto                                                         | auto = forced off with jars / all without, or off/all        |
 | kotlin.enabled                    | true                                                         | Enable the kotlin sub-module (KLS)                           |
 | kotlin.jar_mode                   | curated                                                      | curated = core modules only, all = everything (experimental) |

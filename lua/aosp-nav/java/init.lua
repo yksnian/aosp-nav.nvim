@@ -360,7 +360,9 @@ function M.configure(opts)
         callback = function(args)
           local c = vim.lsp.get_client_by_id(args.data.client_id)
           if c and c.name == "jdtls" then
-            require("aosp-nav.java.source_apply").attach()
+            -- 传 client: 存量补注入是**每棵树**一次, 不是每会话一次 (多树会话里
+            -- 后挂的那棵树否则永远等不到)
+            require("aosp-nav.java.source_apply").attach(c)
           end
         end,
       })
@@ -502,24 +504,42 @@ function M.configure(opts)
       log.user(msg, { id = "blockers:" .. root_path, timeout = 20000 })
     end
 
-    -- 14. 单实例自检。两个 jdtls JVM 共用同一个 -data 会互相覆盖索引与 .classpath,
-    --     实测症状是 "Java Index broken - will be automatically deleted to repair"
-    --     与索引被反复删除重建 —— 正是"索引不动"的一大来源。只提示, 不杀进程。
-    --     注意这里只能看见**共用同一 -data** 的那种; 不带 -data 的第二台
-    --     (~/.cache/jdtls/jdtls-<sha1>) 由 java/root.lua 的 reuse_root 从
-    --     源头挡掉 —— 见 DEVELOPMENT.md §2.13。
-    local others = ui.foreign_jdtls(ws_dir)
-    if #others > 0 and not _instances_warned[ws_dir or ""] then
+    -- 14. jdtls 实例自检。三个形态共用**一次** /proc 扫描 (ui.jdtls_inventory):
+    --     a) **回收孤儿**。上一个 nvim 崩了 / 被 kill -9 / 终端被关, 它拉起的 jdtls
+    --        会被 init 收养, 一直占着 -data —— 于是之后**每个**新会话都撞上"两个
+    --        jdtls 抢一份索引"。孤儿没有任何会话拥有它, 是纯垃圾: 与第 13(a) 步的
+    --        空壳自清同构 ("不可逆" 改 "可自愈"), 只是对象从磁盘文件换成进程。
+    --        安全闸两条 (都在 ui.reap_orphan_jdtls 里): 必须真的是孤儿 (ppid 链走到
+    --        init 都没有 nvim), 且 -data 必须落在本插件缓存根之下 —— 别的编辑器也
+    --        用 jdtls, 只认"孤儿"就杀等于越界。
+    --        跑在 client 启动**之前**, 赶在两个 JVM 打架之前清场; 杀掉后等它落完
+    --        最后一份索引 (上限 3 秒) 再继续。
+    --     b) 剩下的**有主**重复 (真开了两个 nvim) —— 报给用户, 只提示不杀。
+    --     c) **走失 JVM** (§2.13: 取不到根的缓冲引出的那台, -data 落在
+    --        ~/.cache/jdtls/ 而不是我们这份) —— 只报, 连删都不删 (它可能压根不属于
+    --        本插件这条链)。它不共用我们的 -data, 所以 (a)(b) 都看不见它。
+    --     自动做掉的事不单独通知 (见 DEVELOPMENT §2.10): 报告文本由
+    --     ui.instances_message 生成, 无话可说时返回 nil。
+    local inv = ui.jdtls_inventory()
+    local reaped = ui.reap_orphan_jdtls(inv,
+      { enabled = java_cfg.kill_orphan_jdtls ~= false })
+    if #reaped > 0 then
+      log.debug("reaped orphan jdtls (SIGTERM): " .. table.concat(reaped, ", "))
+    end
+    local strays = {}
+    for _, r in ipairs(inv) do
+      if ui.is_stray(r) then strays[#strays + 1] = r end
+    end
+    local msg = ui.instances_message({
+      ws_dir = ws_dir,
+      holders = ui.foreign_jdtls(ws_dir, inv),
+      strays = strays,
+      reaped = reaped,
+    })
+    if msg and not _instances_warned[ws_dir or ""] then
       _instances_warned[ws_dir or ""] = true
-      -- must-see 情况 #2: 外部 jdtls 共用同一 -data 目录
-      log.user(("%d jdtls process(es) (pid %s) are already using the same data directory:\n"
-        .. "  %s\n"
-        .. "Two JVMs sharing one index overwrite each other (symptoms: the index is "
-        .. "repeatedly deleted and rebuilt, Java Index broken).\n"
-        .. "Keep only one: close the other nvim, or kill these pids and run "
-        .. ":AospCleanWorkspace to rebuild.")
-        :format(#others, table.concat(others, ", "), ws_dir or "?"),
-        { id = "instances:" .. (ws_dir or "?"), timeout = 20000 })
+      -- must-see 情况 #2: 外部 jdtls 共用同一 -data 目录 / 走失 JVM
+      log.user(msg, { id = "instances:" .. (ws_dir or "?"), timeout = 20000 })
     end
   end
 

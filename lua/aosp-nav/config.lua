@@ -94,6 +94,14 @@ M.defaults = {
     import_exclusions_enabled = true,
     import_exclusions_scan = true,
     import_exclusions_ttl = 604800,
+    -- [v10] 启动时 SIGTERM 掉**孤儿** jdtls。孤儿 = 上一个 nvim 崩了/被 kill -9/
+    -- 终端被关之后, 被 init 收养、还一直占着同一份 -data 的那个 JVM —— 不收拾它,
+    -- 之后每个新会话都撞上"两个 jdtls 抢一份索引"(索引被反复删除重建)。
+    -- 没有任何会话拥有它, 所以这是纯垃圾; 与空壳工程自清 (java/init.lua 第 13a 步)
+    -- 同一个道理: 能自动做掉的事就自动做掉, 不留一条要用户手动 kill 的消息。
+    -- 安全闸在 ui.reap_orphan_jdtls: 只杀"确实是孤儿"**且** -data 在本插件缓存根
+    -- 之下的; 别的编辑器也用 jdtls, 缺了任何一条都不动它。设 false 关掉。
+    kill_orphan_jdtls = true,
     -- [v10] 单一模式键 (取代旧的 workspace_mode + source_paths_mode 组合):
     --   "aosp" (默认) = 工作区根是 AOSP 根 **且** 注入 sourcePaths (预置核心集
     --     + 按打开项目累积)。跨模块跳转落到可编辑的真实 .java。

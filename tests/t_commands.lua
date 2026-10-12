@@ -1,13 +1,15 @@
--- t_commands.lua: 命令面 10 -> 4 的冻结契约。
--- 保留: :Aosp / :AospRescan / :AospCleanWorkspace / :AospCollectJars
+-- t_commands.lua: 命令面 10 -> 4 的冻结契约, 后加 :AospDebug 变 5 (2026-10-10)。
+-- 保留: :Aosp / :AospDebug / :AospRescan / :AospCleanWorkspace / :AospCollectJars
 -- 删除: :AospStatus :AospDiagnostics :AospSourceRoots :AospApplySourceRoots
 --       :AospImportExclusions :AospKlsClasspath :AospKillOrphanKls
+-- :AospDebug 是唯一一次例外, 理由写在 plugin/aosp-nav.lua 头部 (活进程维度,
+-- 不能折进 :Aosp 的 bang)。
 local here = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h")
 local PLUGIN = vim.fn.fnamemodify(here .. "/..", ":p"):gsub("/$", "")
 vim.opt.runtimepath:prepend(PLUGIN)
 local H = dofile(here .. "/helper.lua")
 
-local EXPECTED = { "Aosp", "AospRescan", "AospCleanWorkspace", "AospCollectJars" }
+local EXPECTED = { "Aosp", "AospDebug", "AospRescan", "AospCleanWorkspace", "AospCollectJars" }
 local DELETED = {
   "AospStatus",
   "AospDiagnostics",
@@ -34,7 +36,7 @@ for _, name in ipairs(DELETED) do
   H.check(cmds[name] == nil, "命令 :" .. name .. " 已删除")
 end
 
--- 恰好四个 Aosp* 命令
+-- 恰好五个 Aosp* 命令
 local aosp = {}
 for name in pairs(cmds) do
   if name:match("^Aosp") then aosp[#aosp + 1] = name end
@@ -42,8 +44,11 @@ end
 table.sort(aosp)
 local want = vim.deepcopy(EXPECTED)
 table.sort(want)
-H.eq(#aosp, 4, "恰好 4 个 Aosp* 命令 (实际 " .. #aosp .. ": " .. table.concat(aosp, ", ") .. ")")
+H.eq(#aosp, 5, "恰好 5 个 Aosp* 命令 (实际 " .. #aosp .. ": " .. table.concat(aosp, ", ") .. ")")
 H.eq(table.concat(aosp, ","), table.concat(want, ","),
-  "Aosp* 命令集合恰为四个预期命令")
+  "Aosp* 命令集合恰为五个预期命令")
+-- :AospDebug 必须是 bang 命令 (无 bang = 快照, 有 bang = 落 thread dump)
+H.check(cmds.AospDebug and cmds.AospDebug.bang == true, ":AospDebug 支持 bang")
+H.check(cmds.Aosp and cmds.Aosp.bang == true, ":Aosp 支持 bang (强制注入源码根)")
 
 H.finish("t_commands")

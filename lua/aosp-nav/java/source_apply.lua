@@ -88,10 +88,34 @@ local function now_ms()
   return vim.uv.now()
 end
 
---- 第一个 jdtls 实例 (增量注入只对活着的 server 有意义)
+--- 该文件所属的 jdtls 实例 (增量注入只对活着的 server 有意义)。
+--- **必须按 buffer 选**: 一个 nvim 会话里可以同时挂两棵 AOSP 树 (两个 root_dir ->
+--- 两个 jdtls)。取 [1] 会把我们替 X 树算出的路径发给 Y 树的 server —— 那些 URI 不在
+--- 它的 workspace 之内, addToSourcePath 只会失败 (旧实现正是如此)。
+--- 取不到 (缓冲没挂 jdtls / 无缓冲) 时退回任意一台: 与旧行为一致, 不会更差。
+--- @param fname string|nil 缺省用当前缓冲
 --- @return table|nil
-function M.client()
+function M.client(fname)
+  fname = (fname and fname ~= "") and fname or vim.api.nvim_buf_get_name(0)
+  if fname ~= "" then
+    local bufnr = vim.fn.bufnr(fname)
+    if bufnr and bufnr > 0 then
+      local c = vim.lsp.get_clients({ name = "jdtls", bufnr = bufnr })[1]
+      if c then return c end
+    end
+  end
   return vim.lsp.get_clients({ name = "jdtls" })[1]
+end
+
+--- client -> 分区键。用 workspace 根: 它跨 :LspRestart 稳定 (client id 每次都变),
+--- 且天然按树分区 —— 下面这些"每会话一次"的标记因此变成"每棵树一次", 这才是它们
+--- 真正想表达的意思。取不到 root_dir 时退回 client id (至少能区分不同实例)。
+--- @param client table
+--- @return string
+local function client_key(client)
+  local root = client and (client.root_dir or (client.config and client.config.root_dir))
+  if root and root ~= "" then return root end
+  return client and ("client:" .. tostring(client.id)) or "?"
 end
 
 --- 服务端是否已经忙完 (可以安全注入)。
@@ -312,19 +336,30 @@ end
 
 --- 正在跑的一批 (累积钩子与 attach 钩子可能同时到, 没有它会同批跑两遍:
 --- 两边的 pending 都从同一份旧 .classpath 算出来, 于是重复下发 + 提示重复)。
-local _running = false
+--- 按 client 分区: 两棵树的批次互不阻塞, 同树的两路钩子仍然合并。
+--- @type table<string, boolean>
+local _running = {}
 
--- [v10] 本会话自动路径是否已经成功注入过一次。成功一次后**不再自动注入** ——
--- 一次注入就是一次全量 classpath 重建 + 工程索引重算 (实测), 每会话一次封顶。
+-- [v10] 自动路径是否已经成功注入过一次。成功一次后**不再自动注入** ——
+-- 一次注入就是一次全量 classpath 重建 + 工程索引重算 (实测), 每次封顶。
 -- 剩下没处理完的 pending 已在累积文件里持久化, 下个会话或用户手动 :Aosp! 处理。
-local _applied_ok = false
+-- 按 client 分区 (= 按树): "本会话"在单树下与"本树"等价, 多树下才是对的意思 ——
+-- 否则 A 树注入成功后 B 树的自动路径直接收工, 永远等不到。
+-- @type table<string, boolean>
+local _applied_ok = {}
 
--- 有界轮询状态 (取代旧的墙钟 RETRY 循环)
-local _poll_armed = false     -- 已排一次 vim.defer_fn 轮询
-local _deadline = 0           -- 自动路径的总预算截止 (单调 ms; 0 = 未开始)
+-- 有界轮询状态 (取代旧的墙钟 RETRY 循环), 同样按 client 分区
+local _poll_armed = {}        -- 已排一次 vim.defer_fn 轮询
+local _deadline = {}          -- 自动路径的总预算截止 (单调 ms; nil = 未开始)
 
--- 每个会话至多提示一次自动失败 (M.report 的闸)
-local _auto_reported = false
+-- 每棵树至多提示一次自动失败 (M.report 的闸)
+local _auto_reported = {}
+
+-- attach 后的首次探测是否已排过 (按 client 分区)。
+-- 顺带修掉一个早先的疏漏: 旧代码里 `_attach_done` 从没声明过, 直接写成了**全局变量**
+-- (Lua 不报错, 于是它成了整个 nvim 会话里唯一的标志)。
+-- @type table<string, boolean>
+local _attach_done = {}
 
 -- 汇总一行 (manual 直接回报, auto 走 debug / 失败重试)
 --- @param s table
@@ -344,17 +379,19 @@ end
 --- @param batch table 本批要注入的相对路径
 --- @param tag string "manual" | "auto"
 --- @param deferred number|nil 因自动上限被推迟到下个会话的条数 (仅日志用)
+--- @param fname string|nil 触发这次注入的文件 (重试时用它锁定同一棵树)
 --- @return boolean started false = 已有一批在跑
-local function start(client, aosp_root, batch, tag, deferred)
-  if _running then return false end
-  _running = true
+local function start(client, aosp_root, batch, tag, deferred, fname)
+  local key = client_key(client)
+  if _running[key] then return false end
+  _running[key] = true
   if log.enabled("debug") then
     log.debug(("%s: adding %d source root(s) to the running jdtls workspace%s")
       :format(tag, #batch,
         (deferred and deferred > 0) and (", %d deferred to next session"):format(deferred) or ""))
   end
   add_serial(client, aosp_root, batch, function(s)
-    _running = false
+    _running[key] = nil
     if tag == "manual" then
       -- 用户敲的命令: 照实回报 (成功后是 log.info)
       if s.failed > 0 then
@@ -368,9 +405,9 @@ local function start(client, aosp_root, batch, tag, deferred)
     -- 失败则在预算内静默重试, 预算耗尽才由 M.report 出声一次。
     log.debug(summarize(s))
     if s.failed == 0 then
-      _applied_ok = true
+      _applied_ok[key] = true
     else
-      M.auto_apply()
+      M.auto_apply({ fname = fname })
     end
   end)
   return true
@@ -380,17 +417,18 @@ end
 --- @param opts table|nil { force = boolean }
 function M.apply(opts)
   opts = opts or {}
-  if _running then
-    log.info("an incremental apply is already running")
-    return
-  end
-  local client = M.client()
+  local fname = (opts.fname and opts.fname ~= "") and opts.fname
+    or vim.api.nvim_buf_get_name(0)
+  local client = M.client(fname)
   if not client then
     log.warn("no running jdtls client; start one and retry")
     return
   end
+  if _running[client_key(client)] then
+    log.info("an incremental apply is already running")
+    return
+  end
 
-  local fname = vim.api.nvim_buf_get_name(0)
   local pending, err = M.pending(fname)
   if not pending then
     log.warn("cannot apply source roots incrementally: " .. err)
@@ -416,7 +454,7 @@ function M.apply(opts)
     return
   end
 
-  start(client, aosp_root, pending, "manual")
+  start(client, aosp_root, pending, "manual", nil, fname)
 end
 
 -- ---------------------------------------------------------------------------
@@ -429,36 +467,43 @@ end
 -- ---------------------------------------------------------------------------
 
 --- 有界排一次轮询。true = 已排 (或正在排) 一次; false = 放弃 (成功过 / 已到 deadline)。
+--- @param key string client 分区键
+--- @param fname string|nil 轮询回来时继续锁定的文件
 --- @return boolean
-local function arm_poll()
-  if _applied_ok or _running then return false end
-  if _poll_armed then return true end
-  if _deadline == 0 then _deadline = now_ms() + AUTO_DEADLINE_MS end
-  if now_ms() >= _deadline then return false end
-  _poll_armed = true
+local function arm_poll(key, fname)
+  if _applied_ok[key] or _running[key] then return false end
+  if _poll_armed[key] then return true end
+  if not _deadline[key] then _deadline[key] = now_ms() + AUTO_DEADLINE_MS end
+  if now_ms() >= _deadline[key] then return false end
+  _poll_armed[key] = true
   vim.defer_fn(function()
-    _poll_armed = false
-    M.auto_apply()
+    _poll_armed[key] = nil
+    M.auto_apply({ fname = fname })
   end, POLL_MS)
   return true
 end
 
---- 自动路径没能完成时的**唯一**一次提示 (每个会话最多一次)。
+--- 自动路径没能完成时的**唯一**一次提示 (每棵树最多一次)。
 --- must-see 情况 #4: 自动源码根注入在重试预算耗尽后仍失败 —— 这条必须让用户
 --- 看见 (默认阈值降到 warn 后, 旧代码里 INFO 的失败提示会彻底消失)。
 --- @param status string
 --- @param detail any
-function M.report(status, detail)
-  if _auto_reported then return end
-  _auto_reported = true
+--- @param key string client 分区键
+function M.report(status, detail, key)
+  key = key or "?"
+  if _auto_reported[key] then return end
+  _auto_reported[key] = true
+  -- id 也带上 key: util/log 的 _seen 是按 id 全局去重的, 固定 id 会把第二棵树的
+  -- 那条静默吞掉 —— 而 :Aosp! 只作用于当前 buffer 所在的那棵树, 两棵树各说一次
+  -- 才是可行动的。
   log.user(("could not add the pending source roots automatically (%s%s).\n"
     .. "Run :Aosp! to add them by hand — no workspace rebuild needed.")
     :format(status, detail and (": " .. tostring(detail)) or ""),
-    { level = "warn", id = "source-apply-failed", timeout = 12000 })
+    { level = "warn", id = "source-apply-failed:" .. key, timeout = 12000 })
 end
 
 --- 试一次自动注入。任何"现在做不了"的情况都只是返回状态, 由 auto_apply 决定是否轮询。
---- @param opts table|nil { force = boolean }
+--- @param opts table|nil { fname = string|nil 触发文件 (缺省用当前缓冲) }
 --- @return string status
 ---   "started"|"none"|"off"|"busy"|"done"|"not-ready"|"no-client"|"unknown"
 --- @return any detail
@@ -467,16 +512,19 @@ function M.auto(opts)
   local j = cfg().java
   -- 非 aosp 模式 (infer/project, 不注入) / 用户关掉自动: 不是错误, 静默
   if j.source_apply_auto == false or j.mode ~= "aosp" then return "off" end
-  -- 本会话已成功注入过一次: 自动路径收工 (R2b)
-  if _applied_ok then return "done" end
-  local client = M.client()
+  local fname = (opts.fname and opts.fname ~= "") and opts.fname
+    or vim.api.nvim_buf_get_name(0)
+  -- 一律由**触发文件**推出树与 client: 去抖/轮询窗口里用户可能已经切到另一棵树
+  local client = M.client(fname)
   if not client then return "no-client" end
+  local key = client_key(client)
+  -- 这棵树已成功注入过一次: 自动路径收工 (R2b)
+  if _applied_ok[key] then return "done" end
   -- 已经有一批在跑: 两者的 pending 是同一份旧 .classpath 算出来的, 再来一遍纯属重复
-  if _running then return "busy" end
+  if _running[key] then return "busy" end
   -- 就绪门控: 等 server 忙完 (导入/建索引) 再动手, 而不是等固定墙钟
   if not ready(client) then return "not-ready" end
 
-  local fname = vim.api.nvim_buf_get_name(0)
   local pending, err, code = M.pending(fname)
   if not pending then
     -- not-aosp: auto 挂在任意 java 文件的 attach 上, 非 AOSP 树是常态, 静默。
@@ -499,32 +547,53 @@ function M.auto(opts)
     deferred = #pending - cap
   end
 
-  start(client, aosp_root, batch, "auto", deferred)
+  start(client, aosp_root, batch, "auto", deferred, fname)
   return "started"
 end
 
 --- 自动路径的统一入口: 现在做不了就**有界**轮询, 到 deadline 才提示一次。
---- @param opts table|nil { force = boolean }
+--- @param opts table|nil { force = boolean, fname = string|nil }
 function M.auto_apply(opts)
-  local status, detail = M.auto(opts)
+  opts = opts or {}
+  -- fname 只解析一次: 轮询窗口里用户可能切到别的缓冲/别的树, 整条链 (选 client、
+  -- 算 pending、记账、提示) 必须锁定同一个文件, 否则会张冠李戴。
+  local fname = (opts.fname and opts.fname ~= "") and opts.fname
+    or vim.api.nvim_buf_get_name(0)
+  local status, detail = M.auto({ fname = fname, force = opts.force })
   if status == "started" or status == "none" or status == "off"
       or status == "busy" or status == "done" then
     return status
   end
   -- not-ready / no-client / unknown: 有界轮询 (等待 server 就绪)。
   -- toomany 已不复存在 —— 自动路径改为"截断 + 推迟", 不再拒绝。
-  if arm_poll() then return "retry" end
-  M.report(status, detail)
+  local key = client_key(M.client(fname))
+  if arm_poll(key, fname) then return "retry" end
+  M.report(status, detail, key)
   return status
 end
 
 --- jdtls attach 后试一次: 覆盖"上次会话攒下、这次还没注入"的存量。
---- 每个会话只做一次。这里只安排**首次探测**; 真正的动手与否由就绪门控决定
---- (旧代码 3 秒定时器会在 jdtls 仍导入时出手)。
-function M.attach()
-  if _attach_done then return end
-  _attach_done = true
+--- **每棵树**只做一次 (旧实现是每个会话一次 -> 多树下后挂的那棵树永远等不到)。
+--- 这里只安排**首次探测**; 真正的动手与否由就绪门控决定 (旧代码 3 秒定时器会在
+--- jdtls 仍导入时出手)。
+--- @param client table|nil LspAttach 拿到的那台 jdtls
+function M.attach(client)
+  client = client or M.client()
+  local key = client_key(client)
+  if _attach_done[key] then return end
+  _attach_done[key] = true
   vim.defer_fn(function() M.auto_apply() end, 1000)
 end
+
+--- 测试钩子: 查询/设置某棵树的"已成功自动注入过"标记。
+--- (分区语义无法用真 jdtls 之外的途径观察, repo 既有惯例见 M._classify)
+--- @param root string aosp 根
+--- @return boolean
+function M._is_applied(root) return _applied_ok[root] == true end
+
+--- 测试钩子: 见 M._is_applied
+--- @param root string
+--- @param v boolean|nil
+function M._set_applied(root, v) _applied_ok[root] = v or nil end
 
 return M

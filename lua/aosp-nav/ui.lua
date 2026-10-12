@@ -7,9 +7,11 @@
 -- 在工作区被污染时自动调用, 判据见 M.orphan_project —— 只有确认是空壳、且没有
 -- JVM 持有该 -data 时才动)。
 --
--- 命令面已收敛为 4 个 (:Aosp / :AospRescan / :AospCleanWorkspace /
+-- 命令面为 5 个 (:Aosp / :AospDebug / :AospRescan / :AospCleanWorkspace /
 -- :AospCollectJars, 见 plugin/aosp-nav.lua)。:Aosp 打开**一个**信息面板 =
--- diagnostics + source-roots 两块 (M.panel); status() 是给 statusline 的公开 API。
+-- diagnostics + source-roots 两块 (M.panel); :AospDebug 打开**活进程**面板
+-- (M.debug_panel —— jcmd 直读正在跑的 jdtls, 见 util/jvm_live.lua);
+-- status() 是给 statusline 的公开 API。
 
 local M = {}
 
@@ -136,7 +138,9 @@ local function source_root_counts(fname)
     local pend = sa.pending(bufname)
     return { view = "disk", installed = #installed, pending = pend and #pend or 0, ws_dir = ws_dir }
   end
-  local st = require("aosp-nav.java.source_inject").state()
+  -- 内存账本也要按**当前 buffer 的树**取: 全局账本在多树会话里会混进另一棵树的项目
+  local st = require("aosp-nav.java.source_inject").state(
+    require("aosp-nav.java.root").aosp_root(bufname))
   return { view = "memory", installed = st.installed, pending = st.pending, ws_dir = ws_dir }
 end
 
@@ -160,19 +164,12 @@ function M.diagnose()
     if not rd or rd == "" then rd = c.config and c.config.root_dir end
     lines[#lines + 1] = line("jdtls",
       ("%d client(s), root=%s, id=%d"):format(#clients, tostring(rd), c.id), true)
-    -- vmargs (只读, 本插件从不写)。判据是堆**够不够**, 不是"-Xmx 串在不在" ——
-    -- 实测 -Xmx6G 在 AOSP 全量下会 GC 死亡螺旋 (存活集 4G 正好等于 old gen),
-    -- 旧版只查字符串存在性, 这种情况照样显示绿灯, 属于误导
-    local cmd = type(c.config) == "table" and c.config.cmd or nil
-    local vm = require("aosp-nav.util.jvm").assess(cmd)
-    local vm_text
-    if vm.xmx_text == nil then
-      vm_text = "no -Xmx"
-    else
-      vm_text = "-Xmx" .. vm.xmx_text .. (vm.xmx_ok and "" or " (too small)")
-      if vm.parallel_gc then vm_text = vm_text .. " +ParallelGC" end
-    end
-    lines[#lines + 1] = line("jdtls vmargs", vm_text, vm.xmx_ok, vm.advice)
+    -- jvm 参数**不在这里**评估了 (原 "jdtls vmargs" 行已搬进 :AospDebug)。
+    -- 理由是实测教训: "cmd 里 -Xmx 写够了" 与 "进程真的健康" 是两件事 —— 一台
+    -- -Xmx8G 配置完全正确的机器上, 新生代被自适应策略压到 19MB、18.5% 的墙钟在
+    -- GC, 而这行静态检查照样显示绿灯 (判据只是字符串)。要判活进程, 就得读活进程。
+    lines[#lines + 1] = line("jdtls jvm",
+      "live GC/heap/threads + -Xmx check: run :AospDebug", nil)
     -- referencedLibraries / import 设置
     local s = c.config and c.config.settings or {}
     local rl = s.java and s.java.project and s.java.project.referencedLibraries
@@ -284,15 +281,21 @@ function M.diagnose()
           not persisted and "no JDT index on disk yet — every restart re-indexes from "
             .. "scratch (see DEVELOPMENT.md)" or nil)
       end
-      -- 多个 JVM 抢同一份 -data: 索引互相覆盖, 表现为索引被反复删除重建
+      -- 多个 JVM 抢同一份 -data: 索引互相覆盖, 表现为索引被反复删除重建。
+      -- 列出"谁"而不只是 pid —— 有主的去关那个 nvim, 孤儿直接 kill, 处置不同。
       local others = M.foreign_jdtls(wd)
       local me = #vim.lsp.get_clients({ name = "jdtls" })
       local total = me + #others
+      local where = {}
+      for _, r in ipairs(others) do
+        where[#where + 1] = r.owner_pid and ("%s (nvim %d)"):format(r.pid, r.owner_pid)
+          or ("%s (ORPHAN)"):format(r.pid)
+      end
       lines[#lines + 1] = line("jdtls instances",
         ("%d (this nvim: %d, others: %s)"):format(total, me,
-          #others == 0 and "none" or table.concat(others, ", ")),
+          #others == 0 and "none" or table.concat(where, ", ")),
         total <= 1,
-        total > 1 and "two JVMs share one index and overwrite each other; close the other nvim / kill these pids" or nil)
+        total > 1 and "two JVMs share one index and overwrite each other; close the nvim listed above, or kill the orphan" or nil)
     end
   end
 
@@ -542,57 +545,110 @@ function M.index_state(workspace_dir)
   return { files = files, bytes = bytes, newest = newest, dir = dir }
 end
 
---- 命令行是不是"用 -data <dir> 跑 jdtls"。必须按**参数**判, 不能在整个 cmdline
---- 上做子串搜索 —— 那样任何含 "equinox.launcher" 字样的进程 (grep、编辑器、本插件
---- 自己的扫描命令) 都会命中。
+--- 解析 argv: 是不是"跑 jdtls"的命令, 是的话它的 -data 在哪。
+--- 必须按**参数**判, 不能在整个 cmdline 上做子串搜索 —— 那样任何含
+--- "equinox.launcher" 字样的进程 (grep、编辑器、本插件自己的扫描命令) 都会命中。
 --- @param argv table
---- @param workspace_dir string
---- @return boolean
-local function is_jdtls_on(argv, workspace_dir)
-  local launcher, data_dir = false, nil
+--- @return boolean launcher, string|nil data_dir 已去掉尾部斜杠
+local function parse_jdtls_argv(argv)
+  local launcher, data = false, nil
   for i = 1, #argv do
     if argv[i] == "-jar" and argv[i + 1]
         and argv[i + 1]:find("org.eclipse.equinox.launcher", 1, true) then
       launcher = true
     elseif argv[i] == "-data" and argv[i + 1] then
-      data_dir = argv[i + 1]
+      data = argv[i + 1]:gsub("/+$", "")
     end
   end
-  return launcher and data_dir ~= nil and (data_dir:gsub("/+$", "")) == workspace_dir
+  return launcher, data
 end
 
---- 正在使用同一个 jdtls 数据目录 (-data) 的**所有** JVM 进程号 (含本 nvim 拉起的)。
---- 检测手段是直接读 /proc 判 argv: 比 .metadata/.lock 可靠 (clean shutdown 会删掉
---- .lock, 崩溃遗留的 .lock 又会误报 —— 而孤儿 JVM 的 cmdline 一直在)。
---- 两个用途:
----   M.foreign_jdtls —— 报"别的 nvim 在抢同一份 -data";
----   M.jdtls_holders —— 删工作区元数据前的**安全闸**: 只要还有 JVM 持有它, 删除就会被
----     jdt.ls 退出/保存时的内存模型覆盖回去, 不如不删。
---- @param workspace_dir string|nil
---- @return table pids 字符串进程号列表
-local function jdtls_holders(workspace_dir)
-  if not workspace_dir or workspace_dir == "" then return {} end
-  workspace_dir = workspace_dir:gsub("/+$", "")
+--- "用 -data <dir> 跑 jdtls"?
+--- @param argv table
+--- @param workspace_dir string
+--- @return boolean
+local function is_jdtls_on(argv, workspace_dir)
+  local launcher, data = parse_jdtls_argv(argv)
+  return launcher and data ~= nil and data == workspace_dir
+end
+
+--- 本插件的 jdtls 缓存根 (LazyVim java extra 的 -data 全在这之下)。既用来判"这台
+--- 是不是我们这条链拉起来的", 也是回收孤儿进程前的那道安全闸的边界。
+--- @return string
+local function jdtls_cache_root()
+  return vim.fn.stdpath("cache") .. "/jdtls"
+end
+
+--- 读某个进程的工作目录 (报告里给用户认"是哪一个 nvim"用)。
+--- fs_readlink 对不存在的路径返回 nil, 但对 EACCES 会**抛错** —— 不 pcall 的话
+--- 一个别人的 nvim 就能把 configure 打断。
+--- @param pid integer
+--- @return string|nil
+local function read_cwd(pid)
+  local ok, link = pcall(vim.uv.fs_readlink, ("/proc/%d/cwd"):format(pid))
+  return ok and link or nil
+end
+
+--- 盘点本机所有 jdtls JVM, 并追出各自的 nvim 归属。**一次 /proc 扫描**, 三个调用方
+--- (单实例告警 / 孤儿回收 / 走失报告) 都从这里取数, 不再各扫一遍。
+---
+--- 每条记录 { pid, data, orphan, owner_pid, owner_cwd, ours }:
+---   data      = 它的 -data (已去尾斜杠); argv 里根本没有 -data 时为 nil
+---   orphan    = ppid 链走到 init 都没有 nvim —— 拥有它的那个 nvim 已经退出了
+---   owner_pid = 追到的 nvim 进程号 (没主则 nil); owner_cwd = 那个 nvim 的工作目录
+---   ours      = -data 落在本插件缓存根之下
+--- opts 可注入 glob/argv/comm/ppid, 让整条判定能在 headless 下测 (不碰真 /proc)。
+--- @param opts table|nil
+--- @return table 记录列表
+function M.jdtls_inventory(opts)
+  opts = opts or {}
   local proc = require("aosp-nav.util.proc")
+  local read_argv = opts.argv or proc.argv
+  local read_comm = opts.comm or proc.comm
+  local read_ppid = opts.ppid or proc.ppid
+  local entries = opts.globs or vim.fn.glob("/proc/[0-9]*", false, true)
+  local cache_root = jdtls_cache_root()
   local out = {}
-  for _, p in ipairs(vim.fn.glob("/proc/[0-9]*", false, true)) do
-    local pid = vim.fn.fnamemodify(p, ":t")
-    local argv = proc.argv(pid)
-    if argv and is_jdtls_on(argv, workspace_dir) then
-      out[#out + 1] = pid
+  for _, entry in ipairs(entries) do
+    local pid = vim.fn.fnamemodify(entry, ":t")
+    local argv = read_argv(pid)
+    local launcher, data = false, nil
+    if argv then launcher, data = parse_jdtls_argv(argv) end
+    if launcher then
+      local owner = proc.ancestor_named(pid, { nvim = true },
+        { comm = read_comm, ppid = read_ppid })
+      out[#out + 1] = {
+        pid = pid,
+        data = data,
+        orphan = owner == nil,
+        owner_pid = owner,
+        owner_cwd = owner and read_cwd(owner) or nil,
+        ours = data ~= nil and data:sub(1, #cache_root + 1) == cache_root .. "/",
+      }
     end
   end
   return out
 end
 
---- 同 jdtls_holders (含自己拉起的那个)。
+--- 正在使用同一个 jdtls 数据目录 (-data) 的**所有** JVM 进程号 (含本 nvim 拉起的)。
+--- 检测手段是直接读 /proc 判 argv: 比 .metadata/.lock 可靠 (clean shutdown 会删掉
+--- .lock, 崩溃遗留的 .lock 又会误报 —— 而孤儿 JVM 的 cmdline 一直在)。
+--- 删工作区元数据前的**安全闸**: 只要还有 JVM 持有它, 删除就会被 jdt.ls 退出/保存
+--- 时的内存模型覆盖回去, 不如不删。
 --- @param workspace_dir string|nil
---- @return table pids
-function M.jdtls_holders(workspace_dir)
-  return jdtls_holders(workspace_dir)
+--- @param records table|nil 已扫好的 inventory (避免同一轮里重复扫 /proc)
+--- @return table pids 字符串进程号列表
+function M.jdtls_holders(workspace_dir, records)
+  if not workspace_dir or workspace_dir == "" then return {} end
+  workspace_dir = workspace_dir:gsub("/+$", "")
+  local out = {}
+  for _, r in ipairs(records or M.jdtls_inventory()) do
+    if r.data == workspace_dir then out[#out + 1] = r.pid end
+  end
+  return out
 end
 
---- 正在使用同一个 jdtls 数据目录 (-data) 的**别的** JVM 进程号。
+--- 正在使用同一个 jdtls 数据目录 (-data) 的**别的** JVM 记录。
 --- 两个 JVM 共用一份 .metadata 会互相覆盖索引与 .classpath, 实测症状:
 ---   "Java Index broken - will be automatically deleted to repair"
 ---   "Failed to save JDT index ... (No such file or directory)"
@@ -600,19 +656,319 @@ end
 --- 而索引被反复删掉重建正是"索引不动"的一大来源。
 --- 必须排除**本 nvim 自己拉起的** jdtls (它是 nvim 的子进程, 扫描必然命中它;
 --- 不排除就会把 1 个 nvim 报成 2 个实例)。
---- 只报不杀: 杀进程是用户的决定。
+--- 返回的是完整记录而非光秃秃的 pid: 报"有两个"时必须能说清**哪个是有主的、哪个是
+--- 孤儿**, 因为处置完全不同 (关那个 nvim / 直接 kill)。
 --- @param workspace_dir string|nil
---- @return table pids 字符串进程号列表
-function M.foreign_jdtls(workspace_dir)
+--- @param records table|nil 已扫好的 inventory (避免同一轮里重复扫 /proc)
+--- @return table{jdtls_inventory 的记录}
+function M.foreign_jdtls(workspace_dir, records)
+  if not workspace_dir or workspace_dir == "" then return {} end
+  workspace_dir = workspace_dir:gsub("/+$", "")
   local self = vim.fn.getpid()
   local proc = require("aosp-nav.util.proc")
   local out = {}
-  for _, pid in ipairs(jdtls_holders(workspace_dir)) do
-    if not proc.is_descendant(pid, self) then
-      out[#out + 1] = pid
+  for _, r in ipairs(records or M.jdtls_inventory()) do
+    if r.data == workspace_dir and not proc.is_descendant(r.pid, self) then
+      out[#out + 1] = r
     end
   end
   return out
+end
+
+--- 走失的 jdtls: -data 不落在本插件的 jdtls 缓存根之下 (含根本没有 -data 的)。
+--- 成因是 §2.13 那台"取不到根"的 JVM —— nvim-jdtls 不传 -data 时, mason 的
+--- python wrapper 拿它自己的默认值 ~/.cache/jdtls/jdtls-<sha1(cwd basename)>。
+--- 它不共用我们的 -data, 所以单实例自检看不见它, 只有扫 /proc 才发现。
+--- @param rec table jdtls_inventory 的一条记录
+--- @return boolean
+function M.is_stray(rec)
+  return not rec.ours
+end
+
+--- SIGTERM 掉孤儿 jdtls JVM。**只有同时满足两条**才动手:
+---   1. 孤儿 —— ppid 链走到 init 都没有 nvim, 没有任何会话拥有它;
+---   2. 它的 -data 落在本插件的 jdtls 缓存根之下 —— 它抢的正是我们这份索引。
+--- 第 2 条是安全闸: 别的编辑器也用 jdtls, 只认"孤儿"就杀等于越界。反过来,
+--- §2.13 那种走失 JVM 即便成了孤儿也不杀 (它不跟我们抢索引, 只报告)。
+---
+--- 杀完等它自己退场 (上限 3 秒): jdt.ls 收到 SIGTERM 会走 shutdown hook 落一次
+--- 索引, 等它写完再起我们这台 —— 既不互相覆盖, 还白捡一份现成的索引。这一步会
+--- 阻塞调用方, 但只在真有孤儿时发生 (正常情况这里是空的)。
+--- 这是全仓唯一杀进程的地方, 也是"只报不杀"那条老规矩唯一的例外。
+--- @param records table M.jdtls_inventory 的结果
+--- @param opts table|nil { enabled = boolean, kill = fun(pid)|nil, wait_ms = number }
+--- @return table 真的发过 SIGTERM 的 pid 列表
+function M.reap_orphan_jdtls(records, opts)
+  opts = opts or {}
+  if opts.enabled == false then return {} end
+  local victims = {}
+  for _, r in ipairs(records or {}) do
+    if r.orphan and r.ours then victims[#victims + 1] = r.pid end
+  end
+  if #victims == 0 then return {} end
+  -- libuv 的 kill 失败时**不抛错**, 而是返回 nil, err (实测: ESRCH 走这条) ——
+  -- 所以不能只 pcall, 还要看返回值, 否则"根本没杀成"会被当成杀成了报给用户。
+  local kill = opts.kill or function(pid)
+    local ok, res = pcall(vim.uv.kill, tonumber(pid), "sigterm")
+    return ok and res ~= nil
+  end
+  local out = {}
+  for _, pid in ipairs(victims) do
+    if kill(pid) ~= false then out[#out + 1] = pid end
+  end
+  local wait_ms = opts.wait_ms
+  if wait_ms == nil then wait_ms = 3000 end
+  if wait_ms > 0 then
+    vim.wait(wait_ms, function()
+      for _, pid in ipairs(out) do
+        if vim.fn.isdirectory("/proc/" .. pid) == 1 then return false end
+      end
+      return true
+    end, 100)
+  end
+  return out
+end
+
+--- "jdtls 实例"自检的报告文本 (纯函数, 便于测试)。无事可做时返回 nil ——
+--- **自动回收掉的孤儿不单独通知** (插件能自动做掉的事就自动做掉, 见 DEVELOPMENT
+--- §2.10), 它的痕迹只进日志; 只有还剩"该由用户拍板"的东西时才开口。
+--- @param rep table { ws_dir, holders = {records}, strays = {records},
+---                    reaped = {pids} }
+--- @return string|nil
+function M.instances_message(rep)
+  local holders = rep.holders or {}
+  local strays = rep.strays or {}
+  local reaped = rep.reaped or {}
+  -- 刚被回收掉的孤儿**已不在 holders 里** (reap 跑在这次盘点之后)? 不 —— holders
+  -- 是回收**之前**那份盘点, 孤儿两种身份都在里面。这里按 pid 扣掉, 否则同一台会
+  -- 既列 "ORPHAN (its nvim is gone)" 又列 "killed just now", 还会出现在 kill 行里
+  -- 让用户去杀一个已经死掉的 pid。
+  local gone = {}
+  for _, pid in ipairs(reaped) do gone[tostring(pid)] = true end
+  local live = {}
+  for _, r in ipairs(holders) do
+    if not gone[tostring(r.pid)] then live[#live + 1] = r end
+  end
+  if #live == 0 and #strays == 0 then return nil end
+  local parts = {}
+  if #live > 0 or #reaped > 0 then
+    local l = {
+      ("%d other jdtls JVM(s) on the same index directory:"):format(#live + #reaped),
+      "  " .. (rep.ws_dir or "?"),
+    }
+    for _, r in ipairs(live) do
+      l[#l + 1] = ("  pid %s — %s"):format(r.pid,
+        r.owner_pid and ("nvim %d"):format(r.owner_pid) or "ORPHAN (its nvim is gone)")
+    end
+    for _, pid in ipairs(reaped) do
+      l[#l + 1] = ("  pid %s — ORPHAN, killed just now"):format(pid)
+    end
+    l[#l + 1] = "Two JVMs on one index overwrite each other (the index is deleted and "
+      .. "rebuilt, \"Java Index broken\"). Keep one:"
+    local pids = {}
+    for _, r in ipairs(live) do pids[#pids + 1] = r.pid end
+    local owned = {}
+    for _, r in ipairs(live) do
+      if r.owner_pid then owned[#owned + 1] = ("nvim %d"):format(r.owner_pid) end
+    end
+    if #pids > 0 then
+      l[#l + 1] = (#owned > 0 and ("close " .. table.concat(owned, ", ") .. ", or ") or "")
+        .. "kill " .. table.concat(pids, " ")
+    end
+    l[#l + 1] = "This does not need :AospCleanWorkspace unless the index turns out "
+      .. "broken afterwards."
+    parts[#parts + 1] = table.concat(l, "\n")
+  end
+  if #strays > 0 then
+    local l = {
+      ("%d jdtls JVM(s) point -data outside %s:"):format(#strays, jdtls_cache_root()),
+    }
+    for _, r in ipairs(strays) do
+      l[#l + 1] = ("  pid %s — -data %s"):format(r.pid, r.data or "(none)")
+    end
+    l[#l + 1] = "That is the JVM started for a buffer with no project root "
+      .. "(DEVELOPMENT.md §2.13). It does not share your index, but it burns a heap. "
+      .. "Kill it and delete the directory it names."
+    parts[#parts + 1] = table.concat(l, "\n")
+  end
+  return table.concat(parts, "\n\n")
+end
+
+-- ===================== :AospDebug (活进程遥测) =====================
+-- 与上面 jdtls_holders/foreign_jdtls 同源的 /proc 扫描, 但目标相反: 那两处找
+-- **别的** nvim 持有的 JVM (为了报警/拦截删除), 这里找**本 nvim 自己拉起的**那个,
+-- 然后用 jcmd 直读它的堆 / GC / 线程。pid 解析留在本文件是因为要用 is_jdtls_on。
+
+--- 从 client 的 cmd 里取 -data (jdtls 的数据目录)。**必须用这个 client 自己的**,
+--- 不能复用 M._workspace_dir() —— 那个返回**第一个** client 的 -data, 两棵树共用
+--- 一个 nvim 会话时会指到另一棵树上去。
+--- @param client table|nil
+--- @return string|nil
+local function data_dir_of(client)
+  local cmd = client and client.config and client.config.cmd
+  if type(cmd) ~= "table" then return nil end
+  for i, a in ipairs(cmd) do
+    if a == "-data" and cmd[i + 1] then return cmd[i + 1] end
+  end
+  return nil
+end
+
+--- client 的 root_dir (nvim 0.11+ 未解析时可能是空串)
+--- @param client table|nil
+--- @return string|nil
+local function root_dir_of(client)
+  local rd = client and client.root_dir
+  if not rd or rd == "" then rd = client and client.config and client.config.root_dir end
+  if type(rd) == "string" and rd ~= "" then return rd end
+  return nil
+end
+
+--- 面板/文件名里用来指认"报的是哪棵树"的短名
+--- @param client table|nil
+--- @return string
+local function tree_name(client)
+  local rd = root_dir_of(client)
+  if rd then return vim.fn.fnamemodify(rd, ":t") end
+  local d = data_dir_of(client)
+  if d and d ~= "" then return vim.fn.fnamemodify(d:gsub("/+$", ""), ":h:t") end
+  return "jdtls"
+end
+
+--- :AospDebug 的目标 client: 优先当前 buffer 挂着的 (与 java/source_apply 同口径),
+--- 否则退回第一个 —— 面板上会写明报的是哪棵树。
+--- @return table|nil
+local function debug_client()
+  local by_buf = vim.lsp.get_clients({ name = "jdtls", bufnr = vim.api.nvim_get_current_buf() })
+  if #by_buf > 0 then return by_buf[1] end
+  local all = vim.lsp.get_clients({ name = "jdtls" })
+  return all[1]
+end
+
+--- 找出**本 nvim 拉起的**那个 jdtls JVM 的 pid。
+--- 先按 -data 挑出所有持有者, 再限定为本进程的后代 (别的 nvim 的 jdtls 不该被我们
+--- 当自己的报 —— 那种情况由 M.foreign_jdtls 报警)。没有后代时退回全部持有者, 因为
+--- ":AospDebug 看不了别人的 jdtls" 不如"能看, 只是可能看的是较旧的那个"有用。
+--- @param client table|nil
+--- @return string|nil pid, string|nil why (pid 为 nil 时给出人话原因)
+local function jdtls_pid(client)
+  local dir = data_dir_of(client)
+  if not dir or dir == "" then
+    return nil, "the client has no -data in its cmd, cannot locate the JVM"
+  end
+  dir = dir:gsub("/+$", "")
+  local proc = require("aosp-nav.util.proc")
+  local self = vim.fn.getpid()
+  local mine, all = {}, {}
+  for _, p in ipairs(vim.fn.glob("/proc/[0-9]*", false, true)) do
+    local pid = vim.fn.fnamemodify(p, ":t")
+    local argv = proc.argv(pid)
+    if argv and is_jdtls_on(argv, dir) then
+      all[#all + 1] = pid
+      if proc.is_descendant(pid, self) then mine[#mine + 1] = pid end
+    end
+  end
+  local cands = #mine > 0 and mine or all
+  if #cands == 0 then
+    return nil, "no JVM is running with -data " .. dir .. " (jdtls exited?)"
+  end
+  -- 并列时优先 exe 指向 java 的 —— nvim-jdtls/mason 的启动器是 python, 进程列表里
+  -- 可能同时看到包装脚本 (正常情况它 execvp 掉自己, 但崩溃路径下会留下)
+  local best
+  for _, pid in ipairs(cands) do
+    local ok, exe = pcall(vim.uv.fs_readlink, "/proc/" .. pid .. "/exe")
+    if ok and type(exe) == "string" and exe:find("/java", 1, true) then best = pid end
+  end
+  return best or cands[1], nil
+end
+
+--- thread dump 的落盘路径。**只在插件自己的缓存目录** (config.cache_dir, 默认
+--- ~/.cache/nvim/aosp_nav), 绝不写 jdtls 的 -data 目录 —— 那里是 jdt.ls 的私产,
+--- 本插件对它只有 :AospCleanWorkspace 一条删除权, 从不写入。
+--- @param client table|nil
+--- @param pid string
+--- @return string
+local function thread_dump_path(client, pid)
+  local dir = get_cfg().cache_dir
+  vim.fn.mkdir(dir, "p")
+  return ("%s/thread-dump-%s-%s-%s.txt"):format(
+    dir, tree_name(client), pid, os.date("%Y%m%d-%H%M%S"))
+end
+
+--- :AospDebug[!] — 对**正在跑的** jdtls 取证 (jcmd 只读内省)。
+--- 无 bang: 打印一份堆/GC/线程快照 + 判定。
+--- 有 bang: 另外落一份 thread dump 到 config.cache_dir, 并把路径告诉用户
+--- (卡死时抓现场用; 事后慢慢读文件, 不占着 nvim)。
+--- @param bang boolean|nil
+function M.debug_panel(bang)
+  local jl = require("aosp-nav.util.jvm_live")
+  local out = {
+    "aosp-nav debug",
+    "generated: " .. os.date("%Y-%m-%d %H:%M:%S"),
+    "",
+  }
+
+  local client = debug_client()
+  if not client then
+    out[#out + 1] = "jdtls : not attached"
+    out[#out + 1] = "  -> open a .java file in the AOSP tree first"
+  else
+    out[#out + 1] = ("tree   : %s"):format(tree_name(client))
+    out[#out + 1] = ("-data  : %s"):format(tostring(data_dir_of(client)))
+    out[#out + 1] = ("root   : %s"):format(tostring(root_dir_of(client)))
+    out[#out + 1] = ""
+
+    local pid, why = jdtls_pid(client)
+    if not pid then
+      out[#out + 1] = "jvm    : " .. tostring(why)
+    else
+      local static = require("aosp-nav.util.jvm")
+        .assess(client.config and client.config.cmd)
+      local snap, err = jl.snapshot(pid, static)
+      if not snap then
+        out[#out + 1] = "jvm    : pid " .. pid .. ", but the live snapshot failed:"
+        out[#out + 1] = "         " .. tostring(err)
+      else
+        vim.list_extend(out, jl.render(snap, jl.verdict(snap)))
+        if bang then
+          out[#out + 1] = ""
+          local jcmd = snap.jcmd or (jl.find_jcmd(pid))
+          local path = thread_dump_path(client, pid)
+          local ok, derr = jl.thread_dump(jcmd, pid, path)
+          -- 必须走 log.user: 默认日志阈值是 warn, log.info 会被吞掉, 用户就
+          -- 只看到面板里一行字, 不知道文件在哪
+          if ok then
+            out[#out + 1] = "thread dump -> " .. path
+            log.user("thread dump written to " .. path)
+          else
+            out[#out + 1] = "thread dump failed: " .. tostring(derr)
+            log.user("thread dump failed: " .. tostring(derr), { level = "error" })
+          end
+        end
+      end
+    end
+  end
+
+  out[#out + 1] = ""
+  out[#out + 1] = "-- :AospDebug!   also write a thread dump to " .. get_cfg().cache_dir
+  out[#out + 1] = "-- :Aosp        the config/diagnostics panel"
+
+  -- 最后一道闸: 面板内容全部来自第三方文本 (jcmd 的 stdout/stderr、/proc、配置里的
+  -- 路径), 任何一行带换行都会让 nvim_buf_set_lines 直接抛错, 把整个 :AospDebug 变成
+  -- 一条报错 (实测踩过一次: VM.flags 的尾部换行)。render() 已按行产出, 这里再兜一次,
+  -- 保证这个命令在任何输入下都只是"多几行", 而不是打不开。
+  local safe = {}
+  for _, l in ipairs(out) do
+    for _, sub in ipairs(vim.split(l, "\n", { plain = true })) do safe[#safe + 1] = sub end
+  end
+
+  vim.cmd("botright new")
+  local buf = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, safe)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].filetype = "aosp-nav-debug"
+  vim.api.nvim_buf_set_name(buf, "aosp-nav://debug")
 end
 
 --- :AospRescan — 清 jar 缓存并重扫, 同时刷新 import.exclusions 缓存
@@ -671,11 +1027,12 @@ function M.rescan(import_root)
   local si = require("aosp-nav.java.source_inject")
   local sr = require("aosp-nav.java.source_roots")
   local n_src = 0
-  for _, p in ipairs(si.state().projects) do
+  for _, p in ipairs(si.state(root).projects) do
     if sr.reset(p.path, { delete_file = true }) then n_src = n_src + 1 end
   end
   if sr.reset(root, { delete_file = true }) then n_src = n_src + 1 end
-  si.reset()
+  -- 只忘掉**这棵树**攒的项目: 多树会话里重扫 A 树不该顺手清掉 B 树的累积
+  si.reset(root)
 
   -- 只清内存; 文件缓存留着: 重扫失败时下次启动仍有旧列表可用
   local jm = require("aosp-nav.java.jars")
@@ -728,11 +1085,11 @@ local function source_root_lists(aosp_root, st)
   if #st.projects == 0 then
     out[#out + 1] = "  (none yet — open a .java file inside a project)"
   end
-  local aosp = aosp_root or ""
   for _, p in ipairs(st.projects) do
     out[#out + 1] = ("  %s  (%d root(s))"):format(p.rel, p.roots)
-    for _, abs in ipairs(p.list) do
-      local rel = abs:sub(1, #aosp + 1) == aosp .. "/" and abs:sub(#aosp + 2) or abs
+    -- p.list 与 p.rel 同一基准 (**工作区相对**), 直接打印 —— 旧代码在这里把它当绝对
+    -- 路径做前缀切分, 那个分支永不命中, 一直在"侥幸正确"
+    for _, rel in ipairs(p.list) do
       out[#out + 1] = "      " .. rel
     end
   end
@@ -782,7 +1139,7 @@ local function source_roots_section(fname)
   local bufname = (fname and fname ~= "") and fname or vim.api.nvim_buf_get_name(0)
   local aosp_root = require("aosp-nav.java.root").aosp_root(bufname)
   local mode = mode_of(cfg)
-  local st = require("aosp-nav.java.source_inject").state()
+  local st = require("aosp-nav.java.source_inject").state(aosp_root)
   local counts = source_root_counts(bufname)
   local acc_roots = 0
   for _, p in ipairs(st.projects) do acc_roots = acc_roots + #(p.list or {}) end
@@ -838,6 +1195,7 @@ function M.panel()
 
   out[#out + 1] = ""
   out[#out + 1] = "-- :Aosp!        force-apply every pending source root now"
+  out[#out + 1] = "-- :AospDebug    live GC / heap / threads of the running jdtls (add ! for a thread dump)"
   out[#out + 1] = "-- :AospRescan   refresh jars + import.exclusions caches"
   out[#out + 1] = "-- :AospCleanWorkspace  rebuild the jdtls workspace (destructive)"
 

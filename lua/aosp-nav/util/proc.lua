@@ -1,7 +1,9 @@
--- proc.lua: 从 /proc 读进程信息 (参数表、父进程、后代判定)
+-- proc.lua: 从 /proc 读进程信息 (参数表、父进程、后代判定、可执行名、祖先上溯)
 --
--- 只读, 不杀进程。用途见 ui.foreign_jdtls: 判断有没有**别的** JVM 正在用同一份
--- jdtls 数据目录 (-data)。两个 JVM 共用一份 .metadata 会互相覆盖索引。
+-- 只读, 不杀进程 (唯一的例外是 ui.reap_orphan_jdtls, 它自己调 vim.uv.kill)。
+-- 用途见 ui.jdtls_inventory: 判断有没有**别的** JVM 正在用同一份 jdtls 数据目录
+-- (-data), 以及那个 JVM 是哪个 nvim 会话拉起来的。两个 JVM 共用一份 .metadata
+-- 会互相覆盖索引。
 
 local M = {}
 
@@ -49,6 +51,48 @@ function M.ppid(pid)
   if not ok or not lines or not lines[1] then return nil end
   local rest = lines[1]:match("%)%s*(.*)$")
   return rest and tonumber(rest:match("^%S+%s+(%d+)")) or nil
+end
+
+--- 读 /proc/<pid>/comm —— 内核记的**可执行名** (截断到 15 字符), 也是 `ps` 的
+--- COMMAND 列。用它认 nvim: jdtls 的父进程就是 nvim (mason 的 python wrapper
+--- 是 `os.execvp` 换成 java 的, 不留中间层, 见 jdtls.py), 所以上溯一两跳必然命中。
+--- @param pid string|integer
+--- @return string|nil 进程不存在/读不到时 nil
+function M.comm(pid)
+  local ok, lines = pcall(vim.fn.readfile, ("/proc/%s/comm"):format(pid), "", 1)
+  if not ok or not lines or not lines[1] then return nil end
+  local s = lines[1]:gsub("%s+$", "")
+  return s ~= "" and s or nil
+end
+
+--- 沿 ppid 逐级上溯, 返回第一个 comm 命中 names 的祖先 (含 pid 自己)。
+---
+--- 用来回答"这台 JVM 是哪个 nvim 会话拉起来的": 命中 = 有主; 一路走到 init
+--- 都没命中 = **孤儿** —— 它的 nvim 已经没了, JVM 还占着 -data, 于是下一个 nvim
+--- 起来就撞上"两个 jdtls 共用一份索引"。
+---
+--- 两个 reader 可注入, 让判定能在 headless 下测而不去真扫 /proc (同
+--- jvm_live.find_jcmd 对 exepath/exe_target 的做法)。
+--- @param pid string|integer
+--- @param names table<string,true> 认作"主"的 comm 集合
+--- @param opts table|nil { ppid = fun(pid)->pid|nil, comm = fun(pid)->string|nil,
+---                         limit = number } 上溯层数上限 (默认 64, 防环)
+--- @return integer|nil pid, string|nil name
+function M.ancestor_named(pid, names, opts)
+  opts = opts or {}
+  local read_ppid = opts.ppid or M.ppid
+  local read_comm = opts.comm or M.comm
+  local cur = tonumber(pid)
+  if not cur then return nil end
+  for _ = 1, (opts.limit or 64) do
+    local name = read_comm(cur)
+    if not name then return nil end
+    if names[name] then return cur, name end
+    local pp = read_ppid(cur)
+    if not pp or pp <= 1 then return nil end
+    cur = pp
+  end
+  return nil
 end
 
 --- pid 是否就是 ancestor, 或者它的后代 (沿 ppid 逐级上溯)。

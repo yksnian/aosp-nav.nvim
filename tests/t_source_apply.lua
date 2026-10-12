@@ -163,14 +163,18 @@ nav.config.java.source_apply_auto = false
 check(sa.auto({}) == "off", "auto() returns off when source_apply_auto = false")
 nav.config.java.source_apply_auto = saved_auto
 
--- report() 每会话只提示一次
+-- report() 每**棵树**只提示一次 (分区键 = client 的 workspace 根)。
+-- 不是"每会话一次": 多树会话里两棵树各有自己的 pending, 而 :Aosp! 只作用于当前
+-- buffer 所在的那棵树, 所以两棵树各说一次才可行动 (util/log 的 _seen 也按 id 去重,
+-- 故 id 必须带 key, 否则第二棵树被静默吞掉)。
 local notes = {}
 local real_notify = vim.notify
 vim.notify = function(msg) notes[#notes + 1] = msg end
-sa.report("no-client", nil)
-sa.report("toomany", 99)
+sa.report("no-client", nil, "/aosp/A")
+sa.report("toomany", 99, "/aosp/A")       -- 同一棵树: 被闸住
+sa.report("no-client", nil, "/aosp/B")    -- 另一棵树: 放行
 vim.notify = real_notify
-check(#notes == 1, "report() notifies at most once per session (got " .. #notes .. ")")
+check(#notes == 2, "report() 每棵树至多一次 (got " .. #notes .. ")")
 -- 具体命令名随重构变化 (:AospApplySourceRoots -> :Aosp!), 只断言"指向一条 Aosp 命令"
 check(type(notes[1]) == "string" and notes[1]:find("Aosp", 1, true) ~= nil,
   "the single report points at an :Aosp command")

@@ -533,20 +533,23 @@ AOSP 树内) 时, 退到**任一已加载且落在 AOSP 树内的 `.java` 缓冲
 
 | # | 场景 | 触发点 |
 | - | ---- | ------ |
-| 1 | 工作区里存在**活**的外部可见工程 (空壳已自清, §2.12); 仅在有 Gradle 下载证据时才追加 `:AospCleanWorkspace` 指引 | `java/init.lua:470` |
-| 2 | 有别的 jdtls 进程共用同一个 `-data` 目录 (索引互相覆盖, §8.1); 不带 `-data` 的那种第二台已由 §2.13 从源头挡掉, 走不到这里 | `java/init.lua:515` |
-| 3 | 破坏性的 `:AospCleanWorkspace` 确认 | `ui.lua:876` |
-| 4 | 自动注入源码根在耗尽重试预算后失败 (§2.9) | `java/source_apply.lua:454` |
+| 1 | 工作区里存在**活**的外部可见工程 (空壳已自清, §2.12); 仅在有 Gradle 下载证据时才追加 `:AospCleanWorkspace` 指引 | `java/init.lua:504` |
+| 2 | 有别的 jdtls 进程共用同一个 `-data` 目录 (索引互相覆盖, §8.1; 2026-10-10 起报出**归属**, §2.16) / 或存在走失 JVM。**孤儿会被自动回收, 不进这条消息** | `java/init.lua:542` |
+| 3 | 破坏性的 `:AospCleanWorkspace` 确认 | `ui.lua:1232` |
+| 4 | 自动注入源码根在耗尽重试预算后失败 (§2.9) | `java/source_apply.lua:499` |
 | 5 | 首次运行需同步扫描残留 Eclipse 目录 (排除项冷缓存, 数秒) | `java/import_exclusions.lua:160` |
 
 全仓 `log.user` 一共 **6 个调用点**: 上表 5 个是插件**主动**开口 (席位统计只数这五个);
-第 6 个是 `java/source_apply.lua:361` —— 手动 `:Aosp!` 失败后的回报。用户刚敲了命令,
+第 6 个是 `java/source_apply.lua:398` —— 手动 `:Aosp!` 失败后的回报。用户刚敲了命令,
 结果当然要照实告知, 它不算"主动打扰", 也不占席位。改这块时别只 grep `log.user` 就以为
-多出了一处违规。
+多出了一处违规。(`:AospDebug!` 落 thread dump 的两条也是同一类: 用户刚敲了命令。
+**席位没变** —— §2.16 的孤儿回收走 `log.debug`, 不开口。)
 
 **指导原则**: **插件能自动做掉的事就自动做掉, 只就该由用户拍板的事开口。** 一次成功
 的自动操作不是通知 —— 它的结果属于 `:Aosp` 面板。所以 `java/init.lua:106` 那条
 "跳到 jar" 的提示走 `log.info` 而非 `log.user`: 用户此刻不需要做任何决定。
+(这条原则最新的一次应用是 §2.16 的孤儿回收: 那台 JVM 没有任何会话拥有它, 于是
+**静默 SIGTERM**, 只在日志里留一行 —— 而不是像旧文案那样让用户自己去 kill。)
 
 `log.warn(msg, { once = true, id = ... })` 按 id 去重 (§4 的归一告警用它, 避免每次
 setup 刷屏); 被阈值挡下的调用**不登记 id**, 否则调高阈值后再触发就永远看不到了。
@@ -801,6 +804,151 @@ M.defaults)`, 让"merge 不改输入"成为真正的不变量, 也顺带让两�
 改写 / 排除名单 append 语义未回归 / **merge 结果与 `M.defaults` 不共享 java·kotlin
 子表, 就地改它不污染默认值 (标量与列表各一条)** / 两次 setup 之间不共享子表 /
 **前置断言代码默认值确实是 `curated`** (否则这组测试会因为"默认值恰好等于用户值"而假通过)。
+
+---
+
+### 2.15 两棵 AOSP 树共用一个 nvim 会话 (`java/source_inject` 的单例状态)
+
+**症状** (用户提问: "如果有两个 aosp_a16 / aosp_a17, 会造成注入混乱吗?"): 一个 nvim
+会话里同时开两棵树时 ——
+
+* 另一棵树的项目被当成"**0 根**"的空壳塞进本树的 LRU, 占掉 `source_paths_max_projects`
+  的名额;
+* 更糟的是**顺序被覆盖**: `inject_sync` 结束时的 `persist()` 写的是同一个文件, 于是
+  B 树启动一次就把 A 树刚攒的那行冲掉 —— A 的 `_order` 里只剩 B 的项目;
+* `union(本树)` 会把另一棵树的 rel 列表原样带进来 (那些路径在本树里不存在, 发给
+  `addToSourcePath` 只会 failed);
+* 切换树之后 `_projects[项目]` 里存的"工作区相对路径"是按**旧根**算的, 永不重算 ——
+  后开的那棵树在本会话里再也累积不到源码根;
+* `source_apply.client()` 取 `get_clients()[1]`, 把替 X 树算出的路径发给 Y 树的 server;
+* `_applied_ok`/`_attach_done`/`_auto_reported` 是会话级单例: A 树注入成功后 B 树的
+  自动路径直接收工, 后挂的那棵树永远等不到补注入。
+
+**根因**: `source_inject` 的累积状态 (`_aosp_root`/`_order`/`_installed`/`_accumulated`)
+与 `source_apply` 的"每会话一次"标记全是**模块级单例**。**"本会话"只有在单树时才等于
+"本树"** —— 多树下必须显式按树分区。
+
+**修法** (全部按 AOSP 根字符串分区, 与 jars/source_roots 的缓存键同一套约定):
+
+| 原来 | 现在 |
+| ---- | ---- |
+| `_aosp_root` 单变量, BufEnter 时翻转 | 每处显式传根; `_last_root` 只作 `state()`/`union()` 无参兜底 |
+| `_projects[p]` = **工作区相对** roots (依赖当时那棵树) | `_projects[p]` = **项目相对** roots, 派生推迟到 `union(root)` |
+| `_order` 单一 LRU | `_order[root]` —— 名额也是每棵树各自的 |
+| `source_inject-projects.txt` 单文件 | `source_inject-projects-<root 扁平化>.txt` |
+| `_installed`/`_accumulated` 单值 | 按根分表 |
+| `apply()`/`schedule_apply()` 读 `_aosp_root` | 参数化, 且一路以**触发文件 fname**为准 |
+| `M.client()` = `get_clients()[1]` | `M.client(fname)` 按 buffer 选 (`get_clients({bufnr=…})`) |
+| `_applied_ok`/`_running`/`_poll_armed`/`_deadline`/`_auto_reported`/`_attach_done` 单例 | 按 `client_key(client)` = **workspace 根**分区 |
+| `ui` 读全局 `state()` / `si.reset()` | `state(aosp_root)` / `reset(root)` (:AospRescan 只忘本树) |
+
+三条**顺手堵掉的相邻问题** (不是多树引入的, 但都在同一批代码里):
+
+1. `_attach_done` 从来没声明过 —— 旧代码直接写成了**全局变量** (`_G._attach_done`),
+   Lua 不报错。现在是有声明的模块局部表。
+2. `source_apply.report` 的 log `id` 是常量, 而 `util/log` 的 `_seen` **按 id 全局去重**
+   —— 不变的话第二棵树那条会被静默吞掉。id 改成 `"source-apply-failed:" .. key`。
+3. `ui.lua` 打印累积项目的 `p.list` 时把它当**绝对路径**做前缀切分, 而它一直是工作区
+   相对路径 —— 那个分支永不命中, 一直在"侥幸正确"。现在直接打印。
+
+**为什么"每棵树一次"才是对的意思**: `:Aosp!` 只作用于**当前 buffer 所在的那棵树**,
+注入也是一次独立的全量 classpath 重建 —— 所以"A 树注入成功"不能推出"B 树不需要注入"。
+单树下 `client_key` 恒为同一个根, 语义与旧的"每会话一次"逐字等价。
+
+**已知未做**: `state.lua` 的 `root`/`android_root`/`phase` 仍是会话级单例 (读者有
+statusline / 面板 / `java/init.lua`, 且 `state.get()` 会被用户配置里的 lualine 调用,
+签名不能改)。多树下 `:Aosp` 的状态/诊断区显示的是**最后 configure 的那棵树**。
+面板的 source-roots 区已按当前 buffer 的树取, 不受影响。
+
+**实测复现** (headless, 假树; 不启 jdtls):
+
+```
+A 树 inject_sync -> union(A) = {A 核心集, A 项目根}
+切到 B 树 (模块重载 == 新会话) -> 旧实现: state(B) 里躺着 A 的项目且 roots=0,
+                                        union(A) 的 A 项目根已被 B 的 persist 冲掉
+                                新实现: 两棵树各有一份顺序文件, union 各自完整且不相交
+```
+
+覆盖: `tests/t_multi_tree.lua` (29 条) —— 用 `build/make/core/main.mk` + `.git` 造两棵
+假树与各自的项目, 零 LSP。断言: 两棵树各自推断出正确的根与项目 / 会话切到 B 后
+**不继承** A 的项目 (旧实现会) / 同一会话里 A·B 同时活动时 `union` 互不污染 /
+`state(A)` ≠ `state(B)` / 两棵树各有自己的顺序文件且内容不交叉 / `reset(A)` 不动 B /
+`client(fname)` 按 buffer 选到对应的 server (假 `vim.lsp.get_clients`) /
+`_is_applied` 按树分开。
+> 切会话用 `package.loaded["aosp-nav.java.source_inject"] = nil` 模拟: 磁盘缓存保留、
+> 内存状态清空 —— 这正是"下次启动"的语义, 且对新旧实现都成立 (所以它**能咬住旧代码**;
+> 单纯在同一进程里调用两次 `inject_sync` 咬不住, 因为 `_projects` 已经缓存了)。
+
+### 2.16 jdtls 实例自检: 归属 / 孤儿回收 / 走失 (2026-10-10)
+
+**起因**: 工作站上每次开 nvim 都弹
+
+```
+2 jdtls process(es) (pid 843683, 844046) are already using the same data directory:
+  /home/…/.cache/nvim/jdtls/qssi/workspace
+… Keep only one: close the other nvim, or kill these pids and run :AospCleanWorkspace
+```
+
+两个 pid, 但**没说哪个属于谁** —— 而"哪个属于谁"恰恰决定了该怎么办, 用户还得自己
+`ps` 一遍。旧文案给的处置也过重: `:AospCleanWorkspace` 要几十分钟重建, 而杀掉多余的
+那台之后, 活着的那台内存里有完整索引, jdt.ls 会自己重写落盘 (§索引自修复)。
+
+**三个成因, 只有第一个能自动做掉**:
+
+| 形态 | 成因 | 处置 |
+| ---- | ---- | ---- |
+| **孤儿** | 上一个 nvim 崩了 / 被 `kill -9` / WSL 里终端被关 —— 它拉起的 jdtls 被 init 收养, 一直占着 `-data`, 于是之后**每个**新会话都撞上 | 没有任何会话拥有它 = 纯垃圾。**自动 SIGTERM** |
+| **有主** | 用户真的开了两个 nvim 在同一棵树 | 报出归属 (`nvim <pid>` + 它的 cwd), 让用户去关那一个。**只报不杀** |
+| **走失** | §2.13: 取不到根的缓冲引出的那台, `-data` 落在 `~/.cache/jdtls/jdtls-<sha1>` | 它不抢我们的索引, 但白烧一个堆。**只报**, 连删都不删 |
+
+**归属怎么判**: jdtls 的父进程**就是** nvim —— mason 的 python wrapper 用
+`os.execvp` 把自己换成 java (`jdtls.py:139`), 不留中间层。所以沿 ppid 逐级上溯找
+`comm == "nvim"` (本机实测 nvim 的 comm 就是 `nvim`):
+命中 = 有主 (顺带报出它的 `/proc/<pid>/cwd`, 用户才知道是哪个窗口);
+一路走到 init 都没命中 = 孤儿。原语是 `util/proc.lua` 的 `M.comm` / `M.ancestor_named`。
+
+**回收的安全闸**(两条都要满足, 见 `ui.reap_orphan_jdtls`):
+1. 必须**真的**是孤儿。别的编辑器也用 jdtls, 只认"孤儿"就杀等于越界。
+2. `-data` 必须落在本插件缓存根 (`~/.cache/nvim/jdtls/`) 之下 —— 它抢的正是我们这份索引。
+
+第 2 条也解释了为什么**走失** JVM 即便成了孤儿也不杀 (它 `-data` 在 `~/.cache/jdtls/`
+下, 不跟我们抢), 以及为什么有主的那个不杀 (关掉别人的会话不是插件该做的事)。
+
+**时机**: 跑在 `configure` 里, 也就是 client 启动**之前** —— 赶在两个 JVM 打架之前
+清场。SIGTERM 之后**等它自己退场**(上限 3 秒): jdt.ls 收到 SIGTERM 会走 shutdown hook
+落一次索引, 等它写完再起我们这台, 既不互相覆盖、还白捡一份现成的索引。这一步会阻塞
+调用方, 但只在真有孤儿时发生 (正常情况这里是空的)。
+
+**为什么值得开自动**: 就是 §2.10 那句指导原则的推论 —— "插件能自动做掉的事就自动做
+掉"。孤儿没有任何需要用户拍板的地方, 它与第 13(a) 步的**空壳工程自清**同构
+(把"不可逆"改成"可自愈"), 只是对象从磁盘文件换成了进程。于是:
+自动回收**不单独通知** (痕迹只进 `log.debug`); 只有还剩"该由用户拍板"的东西 (有主的
+重复 / 走失 JVM) 才开口, 文案由纯函数 `ui.instances_message` 生成, 无话可说时返回 `nil`。
+
+**这条推翻了 `ui.lua` 里"只报不杀: 杀进程是用户的决定"那句老规矩** —— 但只推翻
+"孤儿"这一种。退路是一个布尔开关 `java.kill_orphan_jdtls` (默认 `true`)。
+
+**实现**: 一次 `/proc` 扫描产出**带归属**的记录 (`ui.jdtls_inventory`), 三个调用方共用
+(`jdtls_holders` / `foreign_jdtls` / 两个新函数), 不再各扫一遍。`opts` 可注入
+`globs/argv/comm/ppid`, 全套判定在 headless 下可测且不碰真 `/proc` (同
+`jvm_live.find_jcmd` 的做法) —— 覆盖见 `tests/t_instances.lua` (43 条) 与
+`tests/t_proc.lua` 的 `ancestor_named` 部分。
+
+> **验收实测** (2026-10-10 判定, 2026-10-12 端到端): 用 `setsid` 造一个命令行形状相同、
+> 已被 init 收养的假 jdtls, `ui.jdtls_inventory` 判出 `orphan=true owner=nil ours=true`,
+> 同一轮里那台**真** jdtls 判出 `orphan=false owner=nvim <pid>` —— 归属判定在真 `/proc`
+> 上成立。回收端到端: 真发 SIGTERM, 孤儿**当场消失** (`reaped=[<pid>]`), 那台真 jdtls
+> 一动没动; 3 秒等待在进程一退出就短路 (`vim.wait` 的谓词), 实际只花 0.1 s。
+> 走完整条 `require("aosp-nav.java").configure({})` (真 AOSP 树 + 真孤儿 + 真 jdtls) 时
+> 通知只剩一条、且内容正确。
+>
+> **这条端到端跑出了一个假 `/proc` 看不见的 bug**: `holders` 是回收**之前**那份盘点,
+> 孤儿的两种身份都在里面, 于是同一台被列两遍 ("ORPHAN (its nvim is gone)" +
+> "ORPHAN, killed just now")、还被塞进 `kill` 行让用户去杀一个**已经死掉的 pid**。
+> 修法: `instances_message` 按 `reaped` 里的 pid 把 `holders` 扣一遍 (见该函数里的
+> `live`)。教训 —— 注入式单测的 fixture 是按**函数契约**捏的, 捏不出"两个调用方共用
+> 同一份盘点、其中一个先改了世界"这种**跨步**耦合; 真正的验收得把整条 `configure`
+> 跑一遍。
 
 ---
 
@@ -1307,6 +1455,131 @@ jar)。README 的 AIDL FAQ 保留这一段结论, 机制在此。
   行只查字符串, 对这种配置照样显示绿灯 —— 已改为按 `util/jvm.lua` 的 `assess()` 判数值
   并给出 `-Xmx8G` 的 action。
 
+#### 8.1.1 `-Xmx8G` 之后换了一种卡法: 新生代被自适应策略压死 (2026-10-10, 加 `:AospDebug` 的由来)
+
+上面那次是**堆不够**(存活集 4.0 G = old gen 容量)。把 `-Xmx` 抬到 8 G 之后, 死亡螺旋
+确实消失了 (`MaxHeapSize=8589934592` 实测生效, 那台机器 RSS 3.2 G / 84.7% idle / 22 核),
+但用户报"工作站上看起来卡住不动了" —— **同一类症状, 完全不同的成因**。
+
+对活进程取证 (`jcmd <pid> {PerfCounter.print, VM.uptime, GC.heap_info}`, 只读):
+
+| 观测 | 值 |
+| --- | --- |
+| `-Xmx / -Xms` | 8 G / 2 G (配置**完全正确**) |
+| uptime | 4112.45 s |
+| `sun.gc.collector.0.{invocations,time}` (young) | **162259 次 / 541.37 s** |
+| `sun.gc.collector.1.{invocations,time}` (full) | **1216 次 / 220.70 s** |
+| `avgMinorIntervalTime` / `avgMajorIntervalTime` | 29 ms / 4393 ms |
+| `avgPromotedAvg` | **10.5 MB per young GC** |
+| `PSYoungGen total` | **21 MB**(启动时 `-XX:NewSize=715653120` = **682 MB**) |
+| `ParOldGen total / used` | 1.94 G / 1.63 G(84%, **没满**) |
+| Metaspace | 73.9 MB |
+| 同机 nvim 进程 | `R` 状态 94.3% CPU 持续 26 分钟, RSS 2.4 G |
+
+派生口径 (全部可由上表算出):
+
+| 指标 | 算法 | 值 |
+| --- | --- | --- |
+| GC 占墙钟 | (541.37 + 220.70) / 4112.45 | **18.5%** |
+| young GC 间隔 | uptime / invocations = 4112.45 / 162259 | **25 ms** |
+| full GC 间隔 | uptime / invocations = 4112.45 / 1216 | **3.4 s** |
+| 晋升速率 | 10.5 MB / 25 ms | **~415 MB/s** |
+
+与 §8.1 的**对比** (两件事必须分清):
+
+| | §8.1 的 6G 死亡螺旋 | 本次 8G |
+| --- | --- | --- |
+| 症状 | CPU 打满, 索引不动 | 一样 |
+| 堆 | `ParOldGen` **100% 满** | **84%, 没满** |
+| 存活集 | 4.0 G **= old gen 容量** | 716 MB = old gen 上限的 13% |
+| 病因 | **放不下**: 工作集 ≥ old gen | **回收太勤**: 新生代被压到 21 MB |
+| 谁在烧 CPU | 15 个 GC 线程, 90% | 同一套 GC 线程, 18.5% 墙钟 |
+| 处置 | 抬 `-Xmx` 到 8 G | **删掉 `-XX:GCTimeRatio=4` + `-XX:AdaptiveSizePolicyWeight=90`** (实测有效, 见下); 换 `-XX:+UseG1GC` 是备选 |
+
+根因: `-XX:+UseParallelGC -XX:GCTimeRatio=4 -XX:AdaptiveSizePolicyWeight=90` 的组合下,
+自适应策略**把 `GCTimeRatio=4` 读成"GC 时间可以占到 1/(1+4) = 20% 的墙钟"**(注意这个
+参数是"应用时间 : GC 时间"的比值, 不是吞吐率百分比; 默认值是 99, 即 1%), 于是它在
+这个宽松预算内只有一个方向可走 —— 最小化内存占用。新生代因此从启动的 682 MB 一路压到
+21 MB。ParallelGC 下 `MaxGCPauseMillis` 默认是**无限**(实测
+`18446744073709551614`), 没有暂停目标来制衡, 缩新生代是零阻力的。eden 小
+到每次几十毫秒就填满 → young GC 每 25 ms 一次 → 每次把 10.5 MB 早晋升进 old gen → old
+gen 以 ~415 MB/s 被填 → full GC 每 3.4 s 一次。**不是泄漏, 也不是放不下, 是回收频率**。
+注意 `avgPromotedAvg` 是 GC 自己的统计口径 (单位 byte), 晋升速率 = 它 / 实测间隔。
+
+同日另一台机器 (PC) 实测同一个形态, 只是程度轻些: 13.0% 墙钟在 GC, `PSYoungGen
+committed 19.5 MB` = 堆的 **0.2%**, young GC 每 36 ms, full GC 每 4.9 s, `ParOldGen`
+83%。**两台不同机器、不同负载、同一个形状** —— 所以这不是偶发, 而是这套 GC 参数的固有
+行为。
+
+**处置与结果** (同日, 经用户授权改 `~/.config/nvim/lua/plugins/jdtls.lua`): 删掉
+`-XX:GCTimeRatio=4` 与配套的 `-XX:AdaptiveSizePolicyWeight=90` (配套项, 要么都在要么都
+不在), **保留** `-XX:+UseParallelGC` 和其余全部参数。回到默认 `GCTimeRatio=99` (1% 目标)
+之后, 策略不再"在 20% 的宽松预算内最小化内存占用", 转而把新生代撑到 GC 时间逼近 1% 为止。
+
+前后对照 (同机、同树、**同一支探针**, uptime 1273 s vs 1291 s):
+
+| | 旧参数 @1291 s | 删掉两个 flag 后 @1273 s |
+| --- | --- | --- |
+| `PSYoungGen` committed | 30.5 MB | **2730 MB** (顶在 `MaxNewSize`) |
+| `ParOldGen` committed | 1365 MB | 2178 MB |
+| young GC | **62691 次** / 每 20.6 ms | **908 次** / 每 1.40 s |
+| full GC | **356 次** / 每 3.6 s | **7 次** / 每 182 s |
+| GC 占墙钟 | ~19% (该取样) | **1.3%** |
+| 晋升速率 | 4.3 MB per young GC = **209 MB/s** | 247 KB = **176 KB/s** |
+| RSS | 1.93 G | 5.16 G |
+
+三条比"GC 少了"更重要的读数:
+
+- **晋升率掉了三个数量级** (209 MB/s → 176 KB/s)。这一条说明那 209 MB/s 的晋升**不是
+  工作负载的固有属性**, 而是 eden 只有 30 MB 造成的**早晋升** (对象活过一次 young GC
+  就被推进老年代)。它同时解释了下面两台机器晋升占比为何差一个量级 (4–6% vs 22%) ——
+  两个数都是同一个产物, 与树的差异无关。
+- **两代同时归位** (young 30.5 M→2.7 G, old 1365 M→2178 M) 才是诊断成立的**完整**证据。
+  "20% 预算让策略放弃吞吐、只优化占用"这个解释预测的正是**两处都压在下限上**, 而不只是
+  新生代偏小; 只盯新生代会把这条线索读成"eden 太小"这一个孤立的旋钮。
+- **代价是堆, 不是别的**: RSS 1.93 G → 5.16 G 换来 GC 占比 19% → 1.3%。单次 young GC
+  暂停反而从 3 ms 变成 17.6 ms (要收 2.2 G 的 eden), 但频率低了 69 倍 —— 对 LSP 而言
+  "每 1.4 s 停 17 ms" 远好于 "每 20 ms 停 3 ms"。**不需要换 G1**: 新生代已顶在
+  `MaxNewSize` (= 堆/3, `NewRatio=2`) 上, 说明策略想要的新生代比允许的还大, 再调只是
+  拿老年代的上限去换。
+
+`--jvm-arg=` 是启动参数, 改完必须重启 jdtls 才生效。判定入口就是本节的产物 `:AospDebug`:
+改前它报 `young_gen_tiny` + `young_interval_low` + `major_interval_low` +
+`gc_pct_elevated` 四条 info, 改后是 `nothing to flag` —— 这也是它第一次在真机上报出
+**有依据的**绿灯。
+
+**为什么旧 `:Aosp` 一个字都看不出来**: 它的 `jdtls vmargs` 行读的是 `client.config.cmd`
+(启动命令行里的字符串), `-Xmx8G` 写得没错就显示绿灯。**配置正确 ≠ 进程健康**。要判后者
+就必须读后者 —— 这是 `:AospDebug` (读活进程) 与 `:Aosp` (读配置) 分成两条命令的根本
+原因, 也是把那段静态 `-Xmx` 检查搬进 `:AospDebug` 的原因 (它属于"活进程"这个入口)。
+
+**阈值怎么标定的** (`util/jvm_live.lua` 的 `M.THRESH`): 相对实测基准留 2–4 倍余量。
+`warn` **只**留给"堆真的放不下"(存活集 > old gen 上限的 90% / RSS > `-Xmx`×1.15 / 墙钟
+>50% 在 GC), 其余偏高形态一律 `info` 并给出可执行建议 —— 导入期本来就该 GC 频繁, 把它
+报成 `warn` 只会教会用户忽略这个面板。故意**不**把阈值标定成"让这台 18.5% / 3.4 s 的会话
+一条告警都不出": 那正是在重演"诊断对着事实显示绿灯"。
+
+**两条实现上的实测教训** (`util/jvm_live.lua`):
+
+- **GC 间隔自己算** (`uptime / invocations`), 不用 `sun.gc.policy.avg*IntervalTime`: 一是
+  那几个键是 ParallelGC 专属 —— G1 的 `sun.gc.policy.*` 只有 **7** 个键, 根本没有它们;
+  二是口径不同 —— 同一进程 `avgMinorIntervalTime=14 ms`, 而整个生命周期的真实均值是
+  `5907.65/167534 = 35 ms`(它是自适应策略的**目标**间隔, 不是历史均值)。回答"多久一次
+  GC"要用后者。
+- **collector 必须按名字分类, 不能按索引兜底**: G1 有**三个** collector
+  (`G1 young` / `G1 full` / **`G1 concurrent cycle`**), 索引 `[2]` 兜底会把 concurrent
+  cycle 当成 full GC。只有名字完全缺失的老 JVM 才退回 "0=young, 1=major"。
+  另外 G1 的 `sun.gc.generation.1.space.0.name` 是 `"space"` 而不是 `"old"`, 别按名字认。
+
+覆盖: `tests/t_jvm.lua` (108 条, 真机 jdtls 在跑时 115)。五条 fixture 分别是本节的实测形态
+(必须报 `young_gen_tiny` + `young_interval_low` + `major_interval_low` 且**零 warn**)、
+6G 死亡螺旋形态、健康 G1 (零 finding)、G1 但新生代低于 5% (仍须零 finding, 见下)、空快照。
+
+`young_gen_tiny` **只对 ParallelGC 报**: 它给的病因是"自适应策略把新生代压小了", 而自适应
+策略是 ParallelScavenge 独有的机制。G1 下 `-XX:G1NewSizePercent` 的默认下限就是堆的 5% ——
+也就是**健康的 G1 恰好压在本规则的阈值上**, 一旦报出来病因还是错的。G1 真出问题, 靠
+`young_interval_low` / `major_interval_low` 两条抓, 不靠这条。
+
 另外两条与"索引被反复重建"直接相关的机制:
 
 - **工程已存在时, initialize 里带的 sourcePaths 会被静默忽略** (`loadInvisibleProject`
@@ -1399,7 +1672,7 @@ classpath **完全相等**且逐条 path 都对得上时才返回工程自己的
 **仓库内**的探针 (见 §10.1):
 
 ```bash
-bash tests/run.sh            # 全部; 8 文件 (带 AOSPNAV_LIVE_TEST=1 时共 175 条断言)
+bash tests/run.sh            # 全部; 13 文件 (默认 427 条断言; 真树/真机块全跑起来时 445)
 ```
 
 下面两条**曾**用来单跑核心集与增量累积两条路径, 但只在 `/tmp/aospnav-t/` 下存在过,
@@ -1500,19 +1773,28 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 
 | 套件 | 断言 | 覆盖 |
 | ---- | ---- | ---- |
-| `t_commands.lua` | 13 | 命令面冻结契约: 恰好 4 个 `:Aosp*` 命令, 且删掉的那 7 个一个都不在 |
+| `t_commands.lua` | 16 | 命令面冻结契约: 恰好 5 个 `:Aosp*` 命令 (含 `:AospDebug`), 且删掉的那 7 个一个都不在; `:Aosp`/`:AospDebug` 都是 bang 命令 |
 | `t_config.lua` | 37 | 本轮重构引入/删除的键: 死键静默丢弃 (不映射、不告警) / `merge` 不改调用方的表 / `source_apply_max_roots` 不再是配置键 / **重复 setup 不得打回默认值** (见 §2.14): 空参 `setup()` 后 `kotlin.jar_mode`·`log_level` 仍是用户值 / 第二次带参 setup 不丢上一次的键 / 新表产出且旧表不被就地改写 / 排除名单 append 语义未回归 / **合并结果不与 `M.defaults` 共享子表**, 就地改它不污染默认值 (标量+列表) |
+| `t_jvm.lua` | 108 | `util/jvm.assess` (此前**完全没有**测试): `-Xmx6G` 判否 / `--jvm-arg=` 前缀剥离 / 重复 `-Xmx` 后者胜 / `UseParallelGC` 识别 / 无值·无键·nil cmd 不崩。`util/jvm_live` (**活进程遥测**, §8.1.1): PerfCounter 解析 (去引号、值含 `=`、缺键) / uptime 与 `/proc/<pid>/status` (读不到是 nil 而非 0) / heap_info 三种形态 / young·major 按**名字**分类 (G1 的第三个 collector **不得**算 major) / 间隔按 `uptime/invocations` **自算**(不信 `avg*IntervalTime`) / 五条 fixture 的判定 (实测形态 → 三条 info 且零 warn; 6G 死亡螺旋 → 三条 warn; 健康 G1 → 零 finding; **G1 但新生代 <5% → 仍零 finding**, `young_gen_tiny` 只对 ParallelGC 报; 空快照不崩) / `find_jcmd` 三条回退路径 (注入式, 不碰 `/proc`) / jcmd 对死 pid 的失败路径 (退出码不可靠, 空 stdout 必须自己判失败) / `render` 的每一项都不得含换行 (`nvim_buf_set_lines` 会直接抛) |
 | `t_log.lua` | 54 | `util/log.lua`: 四档阈值比较 / `log.user` 绕过阈值 / 会话内 `once` 去重 / `once` 被阈值挡下时**不消费**登记 / 消息前缀 |
+| `t_multi_tree.lua` | 29 | **两棵树共用一个 nvim 会话** (§2.15): 假树造 A/B 两棵树, 零 LSP。两棵树各自推断出正确的根与项目 / 会话切到 B 后**不继承** A 的项目 (旧实现会) / 同一会话里 A·B 同时活动时 `union` 互不污染 / `state(A)` ≠ `state(B)` / 两棵树各有自己的顺序文件且内容不交叉 / `reset(A)` 不动 B / `client(fname)` 按 buffer 的 client 选 (旧实现取 `get_clients()[1]`) / `_is_applied` 按树分开 |
 | `t_path.lua` | 14 | `util/path.start_dir`: `nil`/`""` 归一成 cwd, 绝不能给 `"."` (§7 痛点 4 的根因) |
-| `t_proc.lua` | 10 | `util/proc`: `/proc/<pid>/cmdline` 必须**真的按 NUL 切开参数** (回归"一个 nvim 报 2 个 jdtls 实例") / `is_descendant` 自反与否定 |
+| `t_instances.lua` | 43 | jdtls 实例自检 (§2.16), 全部走**注入的假 /proc** (不碰真进程): 盘点只认真 jdtls (命令行里只**含**那个 jar 名的 `grep`、以及 `-jar` 指向别的 jar 的 java 都不算) / 归属判定 (有主 → `owner_pid`; ppid 链到 init → `orphan`) / `ours` 按 `/proc` 缓存根前缀判 / `jdtls_holders`·`foreign_jdtls` 的旧契约 (含 nil·空串·尾斜杠归一) / `is_stray` 三种正反例 / **回收的两条安全闸** (孤儿+ours 才杀; 有主的、走失的、`enabled=false` 时都不动, 且连 `kill` 都不调) / 默认 killer 对已消失 pid **静默失败** (libuv 的 kill 失败不抛错而是返回 nil, err) / 报告文本: 只有孤儿被回收时返回 `nil` (成功不打扰)、有主的重复给 `kill` 行、走失指向 §2.13、全孤儿时不说"去关 nvim"、**已回收的 pid 不得在 holders 段里再出现一次** (holders 是回收**之前**那份盘点, 不按 pid 扣掉就会"列两遍 + 让你杀一个死 pid"; 这条是 configure 端到端跑出来的回归) |
+| `t_proc.lua` | 19 | `util/proc`: `/proc/<pid>/cmdline` 必须**真的按 NUL 切开参数** (回归"一个 nvim 报 2 个 jdtls 实例") / `is_descendant` 自反与否定 / `comm` 认出 `nvim` (归属判定的地基) / `ancestor_named` 用注入的 reader 造链: 命中 nvim / 走到 init → 孤儿 / 起点自己命中 / comm 读不到 / 成环有上限兜底 / 超过 `limit` |
 | `t_root_from_cwd.lua` | 20 | 痛点 4 的**端到端**回归: 起在 AOSP 根、不打开任何 `.java` 文件时 `aosp_root(nil/"")` 仍拿到树根 (真树断言部分需 `AOSPNAV_LIVE_TEST=1`) |
 | `t_phase.lua` | 19 | `phase` 是活状态的冻结契约: `ui.statusline()` 对 `idle`/`ready`/`indexing`/`no-out`/`failed` 五态各自的渲染 (`indexing` 必须带 `(idx)`) / `install_phase_handler` **链式**调用原有 handler (不吞掉 nvim-jdtls 的 status 消息) / 只有 `ServiceReady` 翻牌, 其余 `ServiceStatus` 不动 / `no-out`/`failed` 不被覆盖 / `err` 非空不翻牌 / 非 jdtls client 不包装 |
-| `t_source_apply.lua` | 28 | `java/source_apply.lua`: `abs_of` 归一 / `installed` 解析 `.classpath` (去重、带 `excluding`、剥 `_/` 前缀、读不到返回 nil 而非空集) / 真机 `pending` 与磁盘 src 交集为 0 且有序 / 累积根"要么已装要么待装, 绝不丢弃" / 已装与待装不相交 / 非 core 模式拒绝 / `classify` 三类真实返回值 / 无 client 时 `auto()` 惰性 / `source_apply_auto=false` → `off` / `report()` 每会话只提示一次 |
+| `t_source_apply.lua` | 26 | `java/source_apply.lua`: `abs_of` 归一 / `installed` 解析 `.classpath` (去重、带 `excluding`、剥 `_/` 前缀、读不到返回 nil 而非空集) / 真机 `pending` 与磁盘 src 交集为 0 且有序 / 累积根"要么已装要么待装, 绝不丢弃" / 已装与待装不相交 / 非 core 模式拒绝 / `classify` 三类真实返回值 / 无 client 时 `auto()` 惰性 / `source_apply_auto=false` → `off` / `report()` 每**棵树**只提示一次 (分区键 = workspace 根; §2.15) |
 | `t_root_fallback.lua` | 22 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 |
 | `t_workspace.lua` | 31 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 | 
 
-合计 **248** 条断言 (上表各文件是带 `AOSPNAV_LIVE_TEST=1` 的行数; 默认跑法则
-`t_root_from_cwd` 13 / `t_source_apply` 22, 共 **235**)。
+合计 **445** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
+`t_jvm` 108 / `t_root_from_cwd` 13 / `t_source_apply` 22, 共 **427**)。
+
+> 只有 `t_jvm` (108/115)、`t_root_from_cwd` (13/20) 和 `t_source_apply` (22/26) 三个套件
+> 的条数**随环境而变** (真树/真 jdtls 块整段 SKIP 时不计数), 所以 445/427 是当前环境的
+> 实测值而非不变量; 其余 10 个套件两种跑法条数相同。
+> 特别注意 `t_jvm` 的真机块: 它要**真有 jdtls 在跑**才算数, 只设 `AOSPNAV_LIVE_TEST=1`
+> 是不够的 (本机 2026-10-10 就出现过"采样时在跑、跑测试时已退出"→ 静默少 7 条)。
 
 `source_apply` 的分界是明的: `pending()` **不发任何请求** (纯读 `.classpath` + 算差集);
 发请求的只有 `add_serial` —— 手动经 `:Aosp!`, 或自动经 `source_apply.auto_apply()`
@@ -1533,7 +1815,7 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 
 2026-10-09 之前有一批临时测试放在 `/tmp/aospnav-t/` (**10 个文件 / 242 条断言**), 从未
 进仓库; `/tmp` 被清空后 9 个文件已丢失, 只剩 `t_source_apply.lua` 一份 (其覆盖已在
-10.1 里, 断言数从 28 微调)。
+10.1 里, 断言数 28 → 26: 22 默认 / 26 带真树)。
 
 下表记录它们**曾经覆盖过**的东西, 当作**待补回的覆盖清单** —— 不要再当成"现有测试"读:
 
@@ -1623,6 +1905,8 @@ KLS 进程的孤儿/残留清理现在是**自动的** (旧的 `:AospKillOrphanK
 - **加一个注入点** → 记住 §2.3 (空数组会关掉推断) 和 §2.7 (必须工作区相对路径)。
 - **加一个配置键** → 走 `config.lua` 的默认值 + `validate()` 就近归一, 不要
   `return false` 中断 setup。
+- **动 `util/jvm_live.lua` 的阈值** → 基准是 §8.1.1 的两台机器实测值; 改阈值前先更新
+  那一节的表, 否则下一个人没有对照就无从判断放宽是否合理。`warn` 只留给"堆真放不下"。
 - **碰 BufEnter 路径** → 必须保持毫秒级; 任何扫描都异步 (`scan_async`), 结果进缓存。
 - **碰 `inject_sync`** → 它只能**同步读缓存**, 一旦引入扫描, sourcePaths 就赶不上
   `initialize` 请求了 (而 §2.5 禁止事后补救)。

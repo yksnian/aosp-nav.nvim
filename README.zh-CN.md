@@ -151,6 +151,7 @@ return {
 | ---- | ---- |
 | `:Aosp` | 打开信息面板 (会话状态 + 诊断清单 + 已注入源码根, 合并到同一个 scratch buffer) |
 | `:Aosp!` | 强制注入全部已累积源码根, 越过每会话自动上限 |
+| `:AospDebug` (或 `!`) | 直读正在运行的 jdtls 的活 JVM: 堆 / GC / 线程 (`:AospDebug!` 另落一份 thread dump) |
 | `:AospRescan [dir]` | 作废 jar 缓存并重扫, 同时刷新 `import.exclusions` |
 | `:AospCleanWorkspace` (或 `!`) | 删除 jdtls/Eclipse workspace 目录使其重新导入 (破坏性; `:AospCleanWorkspace!` 跳过确认) |
 | `:AospCollectJars` | 收集 AOSP jar 到 fallback 目录 |
@@ -159,12 +160,26 @@ return {
 
 一个面板, 两部分:
 
-- **diagnostics** —— 一份检查清单, 逐项带 `v`/`!` 标记与下一步动作提示: 插件版本 / jdtls 客户端与其 root_dir / JVM `-Xmx` 是否够用 (按数值而非字符串判断) / `referencedLibraries` 条数 / `java.project.sourcePaths` 是否被注入 (`mode == "aosp"` 时期望"已注入", 缺失即故障) / `java.import.exclusions` 条数 / gradle+maven 是否关闭 / AOSP 根与工作区根及当前模式 / 会话 phase / jar 缓存新鲜度 / Eclipse 残留 blockers / jdtls workspace 目录与 "jdtls index" 行 / Kotlin 脚本归属与 KLS 客户端数 / 是否有外部 jdtls 共用同一 `-data`。
+- **diagnostics** —— 一份检查清单, 逐项带 `v`/`!` 标记与下一步动作提示: 插件版本 / jdtls 客户端与其 root_dir / `referencedLibraries` 条数 / `java.project.sourcePaths` 是否被注入 (`mode == "aosp"` 时期望"已注入", 缺失即故障) / `java.import.exclusions` 条数 / gradle+maven 是否关闭 / AOSP 根与工作区根及当前模式 / 会话 phase / jar 缓存新鲜度 / Eclipse 残留 blockers / jdtls workspace 目录与 "jdtls index" 行 / Kotlin 脚本归属与 KLS 客户端数 / 是否有外部 jdtls 共用同一 `-data` 以及它属于谁 (`nvim <pid>` 还是孤儿)。**JVM `-Xmx` 检查不在这里** —— 已搬到 `:AospDebug` (见下), 那里读的是活进程而不是启动命令行。
 - **source roots** —— 当前注入 `java.project.sourcePaths` 的全部源码根: 配置的核心集 (存在磁盘上的条目标 `x`), 以及每个已累积项目的源码根 (按 LRU 顺序)。当跳转落到同名类的意外实现时用来看清来源。
 
 出问题时先跑这个。
 
 `phase` 是活状态: `idle` (尚未配置) / `indexing` (AOSP 树, 已找到 jar, jdt.ls 仍在导入与构建 —— 状态栏显示 `AOSP:n(idx)`) / `ready` (jdt.ls 已报 `ServiceReady`) / `no-out` (AOSP 树里没有编译产物, 走的 fallback) / `failed` (非 AOSP 文件)。
+
+### :AospDebug
+
+报告**正在运行的** jdtls 究竟在干什么 —— 用 `jcmd` 只读直读 JVM: 堆、GC、线程。
+`:Aosp` 看的是启动命令行写了什么, 那里的 `-Xmx` 正确
+**不等于**进程健康。
+
+- **看什么** —— pid 与实际用到的 `jcmd` / uptime / RSS 与线程数 / GC 策略与 GC 占墙钟的比例 / young 与 full GC 的次数及真实平均间隔 / 每次 young GC 的晋升量 / 新生代与老年代的 used-committed-max / 上次 full GC 实测的存活集 / 原样的 `GC.heap_info` / `vm flags`。
+- **查什么** —— 启动命令行里的 `-Xmx` (按数值判; 这一行已从 `:Aosp` 搬来), 外加活进程的病态形态: 新生代被自适应策略压到远小于堆 / GC 吃掉墙钟 / 每几秒一次 full GC / 存活集放不进老年代 / RSS 超过 `-Xmx`。
+- **判定** 只标出需要动手的; "偏高但在导入期正常"的形态另列, 每条都给具体建议。
+- **`:AospDebug!`** 另外落一份 thread dump 到 `~/.cache/nvim/aosp_nav/` 并给出路径 —— 界面像卡住时用它; 抓完读文件, 不必占着 nvim。
+- **按树** —— 头部写明是哪棵树及其 `-data`, 一个会话里有两套 AOSP 检出时知道报的是谁。
+- **没有 jdtls** —— 一行说明; JVM、`jcmd` 或 `/proc` 读不到时一并给出原因。
+- **只读** —— 从不写 jdtls 工作区; thread dump 落在插件自己的缓存目录。
 
 ### :Aosp!
 
@@ -246,6 +261,7 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 | java.import_exclusions            | {}                                                           | 追加的 jdt.ls glob 排除模式, 排在默认值之后; `!` 开头 = 反向放行 (顺序敏感) |
 | java.import_exclusions_scan       | true                                                         | 是否后台扫描源码树里残留的 `.project`+`.classpath` 目录并自动排除 |
 | java.import_exclusions_ttl        | 604800                                                       | 扫描结果缓存有效期 (秒); ≤0 = 永不过期, 仅 `:AospRescan` 强制重扫 |
+| java.kill_orphan_jdtls            | true                                                         | 启动时 SIGTERM 掉"孤儿"jdtls —— 上一个 nvim 已经退出、却还占着同一份 `-data` 的那台 (之后每个会话都要跟它抢索引)。只杀"确实是孤儿"**且** `-data` 在本插件缓存根之下的; 设 `false` 只报告不杀 |
 | java.inlay_hints_mode             | auto                                                         | auto=有jar强制off/无jar all, 或 off/all                      |
 | kotlin.enabled                    | true                                                         | 启用 kotlin 子模块 (KLS)                                     |
 | kotlin.jar_mode                   | curated                                                      | curated=精选核心模块, all=全量 (实验性)                      |
