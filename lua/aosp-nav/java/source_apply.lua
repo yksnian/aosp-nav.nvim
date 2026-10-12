@@ -217,7 +217,8 @@ end
 --- @return string|nil code "mode"|"not-aosp"|"no-classpath" (自动路径据此决定要不要出声)
 function M.pending(fname)
   local j = cfg().java
-  -- 注入只在 mode == "aosp" 时开启 (infer/project 模式不注入 sourcePaths)
+  -- 运行期**累积**注入只在 mode == "aosp" 时开启。infer 一律不注入;
+  -- project 注入的是**本项目自己的**根, 在导入时一次性下发, 不走这条累积路径。
   if j.mode ~= "aosp" then
     return nil, "java.mode must be \"aosp\" (current: "
       .. tostring(j.mode) .. ")", "mode"
@@ -510,7 +511,7 @@ end
 function M.auto(opts)
   opts = opts or {}
   local j = cfg().java
-  -- 非 aosp 模式 (infer/project, 不注入) / 用户关掉自动: 不是错误, 静默
+  -- 非 aosp 模式 (infer 不注入; project 走导入时的一次性注入) / 用户关掉自动: 不是错误, 静默
   if j.source_apply_auto == false or j.mode ~= "aosp" then return "off" end
   local fname = (opts.fname and opts.fname ~= "") and opts.fname
     or vim.api.nvim_buf_get_name(0)

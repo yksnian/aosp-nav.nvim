@@ -481,13 +481,13 @@ end
 --- @param root string 项目目录
 --- @param opts table|nil { no_cache = boolean }
 --- @return table|nil roots, table|nil stats
-function M.find(root, opts)
-  if not root or root == "" then return nil end
+--- 读缓存 / 冷扫描 / 写缓存 —— M.find 与 M.find_for_project 共用的**全部**实体逻辑。
+--- 模式闸门在各自的入口, 不在这里 (这里只认"哪个目录", 不认模式)。
+--- @param root string 扫描基准目录 (绝对路径)
+--- @param opts table|nil { no_cache = boolean }
+--- @return table|nil roots, table|nil stats
+local function scan_cached(root, opts)
   opts = opts or {}
-  -- 源码根是给 sourcePaths 注入用的: 只有 mode == "aosp" 才注入。
-  -- "infer"/"project" 都不注入, 故都不提供源码根 (见 config 契约的 infer 陷阱:
-  -- "工作区根是 AOSP 根" ≠ "注入 sourcePaths", 此处问的是后者)
-  if get_cfg().java.mode ~= "aosp" then return nil end
 
   if not opts.no_cache and _root == root and _list then return _list, _stats end
 
@@ -522,6 +522,42 @@ function M.find(root, opts)
   end
   M.save(root, list, stats)
   _list, _root, _stats = list, root, stats
+  return list, stats
+end
+
+function M.find(root, opts)
+  if not root or root == "" then return nil end
+  -- 整树那条路 (核心集 + 按项目累积) 的源码根: 只有 mode == "aosp" 才注入。
+  -- "infer" 不注入 (靠推断); "project" 注入的是**本项目自己的**根 —— 那条路走
+  -- M.find_for_project (见下), 不从这里出, 所以这里仍然只认 aosp。
+  if get_cfg().java.mode ~= "aosp" then return nil end
+  return scan_cached(root, opts)
+end
+
+--- [v11] mode == "project" 用的源码根: **该 project 目录自己的**源码根 (相对该项目)。
+---
+--- 为什么需要单独一条路: project 模式下 workspace 根就是项目目录, 而项目里的 .java
+--- 默认只有"打开过的"才会被 jdt.ls 逐文件推断出源码根 —— 于是从本项目 A 类跳到同项目
+--- 里**没打开过**的 B 类, 仍会落到反编译 jar。那是该模式自己的核心承诺失效 (用户实测
+--- 面板里 `preset core: 2 active` 却没下发, 正是这个问题的可见面)。
+--- 注入本项目自己的根即可修好: 它们**本来就是**该项目 workspace 下的相对路径, 不需要
+--- 跨根解析, 也不扩大索引 —— 索引的仍只有这一个模块。
+---
+--- 与 M.find 的区别: 那个是整树模式 (核心集 + 跨项目累积), 只在 aosp 下返回; 这个与
+--- aosp 无关, 只在 project 下返回, 且**不累积** (只答"当前这一个项目")。
+--- @param project_root string 项目目录 (绝对路径)
+--- @param opts table|nil { no_cache = boolean } 语义同 M.find
+--- @return table|nil roots 相对 project_root 的源码根, table|nil stats
+function M.find_for_project(project_root, opts)
+  if not project_root or project_root == "" then return nil end
+  if get_cfg().java.mode ~= "project" then return nil end
+  -- 余下逻辑与 M.find 完全一致 (读缓存 / 冷扫描 / 写缓存), 共用同一份实现 ——
+  -- 只有上面的模式闸门不同。
+  local list, stats = scan_cached(project_root, opts)
+  if not list then return nil, nil end
+  -- 空列表绝不能下发: 注入空 sourcePaths 会**整体关闭** jdt.ls 的逐文件推断
+  -- 而没有替代 (见 config.lua 的机制注释)。宁可不下发, 让推断照旧兜底。
+  if #list == 0 then return nil, nil end
   return list, stats
 end
 

@@ -3,11 +3,17 @@
 -- 三种模式 (java.mode):
 --   "aosp" (默认) = **AOSP 根 = jdtls workspace 根**, 整棵树共用一个索引,
 --                   并按 (预置核心集 + 逐项目累积) 注入 sourcePaths。
+--                   跨模块跳转落到可编辑源码 (受 jdt.ls 每工程字母序前缀截断,
+--                   见 DEVELOPMENT.md §2.17)。
 --   "infer"       = AOSP 根仍是 jdtls workspace 根, 但**不注入 sourcePaths**,
---                   交给 jdt.ls 逐文件推断源码根。
---   "project"     = 按项目 (.git/.project 就近) 开工作区 —— 本插件接管之前的
---                   行为, 索引小、启动快, 但跨模块跳转只能落到反编译 jar;
---                   同样不注入 sourcePaths。
+--                   交给 jdt.ls 逐文件的 package 推断源码根。
+--                   **索引仍覆盖全树, 不比 aosp 快** —— 差别只在跨模块跳转。
+--                   价值: 零配置, 不必维护注入列表。
+--   "project"     = 当前 buffer 所属项目 (.git/.project 就近) 是 workspace 根,
+--                   **只有一个模块的索引** —— 首次导入快, 但跨模块跳转只能落到
+--                   反编译 jar。换项目时由 java/workspace_follow.lua 发
+--                   didChangeWorkspaceFolders 把**运行中**的 jdtls 换过去 (整份
+--                   重导入, 实测约 1 分钟), 不必重启 nvim。
 --
 -- 关键区分: "根是不是 AOSP 根" 与 "注不注入 sourcePaths" 是两个问题。它们在
 -- "aosp" 下一致、在 "infer" 下相反。所以本模块只回答第一个问题:
@@ -83,6 +89,27 @@ function M.workspace_root(fname)
   return M.aosp_root(fname)
 end
 
+--- 当前 buffer 所属的**项目目录** (mode == "project" 下 jdtls 真正的索引根)。
+---
+--- 为什么单独有这个函数: `M.workspace_root` 在 project 模式下刻意返回 nil
+--- (那是"交还用户语义"的旧契约), 于是任何 `workspace_root() or aosp_root` 的写法
+--- 在 project 下都会**静默拿到 AOSP 根** —— 面板上把工作区根显示成 AOSP 根、
+--- 以及把整棵树的源码根当成项目源码根注入, 都出自这一个坑。
+--- 凡是"jdtls 到底以哪为根"的问题都走这里, 不要再用 `or` 兜底。
+--- @param fname string|nil 文件路径或目录路径
+--- @return string|nil project 规整后的绝对路径; nil = 不在树内 / 没有项目标记
+function M.project_dir(fname)
+  local cfg = require("aosp-nav").config
+  if cfg.java.mode ~= "project" then return nil end
+  fname = (fname and fname ~= "") and fname or vim.api.nvim_buf_get_name(0)
+  local aosp = M.aosp_root(fname)
+  if not aosp then return nil end
+  local p = require("aosp-nav.java.projects").find_project_root(fname, aosp)
+  if not p then return nil end
+  return (vim.fn.fnamemodify(p, ":p"):gsub("/+$", ""))
+end
+
+
 --- 最后的兜底: 常规取根 (AOSP 根 / 用户的 root_dir) 都答不上来时, 复用**已经在跑的
 --- 那台** jdtls, 而不是让 LazyVim 拿一个错位的默认工作区另起一台。
 ---
@@ -136,8 +163,10 @@ end
 
 --- 包装用户原有的 root_dir, 交给 jdtls opts.root_dir 使用
 ---   "aosp"/"infer": AOSP 树内插件说了算, 树外回落用户语义 (string 或 function)
----   "project":      用户给了函数就用用户的 (保留其就近取根与客户端复用逻辑),
----                   否则按项目目录取根
+---   "project":      按当前文件所属项目目录取根; **已有 jdtls 在跑时一律复用它的
+---                   root_dir** —— 否则每开一个新模块就会另起一台 (重演本文件开头
+---                   记的"实测 6 个 workspace")。运行中的那台随 buffer 换项目由
+---                   java/workspace_follow.lua 负责, 不在这里。
 --- 两条路都答不上来时走 M.reuse_root 兜底 (反编译视图不能另起一台 jdtls)。
 --- 用户配置无需改动即可生效, 也不会影响非 AOSP 工程
 --- @param user_root string|function|nil 用户原本的 opts.root_dir
@@ -146,9 +175,19 @@ function M.jdtls_root_fn(user_root)
   return function(fname)
     local cfg = require("aosp-nav").config
     if cfg.java.mode == "project" then
-      local r = require("aosp-nav.java.projects").workspace_root_project(
-        fname, user_root, M.aosp_root(fname))
-      return r or M.reuse_root()
+      -- 已经在跑的那台: 复用它的根 (workspace_follow 会随 buffer 把它挪到目标项目)。
+      local live = M.reuse_root()
+      if live then return live end
+      -- 第一台: 按项目目录取根; 取不到 (树外/无项目标记) 才交还用户语义。
+      local p = require("aosp-nav.java.projects").find_project_root(fname, M.aosp_root(fname))
+      if p then return p end
+      if type(user_root) == "function" then
+        local ok, v = pcall(user_root, fname)
+        if ok and v then return v end
+      elseif type(user_root) == "string" and user_root ~= "" then
+        return user_root
+      end
+      return nil
     end
 
     local r = M.workspace_root(fname)

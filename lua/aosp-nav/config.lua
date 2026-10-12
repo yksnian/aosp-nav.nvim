@@ -105,9 +105,17 @@ M.defaults = {
     -- [v10] 单一模式键 (取代旧的 workspace_mode + source_paths_mode 组合):
     --   "aosp" (默认) = 工作区根是 AOSP 根 **且** 注入 sourcePaths (预置核心集
     --     + 按打开项目累积)。跨模块跳转落到可编辑的真实 .java。
-    --   "infer" = 工作区根是 AOSP 根, 但**不**注入 —— 让 jdt.ls 按打开文件的
-    --     package 逐文件推断源码根; 跨模块跳转落到反编译 jar。
-    --   "project" = 工作区根是每个项目 (.git/.project 就近) 的目录, 不注入。
+    --   "project" = 工作区根是**当前 buffer 所属项目** (.git/.project 就近) 的
+    --     目录, 只索引这一个模块 (首次导入快); sourcePaths 注入的是**该项目自己的**
+    --     源码根 (不是核心集 —— 否则本项目里没打开过的类也会跳 jar)。
+    --     [v11] 换项目时自动把**运行中**的 jdtls 换过去
+    --     (workspace/didChangeWorkspaceFolders, 见 java/workspace_follow.lua),
+    --     不必重启 nvim —— 代价是每次切换整份重导入, 实测约 1 分钟。
+    --   "infer" = **不对外宣传的基线模式** (v11 降级, 见 DEVELOPMENT.md §3):
+    --     工作区根是 AOSP 根, 但不注入, 让 jdt.ls 逐文件推断源码根。
+    --     它与 aosp 的**索引范围完全相同** (都是整棵树), 所以并不更快;
+    --     多出来的只是"不必维护注入列表", 因而没有注入列表被 jdt.ls 截断 (§2.17b)
+    --     这类失效形态。留作跳转出问题时的对照/兜底, 不出现在 README。
     -- 注意 (机制, 见 DEVELOPMENT.md): 注入这个 key 会**整体关闭** jdt.ls 的逐文件
     -- 推断 (BaseDocumentLifeCycleHandler.inferInvisibleProjectSourceRoot 在
     -- getInvisibleProjectSourcePaths() != null 时直接 return), 所以注入的列表
@@ -233,8 +241,11 @@ M.defaults = {
 
 -- [v10] java.mode 合法值 (取代旧的 workspace_mode + source_paths_mode):
 --   aosp    = 工作区根 = AOSP 根 + sourcePaths 注入 (默认)
---   infer   = 工作区根 = AOSP 根, 不注入 (jdt.ls 逐文件推断源码根)
---   project = 工作区根 = 项目 .git/.project 目录, 不注入
+--   project = 工作区根 = 当前 buffer 所属项目目录, 注入本项目自己的源码根;
+--             换项目自动重导入 (v11)
+--   infer   = 工作区根 = AOSP 根, 不注入 (jdt.ls 逐文件推断源码根) —— [v11] 保留但
+--             不宣传: 索引范围与 aosp 相同, 无速度优势; 见上面 mode 键的注释。
+-- 三个值都合法 (infer 仍需通过校验, 老配置不能报错), 但 README 只写前两个。
 local JAVA_MODES = { aosp = true, infer = true, project = true }
 
 -- [v10] 日志阈值合法值
@@ -301,8 +312,10 @@ function M.validate(cfg)
     if m == nil then
       cfg.java.mode = "aosp"
     elseif not JAVA_MODES[m] then
+      -- 提示里**只列 README 记的那两个值**: infer 是内部基线, 不引导用户去配它
+      -- (它仍在 JAVA_MODES 里合法通过校验, 只是不作为"可选项"被宣传)。
       log.warn(("java.mode = %q is not a valid value, falling back to 'aosp' "
-        .. "(one of: 'aosp' | 'infer' | 'project')")
+        .. "(one of: 'aosp' | 'project')")
         :format(tostring(m)), { once = true, id = "java_mode:" .. tostring(m) })
       cfg.java.mode = "aosp"
     end

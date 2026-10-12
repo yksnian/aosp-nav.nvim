@@ -732,7 +732,8 @@ exclusions/gradle 禁用) 的 jdtls; 每跳一次攒一个 ~45 MB 的垃圾工�
 断言: 两条真实触发路径 (jdt:// 与 kls 的 `/tmp/…java`, 逐字取自实测) 都复用现有根 /
 无 client 时一律不接管 / **有 `.git` 的树外工程听用户的** / 树外无工程标记的真实文件
 也复用 (它没有可用的根) / 用户 `root_dir` 有结果时一律让位 / 用户函数抛错时不炸 /
-多台 client 的优先级 / 无根 client 跳过 / `mode="project"` 同样挡住。不启任何进程。
+多台 client 的优先级 / 无根 client 跳过 / `mode="project"` 同样挡住 (`jdtls_root_fn` 的
+`project` 分支先走 `reuse_root`, 所以取不到根的缓冲照样复用现有 client)。不启任何进程。
 
 > 写这条测试时踩过一个坑, 记下来免得再犯: 最初用
 > `require("lspconfig.util").root_pattern(...)` 当假 `root_dir`, 而 headless 测试的
@@ -950,32 +951,165 @@ A 树 inject_sync -> union(A) = {A 核心集, A 项目根}
 > 同一份盘点、其中一个先改了世界"这种**跨步**耦合; 真正的验收得把整条 `configure`
 > 跑一遍。
 
+### 2.17 运行中换工作区根 (`workspace/didChangeWorkspaceFolders`) 与每工程字母序截断 (2026-10-12)
+
+两个问题都是 2026-10-12 为把 `java.mode = "project"` 从"重启才能换项目"改成"跟随
+buffer"而做的实测, 用的是**独立 `-data`** (`/tmp/pb-*`, 全程未碰 `~/.cache/nvim/jdtls/`),
+驱动 mason 的 jdtls (`python3 …/bin/jdtls -data /tmp/pb-… -configuration …/config_linux calf`),
+cwd = AOSP 根。
+
+#### (a) 同一台 JVM 能换工作区根, 不需重启 —— 但代价是整份重导入
+
+以 `packages/modules/Connectivity` 为根启动, 发:
+
+```jsonc
+{"method":"workspace/didChangeWorkspaceFolders","params":{"event":{
+  "added":  [{"uri":"file://…/frameworks/base","name":"fb"}],
+  "removed":[{"uri":"file://…/Connectivity","name":"conn"}]}}}
+```
+
+| 观测点 | Connectivity 根 | 切换后 (frameworks/base) | 对照组: 直接以 frameworks/base 冷启动 |
+| --- | --- | --- | --- |
+| `java.project.getAll` | `[]` | `["…/frameworks/base/tests/TouchLatency/app/"]` | `["…/frameworks/base/tests/TouchLatency/app/"]` |
+| `-data` 体积 | 0.4 MB | **43.3 MB** | — |
+| 耗时 | initialize 2.4–3.1 s | **约 60 s** (后台) | — |
+| 进程 | 存活 | **存活** | 存活 |
+
+**切换后与对照组逐字相同** → 变更真的生效, 不是巧合。jdt.ls 自报
+`Updating workspace folders: Adding 1 folder(s), removing 1 folders.`
+结论: **能换, 但要整份重导入, 没有增量信用** —— 切回来要再来一遍。
+这就是 README 里 "project 模式换项目约 1 分钟" 的原文出处。
+
+`java/workspace_follow.lua` 因此**必须**在发出通知时给一条 `log.user` 提示 (而不是
+`log.info`): 用户得知道接下来这一分钟为什么卡。且它只在目标项目与当前根**不同**时出手 ——
+同一个项目里来回切文件是纯字符串比较, 零成本, 不加 timer 也不做防抖。
+
+#### (b) jdt.ls 的 `InvisibleProjectImporter` 按**每工程字母序前缀**截断请求的源码根
+
+`:Aosp` 面板报 3 条 `Java Model Exception (code 969): … does not exist` 的**真正原因**。
+长期怀疑过的四种解释都被测量否掉了:
+
+| 假设 | 否证 |
+| --- | --- |
+| §2.12 的"可见工程阻塞" | 只有 `aosp_3f7ad7da` 一个工程注册, 没有阻塞 |
+| FQN 影子 / 去重 | `framework/src` 与 `framework-t/src` 重叠文件数 = **0** |
+| 文件数阈值 (38/39) | 保留的根里有 2586 / 4638 文件的, 丢弃的里有 **1** 文件的 |
+| 磁盘不存在 | 224 个被丢弃的根**全部存在** |
+
+真正规则: `InvisibleProjectImporter` 对**每个工程独立**地保留所请求源码根的
+**字母序前缀**。实测: `frameworks/base` 保留 218 个里的前 18 (`apex/*` → `cmds/*`),
+`Connectivity` 保留 29 个里的前 5 (`Tethering/*` → `Vcn/*`)。
+`Connectivity/framework/src` 落在它字母序的第 ~12 位, 过了截断点 → 该文件没有
+`PackageFragmentRoot` → `BaseDiagnosticsHandler.collectNonJavaProblems` 里
+`CompilationUnit.getUnderlyingResource()` 抛 969。**确定性地每会话 3 条**, 与索引快慢无关。
+
+推论: **剪 `frameworks/base` 的根救不了 `Connectivity`** —— 两个工程各自截断,
+挪一个不动另一个的截断点。这也解释了为什么"多给源码根"有隐性上限 (`core_source_roots`
+注释里那句"给得越多首次索引越重"之外, 还要加上这条: 超出前缀的根压根不生效)。
+
+#### (c) 测试坑: `-data` 绝不能带 `--jvm-arg=` 前缀
+
+`-data` 是 **equinox 应用参数, 不是 JVM 参数**。写成 `--jvm-arg=-data …` 不报错、
+静默无效 —— 探针于是抢到**用户真实那份索引**(mason wrapper 的默认
+`~/.cache/jdtls/jdtls-<sha1>`), 而不是隔离的 `/tmp`。本机探针因此废过三次。
+正确形态见本节 (a) 的命令行。
+
+另外: 用纯 Python 手搓 JSON-RPC reader 时, `select` 就绪后 `read(1)` 可能返回 `b""`
+(EOF) —— 必须判空返回, 否则后续 `h.split(...)[1]` 抛 `IndexError`, 把"服务器已退出"
+伪装成一个无关的解析崩溃。
+
 ---
 
 ## 3. 导航模式
 
-用户可见三种体验, 由单个键 `java.mode` 表达:
+**对用户只宣传两种体验** (v11 降级后), 由单个键 `java.mode` 表达:
 
-| 体验 | 配置 | 代码路径 |
-| ---- | ---- | ---- |
-| **默认**: 核心集 + 累积 (累积部分由 `source_apply` 增量注入, §2.9; 也可用 `:AospCleanWorkspace` 重建换取"排在 jar 之前") | `mode="aosp"` | `inject_sync` + `on_file` 全开 |
-| 旧 VSCode 行为 (不注入, 靠推断) | `mode="infer"` | 所有注入路径的第一行就 return |
-| VSCode 之前的"按项目开工作区" | `mode="project"` | `root.workspace_root()` 返回 nil; 该模式下不注入 sourcePaths |
+| 体验 | 配置 | 索引范围 | 代码路径 |
+| ---- | ---- | ---- | ---- |
+| **默认**: 核心集 + 累积 (累积部分由 `source_apply` 增量注入, §2.9; 也可用 `:AospCleanWorkspace` 重建换取"排在 jar 之前") | `mode="aosp"` | 整棵树 | `inject_sync` + `on_file` 全开 |
+| 只索引当前项目 (首次导入快, 跨模块落 jar) | `mode="project"` | 一个模块 | `root.workspace_root()` 返回 nil; 注入**该项目自己的**源码根 (`find_for_project`); 运行中换项目见 §2.17 |
+| **(内部, 不写进 README)** 不注入, 靠 jdt.ls 逐文件推断 | `mode="infer"` | **整棵树** (与 aosp 同) | 所有注入路径的第一行就 return |
 
-`mode = "project"` 时 jdtls 的 `root_dir` 落在最近的 `.git`/`.project` 目录,
-每个模块各自一个 Eclipse workspace (磁盘上就是 `~/.cache/nvim/jdtls/{base,Settings,...}/`)。
-这正是本插件接管之前的行为。
+**`infer` 为什么被降级 (v11)**: 它与 `aosp` 的**索引覆盖范围完全相同** —— 都是整棵树的
+workspace, 都要走同样的 invisible project 导入。所以"换 infer 会更快/更轻"是**错的**
+(旧 README 正是这么写的, 已删); 它省掉的只有"维护注入列表"这件事, 而那件事由
+`source_paths_max_projects = 8` 的 LRU 累积 + 核心集兜着, 本就不是开销所在。
+两者唯一可感的差别在**跨模块跳转落点**: `aosp` 落到可编辑 `.java` (受 §2.17b 的字母序
+前缀截断), `infer` 落到反编译 jar —— 也就是说在"能不能跳到源码"这个主诉求上, `infer`
+**更弱**而不是更强。
+
+它唯一还剩的真实价值是**没有注入列表这一层**: 不发明 list 就不会有 list 被 jdt.ls 截断
+(§2.17b) 或"空列表把推断关掉"的失效形态。定位因此是**跳转出问题时的对照/兜底 +
+历史基线 (§11 的 "VSCode 模型")**, 不是给用户的第三个选项。
+
+**保留而不删除的理由**: 它已写好、约 4 行, 且 `t_config.lua:54` 断言了"显式 `java.mode`
+= infer 不因旧键而改变"—— 它是校验表里合法的一员。删它要同时改校验表、配置注释、§11 与
+两条测试, 换来的只是少一个从不被推荐的取值。**但它在 README / 配置表 / `mode` 行内注释里
+一律不出现**; 非法值的告警文案也只列 `'aosp' | 'project'` (见 config.lua 的注释),
+免得用户被引着去配一个没有优势的模式。
+
+**`project` 模式的两段式实现** (v11 重做): 它原先只是"把 `root_dir` 交还用户自己的
+函数", 于是换项目只能靠重启 nvim。现在分两层:
+
+- **第一台** jdtls 的根 → `root.jdtls_root_fn` 在 `project` 分支里用
+  `projects.find_project_root` 取; **已有 client 时一律复用其 `root_dir`** (否则每开一个
+  新模块就另起一台, 重演 §2.13 记的"实测 6 个 workspace")。
+- **已经在跑的那台** 随 buffer 换项目 → `java/workspace_follow.lua` 发
+  `workspace/didChangeWorkspaceFolders`。为什么必须在这一层: nvim 的 `root_dir` 函数在
+  `vim.lsp.start` **那一刻取一次值就固定**, 之后改它不会改变任何事 (Neovim 判复用比的是
+  已有 client 的 root_dir 字面量)。换一台运行中 jdtls 的工作区, 通知是**唯一**入口。
+  实测数据与代价见 §2.17。
+
+旧的 `M.workspace_root_project` (projects.lua) 与它"先问用户函数"的那条路**已删除**,
+没有兼容层。
 
 **一个键, 两个问题 —— 不要合并成同一个谓词:**
 
 - **根是不是 AOSP 根** ⇔ `mode ~= "project"` (`aosp` 与 `infer` 都为真)。
-- **要不要注入 sourcePaths** ⇔ `mode == "aosp"`。
+- **注入什么 sourcePaths** ⇔ `aosp` 注入核心集 + 累积; `project` 注入该项目自己的根;
+  `infer` 一律不注入。
 
-二者在 `aosp` 下一致、在 `infer` 下分道 (根是 AOSP 根, 但不注入)。
 旧的两个键正是把"索引边界"与"是否注入"拆开表达, 结果 `source_paths_mode` 只剩
 一个由 `workspace_mode` 派生的取值 (`project`), 等于一个决定加一个派生值, 于是合并。
-project 模式下注入没有意义 (每个 workspace 里本来就只有一个模块, 推断够用),
-所以该模式下短路所有注入。
+
+**`project` 为什么也要注入 (v11 修, 用户实测发现)**: 早先的实现让 `project` 短路所有
+注入, 理由是"每个 workspace 里本来就只有一个模块, 逐文件推断够用"。这是**错的**:
+jdt.ls 的逐文件推断只覆盖**已经打开过**的文件所在的根源, 于是同一项目里没打开过的类
+**仍会跳到反编译 jar** —— 而"我在这个模块里, 跳本模块的类却给我 jar"正是 project 模式
+最不能接受的失败。用户在 `:Aosp` 面板上看到的是 `preset core: 2 active` 但
+`accumulated: 0 / installed=0`, 而跳转照样落 jar —— 注入了核心集 (属于别的项目)、
+却没注入**自己这个项目**的根。修法见 §5.1 的 `find_for_project`。
+
+注入的列表必须**相对 workspace 根** (= 相对项目目录, §5.1 的基准本就是项目目录),
+且**空列表绝不能下发** (§2.3 / §2.5): 一个没有源码根的目录要当作"不注入"处理,
+而不是发一个空 `sourcePaths` 把 jdt.ls 的全局推断关掉。
+
+**`workspace_root() or aosp_root` 是 project 模式下的一颗地雷 (v11 修, 第二次实测发现)**:
+`M.workspace_root` 在 project 模式**刻意返回 nil** (那是"交还用户语义"的旧契约, §11 的
+第一代), 于是任何 `workspace_root() or aosp_root` 的写法在这里都会**静默拿到 AOSP 根**。
+`init.lua` 用它算 `root_path`, 再把 `root_path` 交给 `find_for_project` —— 结果是把
+**整棵树**当成一个项目扫描并注入。实测数字: `packages/modules/Wifi` 下得到 **331 条**
+源码根 (全是 `build/make/tools/aconfig/...` 之类**别的**模块), 而 Wifi 自己的 4 条
+一条都没有。jdt.ls 的工作区是 `.../Wifi`, 却被塞进一堆指向别处的相对路径, 于是该模块内
+的跳转**全部落回反编译 jar** —— 正是 project 模式的核心承诺失效。
+
+修法是给"jdtls 到底以哪为根"一个**单独的、语义正确的**入口:
+
+```lua
+root.project_dir(fname)  -- project 模式: 项目目录 (规整过的绝对路径); 其他模式 / 无从判断: nil
+```
+
+凡是原先写 `workspace_root() or aosp_root` 的地方一律改用 `project_dir() or workspace_root()`
+(init.lua 的 root_path、ui.lua 的工作区根显示与 `_workspace_dir` 兜底), `workspace_follow.target`
+也改为委托它 —— "当前 buffer 所属项目目录"从此只有**一处**定义。
+面板上 `workspace root` 一行以前在 project 模式显示成 AOSP 根 (同样出自这颗地雷),
+现在显示真实项目目录; 原来那行 `ws project` 与它重复, 已收窄为状态行 `ws follow`
+(只报"运行中那台是否正跟着本项目 / 下一步是否要重导入")。
+
+回归测试: `tests/t_source_roots.lua` 的 `root.project_dir` 一节, 用 `android_root` 钉住
+一棵假树断言"project_dir ≠ AOSP 根"与"项目源码根相对项目目录"。把 `project_dir` 改回
+`aosp_root` 模拟旧 bug 时该节 **5 条失败** (含 `got 2, want 1` 的树相对污染), 说明这组
+断言确实咬得住 —— 写不咬人的断言等于没写。
 
 ---
 
@@ -1023,6 +1157,21 @@ java.source_paths_max_projects 非正整数  ──warn──▶  8
 
 早期版本以 AOSP 根为扫描基准, 结果是: 慢, 且把测试根/影子根一起吞进来, 同名类抢掉正确实现。
 现在的 `root` 参数一律是**项目目录** (最近的 `.git` 所在目录)。
+
+**这个基准正是 `project` 模式能直接复用扫描的原因** (v11): 扫描出来的条目是**相对项目
+目录**的, 而 project 模式的 workspace 根**就是**项目目录 —— 于是同一份扫描结果既是
+"相对 AOSP 根"的路径 (§2.7 要求的 workspace 相对), 又恰好是 project 模式要注入的那批根。
+两个入口 (`M.find` / `M.find_for_project`) 因此共用 `scan_cached()`, 只差一行模式闸门:
+
+```lua
+M.find            -- mode ~= "aosp" 时 return nil    (aosp 模式, 相对 AOSP 根)
+M.find_for_project -- mode ~= "project" 时 return nil (project 模式, 同上结果, 同一缓存)
+```
+
+**空列表在两处都 return nil** (`#list == 0`): 见 §2.3 —— 下发空 `sourcePaths` 会**整体关闭**
+jdt.ls 的逐文件推断且没有任何替代, 比不注入还糟。
+实测 (`packages/modules/Wifi`, 真树): 4 条根 (`OsuLogin/src`、`WifiDialog/src`、
+`framework/java`、`service/java`), 0 条绝对路径, 冷 127 ms / 热 0 ms (同一缓存)。
 
 ### 5.2 取包名
 
@@ -1672,7 +1821,7 @@ classpath **完全相等**且逐条 path 都对得上时才返回工程自己的
 **仓库内**的探针 (见 §10.1):
 
 ```bash
-bash tests/run.sh            # 全部; 13 文件 (默认 427 条断言; 真树/真机块全跑起来时 445)
+bash tests/run.sh            # 全部; 15 文件 (默认 481 条断言; 真树/真机块全跑起来时 499)
 ```
 
 下面两条**曾**用来单跑核心集与增量累积两条路径, 但只在 `/tmp/aospnav-t/` 下存在过,
@@ -1779,20 +1928,22 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_log.lua` | 54 | `util/log.lua`: 四档阈值比较 / `log.user` 绕过阈值 / 会话内 `once` 去重 / `once` 被阈值挡下时**不消费**登记 / 消息前缀 |
 | `t_multi_tree.lua` | 29 | **两棵树共用一个 nvim 会话** (§2.15): 假树造 A/B 两棵树, 零 LSP。两棵树各自推断出正确的根与项目 / 会话切到 B 后**不继承** A 的项目 (旧实现会) / 同一会话里 A·B 同时活动时 `union` 互不污染 / `state(A)` ≠ `state(B)` / 两棵树各有自己的顺序文件且内容不交叉 / `reset(A)` 不动 B / `client(fname)` 按 buffer 的 client 选 (旧实现取 `get_clients()[1]`) / `_is_applied` 按树分开 |
 | `t_path.lua` | 14 | `util/path.start_dir`: `nil`/`""` 归一成 cwd, 绝不能给 `"."` (§7 痛点 4 的根因) |
+| `t_follow.lua` | 27 | `java/workspace_follow.lua` (§2.17): `target()` 只认"树内 + 找得到项目标记"的文件 (树内无标记、树外、`""`、`nil` 一律 nil → 不动, 宁可保持当前工作区) 且第二个返回值是 AOSP 根 / 无 client 不插手 (第一台的根归 `root.lua`) / **已在目标项目之内 → 一次字符串比较后静默返回**, 子目录也算之内 / 跨项目 → 发**恰好一条** `didChangeWorkspaceFolders` 且 `added` 指向新项目 (name 是相对 AOSP 根的路径)、`removed` 是旧根 / **`mode` 为 `aosp`·`infer` 时一条都不发** / 树外文件有 client 也不把工作区搬出 AOSP 树。全部注入假 client + 临时目录, 零 LSP |
 | `t_instances.lua` | 43 | jdtls 实例自检 (§2.16), 全部走**注入的假 /proc** (不碰真进程): 盘点只认真 jdtls (命令行里只**含**那个 jar 名的 `grep`、以及 `-jar` 指向别的 jar 的 java 都不算) / 归属判定 (有主 → `owner_pid`; ppid 链到 init → `orphan`) / `ours` 按 `/proc` 缓存根前缀判 / `jdtls_holders`·`foreign_jdtls` 的旧契约 (含 nil·空串·尾斜杠归一) / `is_stray` 三种正反例 / **回收的两条安全闸** (孤儿+ours 才杀; 有主的、走失的、`enabled=false` 时都不动, 且连 `kill` 都不调) / 默认 killer 对已消失 pid **静默失败** (libuv 的 kill 失败不抛错而是返回 nil, err) / 报告文本: 只有孤儿被回收时返回 `nil` (成功不打扰)、有主的重复给 `kill` 行、走失指向 §2.13、全孤儿时不说"去关 nvim"、**已回收的 pid 不得在 holders 段里再出现一次** (holders 是回收**之前**那份盘点, 不按 pid 扣掉就会"列两遍 + 让你杀一个死 pid"; 这条是 configure 端到端跑出来的回归) |
 | `t_proc.lua` | 19 | `util/proc`: `/proc/<pid>/cmdline` 必须**真的按 NUL 切开参数** (回归"一个 nvim 报 2 个 jdtls 实例") / `is_descendant` 自反与否定 / `comm` 认出 `nvim` (归属判定的地基) / `ancestor_named` 用注入的 reader 造链: 命中 nvim / 走到 init → 孤儿 / 起点自己命中 / comm 读不到 / 成环有上限兜底 / 超过 `limit` |
 | `t_root_from_cwd.lua` | 20 | 痛点 4 的**端到端**回归: 起在 AOSP 根、不打开任何 `.java` 文件时 `aosp_root(nil/"")` 仍拿到树根 (真树断言部分需 `AOSPNAV_LIVE_TEST=1`) |
 | `t_phase.lua` | 19 | `phase` 是活状态的冻结契约: `ui.statusline()` 对 `idle`/`ready`/`indexing`/`no-out`/`failed` 五态各自的渲染 (`indexing` 必须带 `(idx)`) / `install_phase_handler` **链式**调用原有 handler (不吞掉 nvim-jdtls 的 status 消息) / 只有 `ServiceReady` 翻牌, 其余 `ServiceStatus` 不动 / `no-out`/`failed` 不被覆盖 / `err` 非空不翻牌 / 非 jdtls client 不包装 |
+| `t_source_roots.lua` | 27 | `java/source_roots` 两个入口的**模式闸门** (§5.1): `find` 只在 `mode="aosp"` 给结果、`find_for_project` 只在 `mode="project"` 给结果, 另一个一律 nil / 两者共用同一份扫描 (假项目里同样 2 条根) / 结果**全是相对项目目录**的路径, 无绝对路径 (§2.7 的硬要求) / **空项目在两处都返回 nil 而不是空表** (§2.3: 空 `sourcePaths` 会整体关闭 jdt.ls 推断, 比不注入还糟) / `nil`·`""` 入参退化不抛错 / 二次调用命中缓存结果一致。**`root.project_dir` 一节** (§3 的地雷回归): 两个不同项目给出不同根 / **绝不等于 AOSP 根** (旧 bug 的正面回归) / 树内无项目标记 → nil 不猜 / `workspace_root` 在 project 模式仍返回 nil (旧契约) / 非 project 模式退让 / 项目源码根是**项目相对**而非树相对。全部临时目录造假项目, 零 LSP |
 | `t_source_apply.lua` | 26 | `java/source_apply.lua`: `abs_of` 归一 / `installed` 解析 `.classpath` (去重、带 `excluding`、剥 `_/` 前缀、读不到返回 nil 而非空集) / 真机 `pending` 与磁盘 src 交集为 0 且有序 / 累积根"要么已装要么待装, 绝不丢弃" / 已装与待装不相交 / 非 core 模式拒绝 / `classify` 三类真实返回值 / 无 client 时 `auto()` 惰性 / `source_apply_auto=false` → `off` / `report()` 每**棵树**只提示一次 (分区键 = workspace 根; §2.15) |
 | `t_root_fallback.lua` | 22 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 |
 | `t_workspace.lua` | 31 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 | 
 
-合计 **445** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
-`t_jvm` 108 / `t_root_from_cwd` 13 / `t_source_apply` 22, 共 **427**)。
+合计 **499** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
+`t_jvm` 108 / `t_root_from_cwd` 13 / `t_source_apply` 22, 共 **481**)。
 
-> 只有 `t_jvm` (108/115)、`t_root_from_cwd` (13/20) 和 `t_source_apply` (22/26) 三个套件
-> 的条数**随环境而变** (真树/真 jdtls 块整段 SKIP 时不计数), 所以 445/427 是当前环境的
-> 实测值而非不变量; 其余 10 个套件两种跑法条数相同。
+> 只有 `t_jvm` (115/108)、`t_root_from_cwd` (20/13) 和 `t_source_apply` (26/22) 三个套件
+> 的条数**随环境而变** (真树/真 jdtls 块整段 SKIP 时不计数), 所以 499/481 是当前环境的
+> 实测值而非不变量; 其余 12 个套件两种跑法条数相同。
 > 特别注意 `t_jvm` 的真机块: 它要**真有 jdtls 在跑**才算数, 只设 `AOSPNAV_LIVE_TEST=1`
 > 是不够的 (本机 2026-10-10 就出现过"采样时在跑、跑测试时已退出"→ 静默少 7 条)。
 
@@ -1847,9 +1998,10 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 
 | 代 | jdtls root_dir | sourcePaths | 结果 |
 | - | - | - | - |
-| **按项目开工作区** | 最近的 `.git` 目录 | 不注入 | 每个模块一个小 workspace, 模块间索引互不可见。对应 `mode="project"` |
+| **按项目开工作区** (第一代形态) | 当前文件所属项目 (最近的 `.git`) | 不注入 | 只索引这一个模块, 跨模块跳转落到反编译 jar。**这一代的名字后来被 `mode="project"` 继承, 但行为已改** —— v11 起 `project` 会注入**本项目自己的**源码根 (§3), 见下注 |
 | **VSCode 模型** (= `0f27e15`) | AOSP 根 | 不注入 | 整树一个索引, 但跨模块跳转落到反编译 jar。对应 `mode="infer"` |
 | **当前 (默认)** | AOSP 根 | 注入核心集 + 累积 | 跨模块跳转落到真实 `.java` |
+| **只索引当前项目** (v11, 复用第一代的名字) | 当前文件所属项目 (最近的 `.git`) | 注入**本项目自己的**源码根 | 本项目内 (含没打开过的类) 跳真实 `.java`; 项目外落 jar。换项目自动重导入 (~1 min), 见 §2.17 |
 
 中间还有一次失败的尝试: **`attach`** —— 给 `referencedLibraries` 的对象形态挂
 `sourcePaths`, 试图让 jar 带上源码。它整体回退了 (未提交), 不要恢复: §2.2 已证明
@@ -1887,8 +2039,9 @@ KLS 进程的孤儿/残留清理现在是**自动的** (旧的 `:AospKillOrphanK
 **旧的 `.project` 技巧已废弃** (README 的 "About `.project` files" 一节已删): 早期版本
 教你往模块根丢一个空 `.project`, 让 jdtls 的 `root_dir` 从 AOSP 根降回该模块 —— 现在
 默认模式下工作区根**就是** AOSP 根, 该技巧只会让 jdt.ls 把那个目录当成工程导入, 既不
-加速还可能引入重复类。要"只索引一个模块", 用 `java.mode = "project"`; 把 `android_root`
-直接指向该模块也有效, 并能顺带缩小 jar 扫描范围。导入闸门与常量见 §2.1。
+加速还可能引入重复类。要"只索引一个模块", 用 `java.mode = "project"` (它自动跟随 buffer
+换项目, 代价见 §2.17); 把 `android_root` 直接指向该模块也有效, 并能顺带缩小 jar 扫描范围。
+导入闸门与常量见 §2.1。
 
 ---
 

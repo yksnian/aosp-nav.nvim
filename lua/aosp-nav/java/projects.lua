@@ -75,30 +75,4 @@ function M.rel(aosp_root, project_root)
   return project_root
 end
 
---- java.mode == "project" 时的工作区根: 有用户函数就用用户的 (它自带
---- .project/.git 就近取根 + 客户端复用逻辑), 否则按 find_project_root 取。
---- 注意此时 sourcePaths 注入被整体关闭 (java.mode="project" 即不注入),
---- 本函数只决定 jdtls workspace 落在哪。
---- @param fname string|nil 文件路径或目录路径
---- @param user_root string|function|nil
---- @param aosp_root string|nil
---- @return string|nil
-function M.workspace_root_project(fname, user_root, aosp_root)
-  if type(user_root) == "function" then
-    local ok, v = pcall(user_root, fname)
-    -- 返回 nil 是用户的决定 (例如它在 AOSP 树外返回 nil), 原样尊重;
-    -- 抛错则视为"这次答不上来", 回落到项目检测而不是直接放弃
-    if ok then return v end
-  end
-  local static = nil
-  if type(user_root) == "string" and user_root ~= "" then
-    static = normalize(user_root)
-    -- fname 可能是文件, 也可能就是 static 根目录本身
-    local f = normalize(require("aosp-nav.util.path").start_dir(fname))
-    if f == static or f:sub(1, #static + 1) == static .. "/" then return static end
-  end
-  -- 项目检测优先, 检测不出再退回用户的静态根 (它对树外文件仍是有效兜底)
-  return M.find_project_root(fname, aosp_root) or static
-end
-
 return M

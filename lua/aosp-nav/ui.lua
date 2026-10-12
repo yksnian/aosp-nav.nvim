@@ -24,10 +24,11 @@ end
 
 --- 当前生效的模式 (config 契约: 单一 java.mode)。
 ---   "aosp"    = 工作区根是 AOSP 根, 且注入 sourcePaths
----   "infer"   = 工作区根是 AOSP 根, 不注入 sourcePaths
----   "project" = 工作区根是项目目录, 不注入 sourcePaths
+---   "infer"   = 工作区根是 AOSP 根, 不注入 sourcePaths (索引仍覆盖全树)
+---   "project" = 工作区根是**当前 buffer 所属项目**目录, 注入**该项目自己的**源码根;
+---               换项目时自动把运行中的 jdtls 换过去 (约 1 分钟重导入)
 --- 两个问题是**分开**的: "根是 AOSP 根" <=> mode ~= "project";
----                          "注入开着"     <=> mode == "aosp"。
+---                          "注入哪一份"   <=> aosp: 核心集+累积 / project: 本项目 / infer: 无。
 --- @return string
 local function mode_of(cfg)
   return (cfg.java and cfg.java.mode) or "aosp"
@@ -164,32 +165,37 @@ function M.diagnose()
     if not rd or rd == "" then rd = c.config and c.config.root_dir end
     lines[#lines + 1] = line("jdtls",
       ("%d client(s), root=%s, id=%d"):format(#clients, tostring(rd), c.id), true)
-    -- jvm 参数**不在这里**评估了 (原 "jdtls vmargs" 行已搬进 :AospDebug)。
-    -- 理由是实测教训: "cmd 里 -Xmx 写够了" 与 "进程真的健康" 是两件事 —— 一台
-    -- -Xmx8G 配置完全正确的机器上, 新生代被自适应策略压到 19MB、18.5% 的墙钟在
-    -- GC, 而这行静态检查照样显示绿灯 (判据只是字符串)。要判活进程, 就得读活进程。
-    lines[#lines + 1] = line("jdtls jvm",
-      "live GC/heap/threads + -Xmx check: run :AospDebug", nil)
+    -- jvm 参数**不在这里**评估 (原 "jdtls vmargs" 行已搬进 :AospDebug), 也不再摆一行
+    -- "去跑 :AospDebug" 的指路 —— 它是纯静态提示、不含任何本次会话的信息, 属于噪声:
+    -- 面板底部与 :AospDebug 自己的面板都会写明这条命令。据实测教训 (一台 -Xmx8G 配置
+    -- 完全正确的机器上新生代被压到 19MB、18.5% 墙钟在 GC, 静态检查照样绿灯), 要判活
+    -- 进程就得读活进程, 那件事整体归 :AospDebug。
     -- referencedLibraries / import 设置
     local s = c.config and c.config.settings or {}
     local rl = s.java and s.java.project and s.java.project.referencedLibraries
     local n_rl = type(rl) == "table" and #rl or 0
     lines[#lines + 1] = line("referencedLibraries", tostring(n_rl), n_rl > 0,
       action_if(n_rl > 0, ":AospRescan"))
-    -- sourcePaths: 按模式给不同的判据 —— 注入开着 (mode=="aosp") 时"未注入"是故障
-    -- (推断被关掉又没有替代); infer/project 模式下"未注入"才是预期。
+    -- sourcePaths: 按模式给不同的判据。
+    --   aosp:    注入**开着** —— "未注入"是故障 (推断被关掉又没有替代)。
+    --   project: 注入**开着** (v11 起注入本项目自己的根) —— 同样"未注入"是故障。
+    --   infer:   注入**关着** —— "未注入"才是预期 (它靠 jdt.ls 逐文件推断)。
     -- 注意这里问的是"注入开没开", 不是"根是不是 AOSP 根"。
     local sp = s.java and s.java.project and s.java.project.sourcePaths
     local sp_n = type(sp) == "table" and #sp or 0
-    if mode == "aosp" then
-      lines[#lines + 1] = line("sourcePaths",
-        sp_n > 0 and ("injected (%d entries)"):format(sp_n) or "NOT injected (aosp mode!)",
-        sp_n > 0, action_if(sp_n > 0, "check java.core_source_roots / open a .java file"))
-    else
+    if mode == "infer" then
       lines[#lines + 1] = line("sourcePaths",
         sp_n > 0 and ("injected (%d entries)"):format(sp_n)
-          or ("not injected (jdt.ls infers, mode=" .. tostring(mode) .. ")"),
+          or "not injected (jdt.ls infers per file)",
         sp_n == 0, sp_n > 0 and ("mode=" .. tostring(mode)) or nil)
+    else
+      -- aosp / project 都应当注入: aosp 注入核心集+累积, project 注入本项目自己的根
+      local what = mode == "project" and "this project's source roots"
+        or "java.core_source_roots / open a .java file"
+      lines[#lines + 1] = line("sourcePaths",
+        sp_n > 0 and ("injected (%d entries)"):format(sp_n)
+          or ("NOT injected (mode=" .. tostring(mode) .. "!)"),
+        sp_n > 0, action_if(sp_n > 0, "check " .. what))
     end
     local imp = s.java and s.java.import
     local ex_n = imp and imp.exclusions and #imp.exclusions or 0
@@ -204,11 +210,30 @@ function M.diagnose()
   local root_mod = require("aosp-nav.java.root")
   local bufname = vim.api.nvim_buf_get_name(0)
   local aosp_r = root_mod.aosp_root(bufname)
-  local wr = root_mod.workspace_root(bufname) or aosp_r
+  -- project 模式的真实工作区根是项目目录, 而 workspace_root() 在该模式返回 nil ——
+  -- 必须用 project_dir() 取, 写 `or aosp_r` 兜底会把这里显示成 AOSP 根 (假信息)。
+  local project_r = root_mod.project_dir(bufname)
+  local wr = project_r or root_mod.workspace_root(bufname) or aosp_r
   lines[#lines + 1] = line("aosp root", aosp_r or "<not an AOSP file>", aosp_r ~= nil,
     action_if(aosp_r ~= nil, "aosp-nav only manages roots inside an AOSP tree"))
   lines[#lines + 1] = line("workspace root", ("%s (mode=%s)"):format(wr or "<none>", mode),
     wr ~= nil)
+  -- project 模式下工作区根跟着 buffer 走, 所以"**运行中那台**现在指着谁"是一等信息
+  -- (它决定这次跨模块跳转会落到源码还是 jar)。路径本身已经在上面一行了, 这里只说
+  -- 状态与差异; 别的模式下工作区根恒为 AOSP 根, 没有信息量, 不显示。
+  if mode == "project" then
+    local follow = require("aosp-nav.java.workspace_follow")
+    local live = follow.client()
+    local live_root = live and (live.root_dir or (live.config and live.config.root_dir)) or nil
+    local target = follow.target(bufname)
+    local function clean(p) return p and (vim.fn.fnamemodify(p, ":p"):gsub("/+$", "")) end
+    local pending = clean(target) and clean(live_root) and clean(target) ~= clean(live_root)
+    lines[#lines + 1] = line("ws follow",
+      pending and ("will re-import " .. target .. " (~1 min) on the next buffer switch")
+        or (live_root and "following this project" or "no running jdtls"),
+      true,
+      pending and "cross-project jumps will land on jars until the re-import finishes" or nil)
+  end
 
   -- 源码根: 以磁盘 .classpath 为准 (jdt.ls 实际拥有什么); 读不到时退回内存账本。
   local counts = source_root_counts(bufname)
@@ -362,7 +387,8 @@ function M._workspace_dir(fname)
   end
   local rm = require("aosp-nav.java.root")
   local bufname = fname or vim.api.nvim_buf_get_name(0)
-  local root = rm.workspace_root(bufname) or rm.aosp_root(bufname)
+  -- 没有 jdtls 在跑时按"本该以哪为根"推断: project 模式是项目目录, 不是 AOSP 根
+  local root = rm.project_dir(bufname) or rm.workspace_root(bufname) or rm.aosp_root(bufname)
   if not root then return nil end
   return vim.fn.stdpath("cache") .. "/jdtls/" .. vim.fn.fnamemodify(root, ":t") .. "/workspace"
 end
@@ -1067,6 +1093,28 @@ end
 --- @return table string
 local function source_root_lists(aosp_root, st)
   local cfg = get_cfg()
+
+  -- project 模式: 没有核心集、也不累积 —— 那两段在这个模式下恒为空, 列出来会
+  -- 让人以为坏了。改为列**本项目自己**注入的源码根 (正是 v11 起 project 会下发的东西)。
+  if mode_of(cfg) == "project" then
+    local out = {}
+    out[#out + 1] = ""
+    out[#out + 1] = "this project's source roots (injected):"
+    local live = require("aosp-nav.java.workspace_follow").client()
+    local proj = live and (live.root_dir or (live.config and live.config.root_dir)) or nil
+    if not proj then
+      out[#out + 1] = "  (no running jdtls — the roots are resolved from the workspace root)"
+    else
+      local list = require("aosp-nav.java.source_roots").find_for_project(proj)
+      if not list or #list == 0 then
+        out[#out + 1] = "  (none found — jdt.ls infers per file; cross-project jumps land in jars)"
+      else
+        for _, rel in ipairs(list) do out[#out + 1] = "  " .. rel end
+      end
+    end
+    return out
+  end
+
   local out = {}
   out[#out + 1] = ""
   out[#out + 1] = "preset core roots (java.core_source_roots):"
@@ -1150,14 +1198,30 @@ local function source_roots_section(fname)
     and "on-disk .classpath (what jdtls actually has)"
     or "in-memory bookkeeping (no jdtls workspace to read)")
   out[#out + 1] = ("installed   : %d root(s) in the running workspace"):format(counts.installed)
-  out[#out + 1] = ("preset core : %d active of %d configured"):format(
-    st.core, #(cfg.java.core_source_roots or {}))
-  out[#out + 1] = ("accumulated : %d project(s), %d root(s)"):format(#st.projects, acc_roots)
-  out[#out + 1] = ("pending     : %d root(s) accumulated but not yet in the workspace"):format(
-    counts.pending)
-  if counts.pending > 0 then
-    out[#out + 1] = "  -> applied automatically, at most once per session and 5 roots per batch;"
-    out[#out + 1] = "     :Aosp! (bang) applies every pending root immediately."
+  if mode == "project" then
+    -- project 模式注入的是**本项目自己的**根, 没有核心集、也不跨项目累积 ——
+    -- 那三行 (preset core / accumulated / pending) 在这个模式下恒为 0, 摆在面板上
+    -- 只会让人以为坏了。改为报告本项目自己的根。 (见 java/source_roots.find_for_project)
+    local live = require("aosp-nav.java.workspace_follow").client()
+    local proj = live and (live.root_dir or (live.config and live.config.root_dir)) or nil
+    local n = 0
+    if proj then
+      local list = require("aosp-nav.java.source_roots").find_for_project(proj)
+      n = list and #list or 0
+    end
+    out[#out + 1] = ("project     : %s"):format(proj or "<no running jdtls>")
+    out[#out + 1] = ("src roots   : %d root(s) of this project injected"):format(n)
+    out[#out + 1] = "  -> only the current project is indexed; other modules jump to jars."
+  else
+    out[#out + 1] = ("preset core : %d active of %d configured"):format(
+      st.core, #(cfg.java.core_source_roots or {}))
+    out[#out + 1] = ("accumulated : %d project(s), %d root(s)"):format(#st.projects, acc_roots)
+    out[#out + 1] = ("pending     : %d root(s) accumulated but not yet in the workspace"):format(
+      counts.pending)
+    if counts.pending > 0 then
+      out[#out + 1] = "  -> applied automatically, at most once per session and 5 roots per batch;"
+      out[#out + 1] = "     :Aosp! (bang) applies every pending root immediately."
+    end
   end
   -- 只在真有运行期追加根 (accumulated) 时才说这件事: 一个都没追加时, "它们排在 jar 之后"
   -- 无从谈起, 这四行就纯是噪音。
@@ -1194,7 +1258,11 @@ function M.panel()
   vim.list_extend(out, source_roots_section(nil))
 
   out[#out + 1] = ""
-  out[#out + 1] = "-- :Aosp!        force-apply every pending source root now"
+  -- :Aosp! 是"强制注入全部已累积源码根" —— 只有会累积的 aosp 模式才有东西可强推。
+  -- project 模式下不累积 (只注当前项目), 这行是噪音, 不显示。
+  if mode_of(get_cfg()) ~= "project" then
+    out[#out + 1] = "-- :Aosp!        force-apply every pending source root now"
+  end
   out[#out + 1] = "-- :AospDebug    live GC / heap / threads of the running jdtls (add ! for a thread dump)"
   out[#out + 1] = "-- :AospRescan   refresh jars + import.exclusions caches"
   out[#out + 1] = "-- :AospCleanWorkspace  rebuild the jdtls workspace (destructive)"

@@ -90,7 +90,7 @@ require("aosp-nav").setup({
   log_level = "warn",  -- "debug" | "info" | "warn" | "error" | "off"
   java = {
     jar_fallback_dir = "~/.usr/android_jars",
-    mode = "aosp",  -- "aosp" | "infer" | "project"; see "Navigation modes"
+    mode = "aosp",  -- "aosp" | "project"; see "Navigation modes"
     core_source_roots = {
       "frameworks/base/core/java",
       "frameworks/base/services/core/java",
@@ -128,11 +128,16 @@ return {
 
 A single key, `java.mode`, decides both where jdtls's project root (the Eclipse workspace `root_dir`) is and whether the plugin injects Java source roots.
 
-| `java.mode` | Workspace root | Source paths | What you get |
-| ----------- | -------------- | ------------ | ------------ |
-| `aosp` (default) | the AOSP root | injected (preset core set + per-project accumulation) | cross-module navigation into real `.java` sources |
-| `infer` | the AOSP root | not injected — jdtls infers a source root per opened file | the lightest possible index, accepting that cross-module jumps open decompiled jars |
-| `project` | the per-project `.git`/`.project` dir | not injected | one jdtls workspace per module (the behaviour before this plugin took over) |
+| `java.mode` | Workspace root | Source paths | What you get | Switching project |
+| ----------- | -------------- | ------------ | ------------ | ----------------- |
+| `aosp` (default) | the AOSP root | injected (preset core set + per-project accumulation) | cross-module navigation into real `.java` sources | no switch needed |
+| `project` | the dir of **the project the current file belongs to** | injected (**that project's own** source roots only) | only that one module is indexed; jumps inside it reach real `.java`, everything outside opens jars | automatic, full re-import (~1 min) |
+
+Both modes index a whole workspace and persist the result; the difference is **scope**: `aosp` covers the entire tree, `project` covers a single module (which buys a smaller first import). Pick by whether you care more about cross-module jumps or about opening fast.
+
+`project` still injects source paths — but only the roots **of the project you are in**, so that unopened classes inside that project resolve to real sources instead of jars. `aosp` injects a shared core set plus every project you have visited.
+
+In `project` mode the plugin re-roots the **running** jdtls when you switch projects (the LSP `workspace/didChangeWorkspaceFolders` notification, no nvim restart), at the cost of a **full re-import** of that switch — about 1 minute in practice, with an explicit notice when it happens. Switching files within one project triggers no import at all.
 
 The old `java.workspace_mode` / `java.source_paths_mode` keys are gone — use `java.mode`.
 
@@ -160,7 +165,7 @@ For unbuilt projects — e.g. you have multiple Android checkouts, some built an
 
 One panel with two sections:
 
-- **diagnostics** — a checklist, each row marked `v`/`!` with a suggested next action: plugin version / jdtls clients and their root_dir / `referencedLibraries` count / whether `java.project.sourcePaths` was injected (expected when `mode == "aosp"`; the row is a failure if it is missing there) / `java.import.exclusions` count / gradle+maven disabled / AOSP root and workspace root with the active mode / session phase / jar cache freshness / stale Eclipse blockers / jdtls workspace directory and the "jdtls index" row / Kotlin script ownership and KLS client count / whether a foreign jdtls shares the same `-data` and who owns it (`nvim <pid>`, or an orphan). **The JVM `-Xmx` check is not here** — it moved to `:AospDebug` (below), which reads the live process instead of the launch command.
+- **diagnostics** — a checklist, each row marked `v`/`!` with a suggested next action: plugin version / jdtls clients and their root_dir / `referencedLibraries` count / whether `java.project.sourcePaths` was injected (expected in both modes; the row is a failure if it is missing) / `java.import.exclusions` count / gradle+maven disabled / AOSP root and workspace root with the active mode / session phase / jar cache freshness / stale Eclipse blockers / jdtls workspace directory and the "jdtls index" row / Kotlin script ownership and KLS client count / whether a foreign jdtls shares the same `-data` and who owns it (`nvim <pid>`, or an orphan). **The JVM `-Xmx` check is not here** — it moved to `:AospDebug` (below), which reads the live process instead of the launch command.
 - **source roots** — every source root currently injected into `java.project.sourcePaths`: the configured core set (with an `x` marking entries that exist on disk), and for each accumulated project its roots in LRU order. Useful when navigation lands in an unexpected implementation of a duplicated class.
 
 Run it first when something is off.
@@ -249,7 +254,7 @@ Collects jars from a built project's `out/` directory into the fallback dir (`~/
 | java.exclude_merge | append | Merge semantics for the exclusion lists (exclude_jars/paths/globs/import_exclusions): append = user entries are added after defaults; replace = defaults are discarded |
 | java.make_jar_priority            | {classes.jar, classes-header.jar, javalib.jar}               | Make build system jar priority                               |
 | java.make_blacklist               | {android_stubs_current_intermediates}                        | Make build excluded directories                              |
-| java.mode | aosp | `aosp` = workspace root is the AOSP root AND sourcePaths are injected (default); `infer` = workspace root is the AOSP root, sourcePaths NOT injected; `project` = workspace root is the per-project `.git`/`.project` dir, sourcePaths NOT injected |
+| java.mode | aosp | `aosp` = workspace root is the AOSP root AND sourcePaths are injected (default); `project` = workspace root is the dir of **the project the current file belongs to**, sourcePaths are **that project's own** roots, and a project switch re-roots the running jdtls (full re-import, ~1 min) |
 | java.source_apply_auto | true | Automatically apply the accumulated roots to the running jdtls (at most once per session, internally capped at 5 roots) |
 | java.core_source_roots | {frameworks/base/core/java, frameworks/base/services/core/java} | Preset source roots, relative to the AOSP root, injected from the first import. Replaces the default list wholesale |
 | java.source_paths_max_projects | 8 | Upper bound on accumulated `.git` projects (LRU eviction, `0` = unlimited) |
@@ -313,7 +318,7 @@ The plugin checks for this at startup and warns you; the `workspace blockers` li
 That means jdt.ls resolved the type from a jar instead of from source. Check, in order:
 
 1. `:Aosp` — the `sourcePaths` row must read `injected (N entries)`. If it reads "NOT injected" while `java.mode = "aosp"`, the configured `java.core_source_roots` did not resolve on disk (wrong AOSP version, or a typo) — the source-roots section shows each entry with an `x` when it exists.
-2. `:Aosp` — the `source projects` row reads `core=N projects=N installed=N pending=N`. If `pending` is greater than 0, roots you have accumulated are **not** in the running workspace yet; see the next point.
+2. `:Aosp` — the `source projects` row reads `core=N projects=N installed=N pending=N`. If `pending` is greater than 0, roots you have accumulated are **not** in the running workspace yet; see the next point. In `project` mode this row instead reads `project :` / `src roots : N root(s) of this project injected`.
 3. `:Aosp` — if the class lives in a project that is not listed under source roots, open any `.java` file from that project once; its roots are scanned in the background and remembered (cached on disk). If the project was pushed out by `source_paths_max_projects`, raise the limit or revisit it (`:AospRescan` clears the accumulation).
 4. When `pending > 0`, the plugin applies the pending roots automatically (once per session, at most 5 roots); if they are still pending, run `:Aosp!` to force-apply them.
 5. To get the new roots in front of the jars as well → `:AospCleanWorkspace` and reopen. That path costs a full re-index, and restarting the LSP client is not enough — jdt.ls skips re-importing a project it already knows.
@@ -334,7 +339,7 @@ AIDL/proto/aconfig classes (Stub/Proxy) are generated into `out/` by the build s
 
 ### jdtls workspace cache path and first-index duration
 
-In the default mode the workspace root is the AOSP root, so there is exactly one Eclipse workspace: `~/.cache/nvim/jdtls/<aosp-root-dir-name>/workspace` (e.g. `~/.cache/nvim/jdtls/aosp/workspace`). With `mode = "project"` there is one such directory per module. First-time indexing is CPU-heavy and takes a while depending on the tree and on how many source roots are injected; the index is persisted, so subsequent opens load incrementally. **Do not close/restart jdtls while indexing.**
+In the default mode the workspace root is the AOSP root, so there is exactly one Eclipse workspace: `~/.cache/nvim/jdtls/<aosp-root-dir-name>/workspace` (e.g. `~/.cache/nvim/jdtls/aosp/workspace`). With `mode = "project"` there is one such directory per module. First-time indexing is CPU-heavy and takes a while depending on the tree and on how many source roots are injected; the index is persisted, so subsequent opens load incrementally. **Do not close/restart jdtls while indexing.** Under `mode = "project"`, switching projects re-imports and rebuilds the index — that is expected (the "~1 min" in the notice), not a fault.
 
 If config changes don't take effect or navigation breaks, rebuild the workspace:
 

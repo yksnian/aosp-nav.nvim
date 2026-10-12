@@ -181,11 +181,14 @@ function M.configure(opts)
   local user_root = opts.root_dir
   opts.root_dir = root_mod.jdtls_root_fn(user_root)
   -- aosp_root 与 workspace_root 在默认模式下相同, 但语义不同且都会用到:
-  --   aosp_root      = jar 收集 / import.exclusions / 项目相对路径的基准, 恒为 AOSP 根
-  --   workspace_root = jdtls 索引的根 (project 模式下是项目目录)
-  -- sourcePaths 注入的基准一律用 aosp_root, 否则 project 模式下项目路径算错。
+  --   aosp_root      = jar 收集 / import.exclusions 的基准, 恒为 AOSP 根
+  --   workspace_root = jdtls 索引的根 (project 模式下是项目目录; 该函数在 project
+  --                    模式下返回 nil, 所以**不能用 `or aosp_root` 兜底** ——
+  --                    那会把整棵树当成项目, 见 root.project_dir 的注释)
+  -- sourcePaths 注入的**基准**是工作区根: aosp 模式下它就是 AOSP 根, project 模式下
+  -- 是项目目录 (注入的根必须是 workspace 相对路径, 见 §2.7)。两者都用 root_path 表达。
   local aosp_root = root_mod.aosp_root(bufname)
-  local workspace_root = root_mod.workspace_root(bufname)
+  local workspace_root = root_mod.project_dir(bufname) or root_mod.workspace_root(bufname)
   local root_path = workspace_root or aosp_root
 
   -- 2. JAR 收集 (jars.lua 自己按 android_root 检测/缓存)。
@@ -215,6 +218,16 @@ function M.configure(opts)
     source_inject = require("aosp-nav.java.source_inject")
     -- 同步 + 只读缓存: sourcePaths 必须出现在 initialize 请求里
     source_paths = source_inject.inject_sync(java_cfg, aosp_root, bufname)
+  elseif java_cfg.mode == "project" and root_path then
+    -- [v11] project 模式注入**本项目自己的**源码根 (相对该项目 = 相对 workspace 根)。
+    -- 不注入的后果是: 从本项目跳到同项目里没打开过的类也会落 jar —— 明明索引的就是
+    -- 这一个模块, 却因为 jdt.ls 的推断只认"打开过的文件"而失手 (用户实测面板里
+    -- `preset core: 2 active` 却不下发, 正是这个问题的可见面)。
+    -- 只答当前这一个项目, **不累积跨项目** —— 那正是 project 与 aosp 的分界。
+    -- 空列表返回 nil, 此处自然不下发 (空 sourcePaths 会关掉推断且没有替代)。
+    source_paths = require("aosp-nav.java.source_roots").find_for_project(root_path, {
+      no_cache = false, -- 允许读缓存; 冷启动时同步扫一次 (与 aosp 的核心集同量级)
+    })
   end
 
   -- 5. inlay hints: android 项目 -> off (避签名损坏 NPE), 非 android -> all
@@ -376,6 +389,23 @@ function M.configure(opts)
       pattern = "jdt://*",
       desc = "aosp-nav: one-time hint when a go-to-definition lands in a decompiled jar",
       callback = function(args) hint_if_jar_jump(args.buf) end,
+    })
+  end
+
+  -- 9b. [v11] mode == "project": 让**运行中**的 jdtls 跟随当前 buffer 换项目。
+  --     新 "project" 模式的语义 = 只索引当前项目 (首次导入快), 跨模块跳转落 jar。
+  --     root_dir 函数只决定**第一台**的根 (它在 vim.lsp.start 时取一次值就固定),
+  --     所以换项目只能靠发 workspace/didChangeWorkspaceFolders —— 这里就是那个入口。
+  --     实测代价 (DEVELOPMENT §2.17): 换一次 = 整份重导入, 约 1 分钟。
+  --     只在 project 模式注册: 别的模式下这个钩子是纯开销。
+  if is_android and java_cfg.mode == "project" then
+    local grp = vim.api.nvim_create_augroup("aosp_nav_workspace_follow", { clear = true })
+    vim.api.nvim_create_autocmd("BufEnter", {
+      group = grp,
+      desc = "aosp-nav: re-root the running jdtls to the project of the current buffer",
+      callback = function()
+        require("aosp-nav.java.workspace_follow").on_buf_enter()
+      end,
     })
   end
 
