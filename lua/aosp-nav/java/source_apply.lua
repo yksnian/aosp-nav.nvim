@@ -441,10 +441,15 @@ function M.apply(opts)
   end
   -- 手动非 force: 保留旧的"超限即拒绝"形状 (绝不静默灌一大排 classpath 变更,
   -- 每条 addToSourcePath 都是一次 classpath 重建)。force (:Aosp!) 绕过。
+  -- 提醒内存: 批量注入 = 反复全量重建, 堆可能顶上 -Xmx —— 实测有把 jdtls 撑到
+  -- OOM 被杀的先例, 所以先建议重启 (重启走 initialize.sourcePaths, 一次性且顺序更优),
+  -- :Aosp! 只作为"就要现在做"的第二选择。
   if #pending > MAX_BATCH and not opts.force then
     log.warn(("%d source roots pending — more than the %d/run safety limit.\n"
       .. "This usually means the .classpath baseline was misread or the initial import "
-      .. "never injected sourcePaths. Re-run as :Aosp! to force.")
+      .. "never injected sourcePaths. Prefer restarting jdtls (they are applied in one "
+      .. "pass on the next start); re-run as :Aosp! only if you need them now — it "
+      .. "rebuilds the whole classpath per root and can exhaust the JVM heap.")
       :format(#pending, MAX_BATCH), { timeout = 12000 })
     return
   end
@@ -485,22 +490,51 @@ local function arm_poll(key, fname)
 end
 
 --- 自动路径没能完成时的**唯一**一次提示 (每棵树最多一次)。
---- must-see 情况 #4: 自动源码根注入在重试预算耗尽后仍失败 —— 这条必须让用户
---- 看见 (默认阈值降到 warn 后, 旧代码里 INFO 的失败提示会彻底消失)。
---- @param status string
+---
+--- **这不是故障, 是"本次会话的临时状态"** —— 累积列表已落盘, 下次启动经
+--- inject_sync + initialize.sourcePaths 一次性注入 (顺序还比运行期追加更优),
+--- 所以用户**无需动作**。于是它走 `log.info` 而**不是** `log.user` (同
+--- java/init.lua 那条 "跳到 jar" 的判例): 默认阈值 warn 下不可见, 调到 info 能看全,
+--- 同样的结论在 :Aosp 面板的 `pending` 一栏也常驻。它**不再占用 must-see 席位**。
+---
+--- 也**不再建议 :Aosp!**: 运行期 addToSourcePath 是整条 classpath 重建, 批量大会把
+--- 堆顶上 -Xmx 触发 OOM (2026-10-12 实测把 jdtls 直接杀掉) —— 绝不该在一条"自动
+--- 失败但会自愈"的提示里, 劝用户去做那件更危险的事。
+--- @param status string 内部状态名 (not-ready / no-client / unknown)
 --- @param detail any
 --- @param key string client 分区键
+--- @return string|nil 实际发出的文案 (nil = 被闸挡下); 供测试断言
 function M.report(status, detail, key)
   key = key or "?"
-  if _auto_reported[key] then return end
+  if _auto_reported[key] then return nil end
   _auto_reported[key] = true
-  -- id 也带上 key: util/log 的 _seen 是按 id 全局去重的, 固定 id 会把第二棵树的
-  -- 那条静默吞掉 —— 而 :Aosp! 只作用于当前 buffer 所在的那棵树, 两棵树各说一次
-  -- 才是可行动的。
-  log.user(("could not add the pending source roots automatically (%s%s).\n"
-    .. "Run :Aosp! to add them by hand — no workspace rebuild needed.")
-    :format(status, detail and (": " .. tostring(detail)) or ""),
-    { level = "warn", id = "source-apply-failed:" .. key, timeout = 12000 })
+  -- 承诺"下次自动生效"的依据是**已落盘**的累积列表: 数一下里面有几个项目。
+  -- 读内存态 (启动时由 inject_sync 从磁盘种入), 不扫描、不发请求。
+  -- 非 aosp 模式走不到这里 (auto() 在那之前就返回 "off"), 所以 key (= aosp 模式
+  -- 下 client 的 workspace 根) 就是 aosp_root; 取不到也只是退化成不带数字的文案。
+  local n = 0
+  local ok, st = pcall(function()
+    return require("aosp-nav.java.source_inject").state(key)
+  end)
+  if ok and st and st.projects then n = #st.projects end
+  -- 文案只讲两件事: 本次会话会怎样 (退回 jar)、下次会怎样 (自动生效); 不提命令。
+  -- "fall back to jars" 用 fall back 而非 "use jars": 只有这些根**独有**、jdt.ls
+  -- 推断覆盖不到的类才落 jar, 已导入模块内的照常跳真实源码 (不夸大影响面)。
+  -- 状态名与 detail 只进 debug —— 用户不需要知道 not-ready 是什么。
+  local body = "Jumps to classes outside the imported modules fall back to jars "
+    .. "for this session — applied automatically on next start."
+  local msg = (n > 0
+    and ("source roots from %d project(s) are not in jdtls yet "
+      .. "(it was still importing).\n"):format(n)
+    or "some source roots are not in jdtls yet (it was still importing).\n")
+    .. body
+  if log.enabled("debug") then
+    log.debug(("auto source-root apply gave up: %s%s"):format(
+      status, detail and (": " .. tostring(detail)) or ""))
+  end
+  -- id 带 key: util/log 的 _seen 按 id 全局去重, 固定 id 会把第二棵树的那条吞掉。
+  log.info(msg, { id = "source-apply-deferred:" .. key, timeout = 12000 })
+  return msg
 end
 
 --- 试一次自动注入。任何"现在做不了"的情况都只是返回状态, 由 auto_apply 决定是否轮询。

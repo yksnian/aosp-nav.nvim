@@ -545,9 +545,10 @@ function M.configure(opts)
     --        跑在 client 启动**之前**, 赶在两个 JVM 打架之前清场; 杀掉后等它落完
     --        最后一份索引 (上限 3 秒) 再继续。
     --     b) 剩下的**有主**重复 (真开了两个 nvim) —— 报给用户, 只提示不杀。
-    --     c) **走失 JVM** (§2.13: 取不到根的缓冲引出的那台, -data 落在
-    --        ~/.cache/jdtls/ 而不是我们这份) —— 只报, 连删都不删 (它可能压根不属于
-    --        本插件这条链)。它不共用我们的 -data, 所以 (a)(b) 都看不见它。
+    --     c) -data 落在别处、不跟我们共用索引的 jdtls (比如别的编辑器起的):
+    --        **完全不理**。它既不抢我们的索引, 也不该由我们去告诉用户杀掉别人
+    --        正在用的 server。早先有一版会把它报成"走失 JVM"并劝人删目录, 对用户
+    --        纯属噪音 (还把人自己的 VSCode 报了进去) —— 已整个拿掉。
     --     自动做掉的事不单独通知 (见 DEVELOPMENT §2.10): 报告文本由
     --     ui.instances_message 生成, 无话可说时返回 nil。
     local inv = ui.jdtls_inventory()
@@ -556,19 +557,14 @@ function M.configure(opts)
     if #reaped > 0 then
       log.debug("reaped orphan jdtls (SIGTERM): " .. table.concat(reaped, ", "))
     end
-    local strays = {}
-    for _, r in ipairs(inv) do
-      if ui.is_stray(r) then strays[#strays + 1] = r end
-    end
     local msg = ui.instances_message({
       ws_dir = ws_dir,
       holders = ui.foreign_jdtls(ws_dir, inv),
-      strays = strays,
       reaped = reaped,
     })
     if msg and not _instances_warned[ws_dir or ""] then
       _instances_warned[ws_dir or ""] = true
-      -- must-see 情况 #2: 外部 jdtls 共用同一 -data 目录 / 走失 JVM
+      -- must-see 情况 #2: 外部 jdtls 共用同一 -data 目录
       log.user(msg, { id = "instances:" .. (ws_dir or "?"), timeout = 20000 })
     end
   end

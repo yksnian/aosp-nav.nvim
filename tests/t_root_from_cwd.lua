@@ -46,7 +46,8 @@ not_dot(vim.fn.getcwd(), "cwd")
 -- ---------------------------------------------------------------------------
 -- 有真树时的验收
 -- ---------------------------------------------------------------------------
-local LIVE = "/home/yangwj12/project/aosp"
+-- 真树路径由 $HOME 拼出 (~ 在 Lua 字符串里不会展开), 不写死任何用户名
+local LIVE = (vim.env.HOME or "") .. "/project/aosp"
 local HANDLER = LIVE .. "/frameworks/base/core/java/android/os/Handler.java"
 local saved_cwd = vim.fn.getcwd()
 

@@ -292,6 +292,14 @@ function M.verdict(snap)
       add("xmx_small", "warn",
         ("-Xmx%s is below the measured floor for a full AOSP tree"):format(tostring(a.xmx_text)),
         a.advice)
+    elseif not a.host_ok then
+      -- -Xmx 够大, 但比物理内存还大 —— 这条**必须**独立于 xmx_small 报: 堆内部指标
+      -- (old gen %、full GC 间隔) 这时通常全绿, 旧版面板恰恰因此漏报 (见 jvm.lua 注释)。
+      add("xmx_over_host", "warn",
+        ("-Xmx%s is %d%% of this host's %s RAM — larger than the machine it runs on")
+          :format(tostring(a.xmx_text), math.floor(a.host_ratio * 100 + 0.5),
+            M.fmt_bytes(a.mem_total)),
+        a.advice)
     end
   end
 
@@ -385,6 +393,13 @@ function M.render(snap, findings)
     row("vmargs", ("-Xmx%s%s%s"):format(
       a.xmx_text or "none", a.parallel_gc and " +ParallelGC" or "",
       a.xmx_ok and "" or "  (too small)"))
+    -- 宿主内存一行: -Xmx 只要跟物理内存比才有意义。放这里用户一眼能看出
+    -- "堆上限比机器还大" —— 这正是旧版漏掉的盲区。
+    if a.mem_total then
+      row("host mem", ("%s   -Xmx = %d%% of RAM%s"):format(
+        M.fmt_bytes(a.mem_total), math.floor((a.host_ratio or 0) * 100 + 0.5),
+        a.host_ok and "" or "  (too large)"))
+    end
   end
 
   -- 报的是**哪种 GC**, 用 -XX:+UseXxxGC 的写法 (用户能对上自己配的参数)。

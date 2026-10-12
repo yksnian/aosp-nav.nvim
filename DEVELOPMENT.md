@@ -174,7 +174,7 @@ if (hasTargetFile(dir)) directories.add(dir);        // 命中 .project/.classpa
 
 即 `<root_dir 的 basename>_<Java hashCode 的无符号 16 进制>`。Lua 侧按 `h = h*31 + byte`
 + 2^32 环绕 + `%x` 复算即可 (`ui.invisible_project_name`)。已知向量:
-`/home/yangwj12/project/aosp` → `aosp_3f7ad7da` (与本机真实工作区一致)。
+`~/project/aosp` → `aosp_3f7ad7da` (与本机真实工作区一致)。
 有了它, 一次 `glob` 就能把"本该存在的 invisible project"与"外部可见工程"分开 ——
 前缀匹配会误伤名字恰好以 `aosp_` 开头的正常工程。见 `ui.workspace_blockers`。
 
@@ -509,6 +509,10 @@ AOSP 树内) 时, 退到**任一已加载且落在 AOSP 树内的 `.java` 缓冲
 `no-client` 先按 8s 重试, 其余按 45s 重试, 每会话最多 3 次静默重试, 之后才 `report()` 一次;
 `toomany` 不重试、直接说。
 
+(2026-10-12 起实现改为**有界轮询** `arm_poll` 而非固定墙钟重试: 每 5 s 一档, 总预算
+`AUTO_DEADLINE_MS` = 5 分钟, 预算耗尽由 `M.report` 出声 —— 且那条提示已降为 `log.info`
+且不再劝 `:Aosp!`, 理由见 §2.10.1。)
+
 ### 2.10 通知策略 (`util/log.lua`)
 
 `util/log.lua` 是插件**唯一**的"对用户说话"出口。它存在之前的乱象就是理由: 历史上
@@ -534,16 +538,22 @@ AOSP 树内) 时, 退到**任一已加载且落在 AOSP 树内的 `.java` 缓冲
 | # | 场景 | 触发点 |
 | - | ---- | ------ |
 | 1 | 工作区里存在**活**的外部可见工程 (空壳已自清, §2.12); 仅在有 Gradle 下载证据时才追加 `:AospCleanWorkspace` 指引 | `java/init.lua:504` |
-| 2 | 有别的 jdtls 进程共用同一个 `-data` 目录 (索引互相覆盖, §8.1; 2026-10-10 起报出**归属**, §2.16) / 或存在走失 JVM。**孤儿会被自动回收, 不进这条消息** | `java/init.lua:542` |
+| 2 | 有别的 jdtls 进程共用同一个 `-data` 目录 (索引互相覆盖, §8.1; 2026-10-10 起报出**归属**, §2.16)。**孤儿会被自动回收, 不进这条消息**; `-data` 在别处 (别的编辑器起的) 一律不理 | `java/init.lua:542` |
 | 3 | 破坏性的 `:AospCleanWorkspace` 确认 | `ui.lua:1232` |
-| 4 | 自动注入源码根在耗尽重试预算后失败 (§2.9) | `java/source_apply.lua:499` |
-| 5 | 首次运行需同步扫描残留 Eclipse 目录 (排除项冷缓存, 数秒) | `java/import_exclusions.lua:160` |
+| 4 | 首次运行需同步扫描残留 Eclipse 目录 (排除项冷缓存, 数秒) | `java/import_exclusions.lua:160` |
 
-全仓 `log.user` 一共 **6 个调用点**: 上表 5 个是插件**主动**开口 (席位统计只数这五个);
-第 6 个是 `java/source_apply.lua:398` —— 手动 `:Aosp!` 失败后的回报。用户刚敲了命令,
+**自动注入失败已从席位中移出 (2026-10-12)**: 原先它是席位 #4 (warn, 且劝用户敲 `:Aosp!`)。
+按"无需动作的事不占音量"的判例 (与 `java/init.lua:106` 那条"跳到 jar"同构) 改为
+`log.info` —— 它讲的是"本次会话退回 jar、下次启动自动生效", 用户此刻不需要做任何决定。
+改这一条的真实动因见 §2.10.1: 它原来劝的那条路 (`:Aosp!`) 恰恰会把 jdtls 撑到 OOM。
+所以 `log.user` 的**主动席位从 5 个减到 4 个** (上表)。
+
+全仓 `log.user` 一共 **5 个调用点**: 上表 4 个是插件**主动**开口 (席位统计只数这四个);
+第 5 个是 `java/source_apply.lua:398` —— 手动 `:Aosp!` 失败后的回报。用户刚敲了命令,
 结果当然要照实告知, 它不算"主动打扰", 也不占席位。改这块时别只 grep `log.user` 就以为
 多出了一处违规。(`:AospDebug!` 落 thread dump 的两条也是同一类: 用户刚敲了命令。
-**席位没变** —— §2.16 的孤儿回收走 `log.debug`, 不开口。)
+另有 `java/source_apply.lua:533` 的 `log.info` —— 它**不是** `log.user`, 上面的统计只数
+`log.user`; 别把它算进来。§2.16 的孤儿回收走 `log.debug`, 同样不开口。)
 
 **指导原则**: **插件能自动做掉的事就自动做掉, 只就该由用户拍板的事开口。** 一次成功
 的自动操作不是通知 —— 它的结果属于 `:Aosp` 面板。所以 `java/init.lua:106` 那条
@@ -553,6 +563,38 @@ AOSP 树内) 时, 退到**任一已加载且落在 AOSP 树内的 `.java` 缓冲
 
 `log.warn(msg, { once = true, id = ... })` 按 id 去重 (§4 的归一告警用它, 避免每次
 setup 刷屏); 被阈值挡下的调用**不登记 id**, 否则调高阈值后再触发就永远看不到了。
+
+### 2.10.1 `:Aosp!` 会把 jdtls 撑到 OOM —— 别再劝用户敲它 (2026-10-12 实测)
+
+**现象** (用户实测): 面板报 `could not add the pending source roots automatically
+(not-ready)` (即自动注入在 5 分钟预算内没等到就绪窗口), 于是照旧文案敲了 `:Aosp!`;
+随后 **nvim 明显卡顿, jdtls 报错退出**。
+
+**取证** (全部只读, 未动用户工作区):
+- 内核日志 `dmesg` / `journalctl`:
+  `GC Thread#6 invoked oom-killer` → `Out of memory: Killed process <pid> (java)
+  anon-rss:8057792kB` —— **7.7 GB**, 正是配置里的 `-Xmx8G`。触发者是 **JVM 自己的
+  GC 线程** (申请内存失败 → 全局 OOM), 被杀的 java 就是那台 jdtls。
+- jdtls 的 `.metadata/.log` 在注入完成后**戛然而止** (无 shutdown 序列), 时间线:
+  `:Aosp!` → 串行 `addToSourcePath` → `.classpath` 于 16:05:52 改写 → 立即整份重算
+  classpath + 重建索引 → 16:09 OOM。
+- 日志里的 `Java Model Exception (code 969): _/… does not exist` 是**次生症状**:
+  目录在磁盘上确实存在, 是 classpath 刚改、JDT model 重建中的竞态 (重建完自愈),
+  **不是**崩溃原因。
+
+**机理**: `:Aosp!` 走 `M.apply` 的 force 分支, 恰好**拆掉自动路径的三道闸** ——
+不等就绪、单批无上限、可能正忙时动手。而每条 `addToSourcePath` 都是一次**全量
+classpath 重建** (§2.9 表), 注入 N 条 = N 次重建, 堆持续冲高直至 `-Xmx`。
+
+**结论 (两道改动)**:
+1. 自动注入失败的提示**不再建议 `:Aosp!`** —— 改 `log.info`, 只说"本次退回 jar、
+   下次启动自动生效"(见 §2.10)。
+2. **优先重启 jdtls**: 累积根下次启动经 `inject_sync` + `initialize.sourcePaths`
+   **一次性**注入, 顺序还排在 jar 之前 (优于运行期追加到末尾)。`:Aosp!` 降级为
+   "就要现在用"的第二选择, 手动超限告警里补了内存代价说明与"优先重启"的建议。
+
+**给用户的实操建议**: 见到 `pending > 0` 先重启 nvim, 别敲 `:Aosp!`。`-Xmx8G` 在
+15 GiB 机器上空载可用, 但与别的负载并存时偏激进 (可降到 6G, 代价是 full GC 变多)。
 
 ### 2.11 jar 分桶去重与 AOSP 兼容补丁 (从 README Features 移入)
 
@@ -675,7 +717,7 @@ argv 里带着这个 `-data`** (`util/proc.argv` 逐参数匹配, 不是子串�
 5. `-data` 缺席 → mason 的 jdtls python wrapper 用它自己的默认值
    `~/.cache/jdtls/jdtls-<sha1(cwd 的 basename)>` (`jdtls.py:99`)。
    **闭合验证两次**, 两次都靠 `sha1` 反查 cwd 的 basename 对上:
-   `sha1("yangwj12") == feb416b998b9c9b946d6d1bf6c8319eed8a3574e` (第一次, cwd=$HOME) 与
+   `sha1("<$HOME 的 basename>") == feb416b998b9c9b946d6d1bf6c8319eed8a3574e` (第一次, cwd=$HOME) 与
    `sha1("jdtls") == 6577a689d38cf4eb6f3b1b0a9ab5863258a9a0b5` (第二次, cwd=`~/.cache/jdtls`)。
    第二次的线索还来自那台垃圾 jdtls 自己的日志:
    `Failed to create linked resource from file:///tmp/kotlinlangserver…/Handler….java
@@ -880,7 +922,7 @@ A 树 inject_sync -> union(A) = {A 核心集, A 项目根}
 > 内存状态清空 —— 这正是"下次启动"的语义, 且对新旧实现都成立 (所以它**能咬住旧代码**;
 > 单纯在同一进程里调用两次 `inject_sync` 咬不住, 因为 `_projects` 已经缓存了)。
 
-### 2.16 jdtls 实例自检: 归属 / 孤儿回收 / 走失 (2026-10-10)
+### 2.16 jdtls 实例自检: 归属 / 孤儿回收 (2026-10-10)
 
 **起因**: 工作站上每次开 nvim 都弹
 
@@ -894,13 +936,45 @@ A 树 inject_sync -> union(A) = {A 核心集, A 项目根}
 `ps` 一遍。旧文案给的处置也过重: `:AospCleanWorkspace` 要几十分钟重建, 而杀掉多余的
 那台之后, 活着的那台内存里有完整索引, jdt.ls 会自己重写落盘 (§索引自修复)。
 
-**三个成因, 只有第一个能自动做掉**:
+**报告只讲一件事**: 有**别人的** jdtls 正在用**同一个 `-data`** (两个 JVM 互相覆盖索引
+= 真会坏, 必须让用户去关掉一个)。起因里那种"两个 pid 不知道谁是谁"的情形, 现在就靠
+这一条说清楚。
 
 | 形态 | 成因 | 处置 |
 | ---- | ---- | ---- |
 | **孤儿** | 上一个 nvim 崩了 / 被 `kill -9` / WSL 里终端被关 —— 它拉起的 jdtls 被 init 收养, 一直占着 `-data`, 于是之后**每个**新会话都撞上 | 没有任何会话拥有它 = 纯垃圾。**自动 SIGTERM** |
 | **有主** | 用户真的开了两个 nvim 在同一棵树 | 报出归属 (`nvim <pid>` + 它的 cwd), 让用户去关那一个。**只报不杀** |
-| **走失** | §2.13: 取不到根的缓冲引出的那台, `-data` 落在 `~/.cache/jdtls/jdtls-<sha1>` | 它不抢我们的索引, 但白烧一个堆。**只报**, 连删都不删 |
+| **-data 在别处的 jdtls** | 任何**别的程序**起的 jdtls (VSCode 的 redhat.java、IntelliJ、Eclipse、Emacs、将来某个新工具) —— `-data` 在各自的数据目录里 | **完全不理**: 既不报, 也不回收 |
+
+**"-data 在别处"这条曾经被报出来过, 已整个删掉 (2026-10-12 用户拍板)**。它的来历是
+§2.13: 取不到根的缓冲引出过一台 jdtls, `-data` 落在 mason wrapper 自己的默认目录
+`~/.cache/jdtls/jdtls-<sha1>`。当时插件为此加了一段专门的报告, 劝用户"杀掉它并删掉它
+那个目录" —— 但那条建议**只对我们自己这条链**成立。用户实测时弹出来的正是自己 VSCode
+的进程:
+
+```
+[aosp-nav] 1 jdtls JVM(s) point -data outside /home/…/.cache/nvim/jdtls: pid 883449
+  — -data /home/…/usr/VSCode-linux-x64/data/user-data/User/workspaceStorage/…/redhat.java/jdt_ws
+That is the JVM started for a buffer with no project root (DEVELOPMENT.md §2.13).
+```
+
+中间修过两轮: 先是黑名单 (认出 `vscode`/`redhat.java` 就不报), 用户指出不成立 ——
+**下一个没见过的 IDE 又会被误报**; 改成白名单 (`-data` 必须落在 `~/.cache/jdtls/` 之下
+才报)。白名单本身是对的 (§2.13 的走失路径确实只有这一条), 但**这道题根本不该出**:
+
+1. 那台 JVM 不跟我们共用 `-data`, 也就**不会互相覆盖索引** —— 它不构成 §2.16 要解决的
+   任何问题, 却白烧用户一个堆的提示额度;
+2. 处置只有"杀掉"一条, 而它也**未必真该杀** —— 用户自己刚开的 VSCode 就在名单里;
+3. 文案要把 `-data` 路径、mason wrapper、DEVELOPMENT §2.13 全讲一遍用户才看得懂。
+   用户的评价: **"DEVELOPMENT.md §2.13 是啥用户根本不知道啊"**。
+
+结论: 判据再准, 一条**不可操作**的提示也是噪音。删掉整段报告后, `ui.is_stray` /
+`ui.is_mason_stray` 与 `init.lua` 里组装 `strays` 的那段一并移除, `instances_message`
+的入参退回 `{ ws_dir, holders, reaped }`。**注意 `ours` 这个记录字段保留** —— 孤儿回收的
+第 2 条安全闸 (`r.orphan and r.ours`) 与 `jdtls_inventory` 都还在用它, 删的只是**显示**。
+
+> §2.13 那台 JVM 本身并没有被无视: `M.reuse_root` 已经让它不再产生 (取不到根的缓冲改
+> 去复用已在跑的 jdtls), 实测 `~/.cache/jdtls/` 是空的。报告是它留下的一根尾巴。
 
 **归属怎么判**: jdtls 的父进程**就是** nvim —— mason 的 python wrapper 用
 `os.execvp` 把自己换成 java (`jdtls.py:139`), 不留中间层。所以沿 ppid 逐级上溯找
@@ -912,8 +986,7 @@ A 树 inject_sync -> union(A) = {A 核心集, A 项目根}
 1. 必须**真的**是孤儿。别的编辑器也用 jdtls, 只认"孤儿"就杀等于越界。
 2. `-data` 必须落在本插件缓存根 (`~/.cache/nvim/jdtls/`) 之下 —— 它抢的正是我们这份索引。
 
-第 2 条也解释了为什么**走失** JVM 即便成了孤儿也不杀 (它 `-data` 在 `~/.cache/jdtls/`
-下, 不跟我们抢), 以及为什么有主的那个不杀 (关掉别人的会话不是插件该做的事)。
+第 2 条也解释了为什么有主的那个不杀 (关掉别人的会话不是插件该做的事)。
 
 **时机**: 跑在 `configure` 里, 也就是 client 启动**之前** —— 赶在两个 JVM 打架之前
 清场。SIGTERM 之后**等它自己退场**(上限 3 秒): jdt.ls 收到 SIGTERM 会走 shutdown hook
@@ -924,15 +997,15 @@ A 树 inject_sync -> union(A) = {A 核心集, A 项目根}
 掉"。孤儿没有任何需要用户拍板的地方, 它与第 13(a) 步的**空壳工程自清**同构
 (把"不可逆"改成"可自愈"), 只是对象从磁盘文件换成了进程。于是:
 自动回收**不单独通知** (痕迹只进 `log.debug`); 只有还剩"该由用户拍板"的东西 (有主的
-重复 / 走失 JVM) 才开口, 文案由纯函数 `ui.instances_message` 生成, 无话可说时返回 `nil`。
+重复) 才开口, 文案由纯函数 `ui.instances_message` 生成, 无话可说时返回 `nil`。
 
 **这条推翻了 `ui.lua` 里"只报不杀: 杀进程是用户的决定"那句老规矩** —— 但只推翻
 "孤儿"这一种。退路是一个布尔开关 `java.kill_orphan_jdtls` (默认 `true`)。
 
-**实现**: 一次 `/proc` 扫描产出**带归属**的记录 (`ui.jdtls_inventory`), 三个调用方共用
-(`jdtls_holders` / `foreign_jdtls` / 两个新函数), 不再各扫一遍。`opts` 可注入
+**实现**: 一次 `/proc` 扫描产出**带归属**的记录 (`ui.jdtls_inventory`), 两个调用方共用
+(`jdtls_holders` / `foreign_jdtls`), 不再各扫一遍。`opts` 可注入
 `globs/argv/comm/ppid`, 全套判定在 headless 下可测且不碰真 `/proc` (同
-`jvm_live.find_jcmd` 的做法) —— 覆盖见 `tests/t_instances.lua` (43 条) 与
+`jvm_live.find_jcmd` 的做法) —— 覆盖见 `tests/t_instances.lua` (39 条) 与
 `tests/t_proc.lua` 的 `ancestor_named` 部分。
 
 > **验收实测** (2026-10-10 判定, 2026-10-12 端到端): 用 `setsid` 造一个命令行形状相同、
@@ -950,6 +1023,10 @@ A 树 inject_sync -> union(A) = {A 核心集, A 项目根}
 > `live`)。教训 —— 注入式单测的 fixture 是按**函数契约**捏的, 捏不出"两个调用方共用
 > 同一份盘点、其中一个先改了世界"这种**跨步**耦合; 真正的验收得把整条 `configure`
 > 跑一遍。
+>
+> 这条也顺带说明了 `holders` 的契约: 它是 `foreign_jdtls(ws_dir, inv)` 的结果, 只收
+> `data == ws_dir` 的记录 —— 所以"别的程序起的 jdtls 不冒头"这件事在 `configure` 侧
+> 是**结构性**保证的 (它压根进不了 `holders`), 不靠报告函数里的路径判据去挡。
 
 ### 2.17 运行中换工作区根 (`workspace/didChangeWorkspaceFolders`) 与每工程字母序截断 (2026-10-12)
 
@@ -1517,7 +1594,7 @@ reset()  再清一次 (用户真的按了 :AospRescan)
 >
 > **确认**: 同一个累积 workspace (`src=247` 在 lib 之前) 放到索引稳定后再探,
 > `definition(Handler)` 第一次就返回
-> `file:///home/yangwj12/project/aosp/frameworks/base/core/java/android/os/Handler.java`
+> `file://~/project/aosp/frameworks/base/core/java/android/os/Handler.java`
 > (`t=309 s err=nil`)。所以"累计 247 根仍然能跳到真实 .java"是成立的, 之前
 > 的 <nil> 全是被索引期掩盖的。
 
@@ -1702,6 +1779,41 @@ committed 19.5 MB` = 堆的 **0.2%**, young GC 每 36 ms, full GC 每 4.9 s, `Pa
 就必须读后者 —— 这是 `:AospDebug` (读活进程) 与 `:Aosp` (读配置) 分成两条命令的根本
 原因, 也是把那段静态 `-Xmx` 检查搬进 `:AospDebug` 的原因 (它属于"活进程"这个入口)。
 
+#### 8.1.2 `-Xmx` 比物理内存还大: 堆内部全绿, 机器先被 OOM 掉 (2026-10-12, `xmx_over_host` 的由来)
+
+用户报"界面很卡, 最后卡住", 附上两张相隔 20 分钟的 `:AospDebug` 面板。堆内部**完全健康**:
+old gen 49%→59%(远未满)、full GC 每 ~350 s 一次、存活集 1.7G→2.7G、promotion 正常 ——
+所以面板诚实地报了 `verdict: nothing to flag`。但同一时刻:
+
+| 观测 | 值 |
+| --- | --- |
+| `-Xmx` / `MaxHeapSize` | **16 G** |
+| 该进程 RSS | 11.3 G → **13.3 G** (20 分钟) |
+| 物理内存 | **15 G**(WSL2 默认分配) |
+| `dmesg` | 两次 `Out of memory: Killed process (java)`, `anon-rss` 6.4G / 8.1G |
+
+`-Xmx16G` 的堆**上限比整机内存还大** → JVM 永远够不着自己的天花板, 内核先一步全局
+OOM-kill (`GC Thread#6 invoked oom-killer`: 一个正在 GC 的线程触发的)。**旧面板看不出来,
+是因为它只把 `-Xmx` 跟"AOSP 需要的下限 (8G)"比, 从不跟"这台机器有多少内存"比。** 堆够大
+是对的, 但"够大"和"比机器还大"是两回事, 中间那一段才是这次的坑。
+
+补的规则: `util/jvm.lua` 的 `assess()` 收一个可选的物理内存字节数 (缺省自读
+`/proc/meminfo` 的 `MemTotal`), 算出 `host_ratio = -Xmx / MemTotal`; 超过
+`M.HOST_RATIO_WARN = 0.80` 即 `host_ok = false`, 由 `jvm_live.verdict` 报 `xmx_over_host`
+(warn), 而**不是** `xmx_small` —— 方向相反的两件事必须分开报: 这一条的建议是**调小**
+(ceil 到整 G 举例), 不是 `xmx_small` 的"调到 8G"。`:AospDebug` 面板同时多一行
+`host mem` 显示物理内存与 `-Xmx = N% of RAM`, 让用户一眼看出堆上限和机器的关系。
+
+**为什么 80% 而不是 100%**: 堆之外还有 native/off-heap/metaspace/线程栈与**第二个 JVM**
+(kls、另一个工作区), 都在这台机器上分同一块内存; 堆占满 80% 时余量已经不足以让这些
+东西不进 swap。`-Xmx` 恰好等于物理内存 (100%) 时"够不够"取决于同机还有什么在跑,
+80% 是把"必然危险"和"看情况"分开的位置。
+
+**测试必须显式传 `mem_total`**: 这条规则依赖宿主, 同一份断言在 15G 笔记本与 512G 工作站
+上会得到相反结果 (实测: `-Xmx16G` 在 512G 上是 3.1% 静默, 在 15G 上是 106.7% 报警)。
+所有 `jvm.assess()` 的测试调用因此都显式传第二参, 只有一条断言去真读 `/proc/meminfo`
+(存在即正数, 否则 nil, 两者都不许崩)。
+
 **阈值怎么标定的** (`util/jvm_live.lua` 的 `M.THRESH`): 相对实测基准留 2–4 倍余量。
 `warn` **只**留给"堆真的放不下"(存活集 > old gen 上限的 90% / RSS > `-Xmx`×1.15 / 墙钟
 >50% 在 GC), 其余偏高形态一律 `info` 并给出可执行建议 —— 导入期本来就该 GC 频繁, 把它
@@ -1821,7 +1933,7 @@ classpath **完全相等**且逐条 path 都对得上时才返回工程自己的
 **仓库内**的探针 (见 §10.1):
 
 ```bash
-bash tests/run.sh            # 全部; 15 文件 (默认 481 条断言; 真树/真机块全跑起来时 499)
+bash tests/run.sh            # 全部; 15 文件 (默认 499 条断言; 真树/真机块全跑起来时 512)
 ```
 
 下面两条**曾**用来单跑核心集与增量累积两条路径, 但只在 `/tmp/aospnav-t/` 下存在过,
@@ -1917,35 +2029,36 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 不启 jdtls, 不依赖任何测试框架 (断言宏就在 `tests/helper.lua` 的 ~50 行里)。
 
 **默认跳过真树检查**: 带 `AOSPNAV_LIVE_TEST=1` 时才会去**读** `~/.cache/nvim/jdtls/`
-下的活工作区与 `/home/yangwj12/project/aosp` —— 只读, 不写不删 (§硬约束)。没有那棵树/
+下的活工作区与 `~/project/aosp` —— 只读, 不写不删 (§硬约束)。没有那棵树/
 那个工作区时相关断言自动 SKIP, 不会失败。
 
 | 套件 | 断言 | 覆盖 |
 | ---- | ---- | ---- |
 | `t_commands.lua` | 16 | 命令面冻结契约: 恰好 5 个 `:Aosp*` 命令 (含 `:AospDebug`), 且删掉的那 7 个一个都不在; `:Aosp`/`:AospDebug` 都是 bang 命令 |
 | `t_config.lua` | 37 | 本轮重构引入/删除的键: 死键静默丢弃 (不映射、不告警) / `merge` 不改调用方的表 / `source_apply_max_roots` 不再是配置键 / **重复 setup 不得打回默认值** (见 §2.14): 空参 `setup()` 后 `kotlin.jar_mode`·`log_level` 仍是用户值 / 第二次带参 setup 不丢上一次的键 / 新表产出且旧表不被就地改写 / 排除名单 append 语义未回归 / **合并结果不与 `M.defaults` 共享子表**, 就地改它不污染默认值 (标量+列表) |
-| `t_jvm.lua` | 108 | `util/jvm.assess` (此前**完全没有**测试): `-Xmx6G` 判否 / `--jvm-arg=` 前缀剥离 / 重复 `-Xmx` 后者胜 / `UseParallelGC` 识别 / 无值·无键·nil cmd 不崩。`util/jvm_live` (**活进程遥测**, §8.1.1): PerfCounter 解析 (去引号、值含 `=`、缺键) / uptime 与 `/proc/<pid>/status` (读不到是 nil 而非 0) / heap_info 三种形态 / young·major 按**名字**分类 (G1 的第三个 collector **不得**算 major) / 间隔按 `uptime/invocations` **自算**(不信 `avg*IntervalTime`) / 五条 fixture 的判定 (实测形态 → 三条 info 且零 warn; 6G 死亡螺旋 → 三条 warn; 健康 G1 → 零 finding; **G1 但新生代 <5% → 仍零 finding**, `young_gen_tiny` 只对 ParallelGC 报; 空快照不崩) / `find_jcmd` 三条回退路径 (注入式, 不碰 `/proc`) / jcmd 对死 pid 的失败路径 (退出码不可靠, 空 stdout 必须自己判失败) / `render` 的每一项都不得含换行 (`nvim_buf_set_lines` 会直接抛) |
+| `t_jvm.lua` | 127 | `util/jvm.assess` (此前**完全没有**测试): `-Xmx6G` 判否 / `--jvm-arg=` 前缀剥离 / 重复 `-Xmx` 后者胜 / `UseParallelGC` 识别 / 无值·无键·nil cmd 不崩 / **`xmx_over_host`** (§8.1.2): `-Xmx16G` 在 512G 宿主静默·在 15G 宿主报警且建议**调小** (不得误报 `xmx_small`) / 80% 边界恰好不报·超过才报 / `MemTotal` 读不到时跳过该检查 / `host_mem_total()` 真读 `/proc/meminfo` (正数或 nil, 不崩)。`util/jvm_live` (**活进程遥测**, §8.1.1): PerfCounter 解析 (去引号、值含 `=`、缺键) / uptime 与 `/proc/<pid>/status` (读不到是 nil 而非 0) / heap_info 三种形态 / young·major 按**名字**分类 (G1 的第三个 collector **不得**算 major) / 间隔按 `uptime/invocations` **自算**(不信 `avg*IntervalTime`) / 五条 fixture 的判定 (实测形态 → 三条 info 且零 warn; 6G 死亡螺旋 → 三条 warn; 健康 G1 → 零 finding; **G1 但新生代 <5% → 仍零 finding**, `young_gen_tiny` 只对 ParallelGC 报; 空快照不崩) / `find_jcmd` 三条回退路径 (注入式, 不碰 `/proc`) / jcmd 对死 pid 的失败路径 (退出码不可靠, 空 stdout 必须自己判失败) / `render` 的每一项都不得含换行 (`nvim_buf_set_lines` 会直接抛) |
 | `t_log.lua` | 54 | `util/log.lua`: 四档阈值比较 / `log.user` 绕过阈值 / 会话内 `once` 去重 / `once` 被阈值挡下时**不消费**登记 / 消息前缀 |
 | `t_multi_tree.lua` | 29 | **两棵树共用一个 nvim 会话** (§2.15): 假树造 A/B 两棵树, 零 LSP。两棵树各自推断出正确的根与项目 / 会话切到 B 后**不继承** A 的项目 (旧实现会) / 同一会话里 A·B 同时活动时 `union` 互不污染 / `state(A)` ≠ `state(B)` / 两棵树各有自己的顺序文件且内容不交叉 / `reset(A)` 不动 B / `client(fname)` 按 buffer 的 client 选 (旧实现取 `get_clients()[1]`) / `_is_applied` 按树分开 |
 | `t_path.lua` | 14 | `util/path.start_dir`: `nil`/`""` 归一成 cwd, 绝不能给 `"."` (§7 痛点 4 的根因) |
 | `t_follow.lua` | 27 | `java/workspace_follow.lua` (§2.17): `target()` 只认"树内 + 找得到项目标记"的文件 (树内无标记、树外、`""`、`nil` 一律 nil → 不动, 宁可保持当前工作区) 且第二个返回值是 AOSP 根 / 无 client 不插手 (第一台的根归 `root.lua`) / **已在目标项目之内 → 一次字符串比较后静默返回**, 子目录也算之内 / 跨项目 → 发**恰好一条** `didChangeWorkspaceFolders` 且 `added` 指向新项目 (name 是相对 AOSP 根的路径)、`removed` 是旧根 / **`mode` 为 `aosp`·`infer` 时一条都不发** / 树外文件有 client 也不把工作区搬出 AOSP 树。全部注入假 client + 临时目录, 零 LSP |
-| `t_instances.lua` | 43 | jdtls 实例自检 (§2.16), 全部走**注入的假 /proc** (不碰真进程): 盘点只认真 jdtls (命令行里只**含**那个 jar 名的 `grep`、以及 `-jar` 指向别的 jar 的 java 都不算) / 归属判定 (有主 → `owner_pid`; ppid 链到 init → `orphan`) / `ours` 按 `/proc` 缓存根前缀判 / `jdtls_holders`·`foreign_jdtls` 的旧契约 (含 nil·空串·尾斜杠归一) / `is_stray` 三种正反例 / **回收的两条安全闸** (孤儿+ours 才杀; 有主的、走失的、`enabled=false` 时都不动, 且连 `kill` 都不调) / 默认 killer 对已消失 pid **静默失败** (libuv 的 kill 失败不抛错而是返回 nil, err) / 报告文本: 只有孤儿被回收时返回 `nil` (成功不打扰)、有主的重复给 `kill` 行、走失指向 §2.13、全孤儿时不说"去关 nvim"、**已回收的 pid 不得在 holders 段里再出现一次** (holders 是回收**之前**那份盘点, 不按 pid 扣掉就会"列两遍 + 让你杀一个死 pid"; 这条是 configure 端到端跑出来的回归) |
+| `t_instances.lua` | 39 | jdtls 实例自检 (§2.16), 全部走**注入的假 /proc** (不碰真进程): 盘点只认真 jdtls (命令行里只**含**那个 jar 名的 `grep`、以及 `-jar` 指向别的 jar 的 java 都不算) / 归属判定 (有主 → `owner_pid`; ppid 链到 init → `orphan`) / `ours` 按 `/proc` 缓存根前缀判 / `jdtls_holders`·`foreign_jdtls` 的旧契约 (含 nil·空串·尾斜杠归一) / **回收的两条安全闸** (孤儿+ours 才杀; 有主的、`-data` 在别处的、`enabled=false` 时都不动, 且连 `kill` 都不调) / 默认 killer 对已消失 pid **静默失败** (libuv 的 kill 失败不抛错而是返回 nil, err) / 报告文本: 无事可做时返回 `nil`、有主的重复给 `kill` 行、孤儿已自动回收**不单独通知**、全孤儿时不说"去关 nvim"、**已回收的 pid 不得在 holders 段里再出现一次** (holders 是回收**之前**那份盘点, 不按 pid 扣掉就会"列两遍 + 让你杀一个死 pid"; 这条是 configure 端到端跑出来的回归) / **`-data` 在别处的 jdtls 一律不冒头** (§2.16 把那整段报告删了): `foreign_jdtls` 只收 `data == ws_dir` 的, 别人的 JVM 结构性进不来 |
 | `t_proc.lua` | 19 | `util/proc`: `/proc/<pid>/cmdline` 必须**真的按 NUL 切开参数** (回归"一个 nvim 报 2 个 jdtls 实例") / `is_descendant` 自反与否定 / `comm` 认出 `nvim` (归属判定的地基) / `ancestor_named` 用注入的 reader 造链: 命中 nvim / 走到 init → 孤儿 / 起点自己命中 / comm 读不到 / 成环有上限兜底 / 超过 `limit` |
 | `t_root_from_cwd.lua` | 20 | 痛点 4 的**端到端**回归: 起在 AOSP 根、不打开任何 `.java` 文件时 `aosp_root(nil/"")` 仍拿到树根 (真树断言部分需 `AOSPNAV_LIVE_TEST=1`) |
 | `t_phase.lua` | 19 | `phase` 是活状态的冻结契约: `ui.statusline()` 对 `idle`/`ready`/`indexing`/`no-out`/`failed` 五态各自的渲染 (`indexing` 必须带 `(idx)`) / `install_phase_handler` **链式**调用原有 handler (不吞掉 nvim-jdtls 的 status 消息) / 只有 `ServiceReady` 翻牌, 其余 `ServiceStatus` 不动 / `no-out`/`failed` 不被覆盖 / `err` 非空不翻牌 / 非 jdtls client 不包装 |
 | `t_source_roots.lua` | 27 | `java/source_roots` 两个入口的**模式闸门** (§5.1): `find` 只在 `mode="aosp"` 给结果、`find_for_project` 只在 `mode="project"` 给结果, 另一个一律 nil / 两者共用同一份扫描 (假项目里同样 2 条根) / 结果**全是相对项目目录**的路径, 无绝对路径 (§2.7 的硬要求) / **空项目在两处都返回 nil 而不是空表** (§2.3: 空 `sourcePaths` 会整体关闭 jdt.ls 推断, 比不注入还糟) / `nil`·`""` 入参退化不抛错 / 二次调用命中缓存结果一致。**`root.project_dir` 一节** (§3 的地雷回归): 两个不同项目给出不同根 / **绝不等于 AOSP 根** (旧 bug 的正面回归) / 树内无项目标记 → nil 不猜 / `workspace_root` 在 project 模式仍返回 nil (旧契约) / 非 project 模式退让 / 项目源码根是**项目相对**而非树相对。全部临时目录造假项目, 零 LSP |
-| `t_source_apply.lua` | 26 | `java/source_apply.lua`: `abs_of` 归一 / `installed` 解析 `.classpath` (去重、带 `excluding`、剥 `_/` 前缀、读不到返回 nil 而非空集) / 真机 `pending` 与磁盘 src 交集为 0 且有序 / 累积根"要么已装要么待装, 绝不丢弃" / 已装与待装不相交 / 非 core 模式拒绝 / `classify` 三类真实返回值 / 无 client 时 `auto()` 惰性 / `source_apply_auto=false` → `off` / `report()` 每**棵树**只提示一次 (分区键 = workspace 根; §2.15) |
+| `t_source_apply.lua` | 27 | `java/source_apply.lua`: `abs_of` 归一 / `installed` 解析 `.classpath` (去重、带 `excluding`、剥 `_/` 前缀、读不到返回 nil 而非空集) / 真机 `pending` 与磁盘 src 交集为 0 且有序 / 累积根"要么已装要么待装, 绝不丢弃" / 已装与待装不相交 / 非 core 模式拒绝 / `classify` 三类真实返回值 / 无 client 时 `auto()` 惰性 / `source_apply_auto=false` → `off` / `report()` 每**棵树**只提示一次 (分区键 = workspace 根; §2.15) / **报告文案契约 (2026-10-12)**: 不再出现 `:Aosp!`, 必说"本次退回 jar"与"下次启动自动生效", 且**默认阈值 (warn) 下不可见** (§2.10.1) |
 | `t_root_fallback.lua` | 22 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 |
 | `t_workspace.lua` | 31 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 | 
 
-合计 **499** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
-`t_jvm` 108 / `t_root_from_cwd` 13 / `t_source_apply` 22, 共 **481**)。
+合计 **512** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
+`t_jvm` 127 / `t_root_from_cwd` 13 / `t_source_apply` 25, 共 **499**)。
 
-> 只有 `t_jvm` (115/108)、`t_root_from_cwd` (20/13) 和 `t_source_apply` (26/22) 三个套件
-> 的条数**随环境而变** (真树/真 jdtls 块整段 SKIP 时不计数), 所以 499/481 是当前环境的
+> 只有 `t_jvm` (127/127)、`t_root_from_cwd` (20/13) 和 `t_source_apply` (31/25) 三个套件
+> 的条数**随环境而变** (真树/真 jdtls 块整段 SKIP 时不计数), 所以 512/499 是当前环境的
 > 实测值而非不变量; 其余 12 个套件两种跑法条数相同。
 > 特别注意 `t_jvm` 的真机块: 它要**真有 jdtls 在跑**才算数, 只设 `AOSPNAV_LIVE_TEST=1`
-> 是不够的 (本机 2026-10-10 就出现过"采样时在跑、跑测试时已退出"→ 静默少 7 条)。
+> 是不够的 (本机 2026-10-10 就出现过"采样时在跑、跑测试时已退出"→ 静默少几条;
+> 2026-10-12 记 §2.10.1 那件事之后 jdtls 被 OOM 杀掉没在跑, 真机块整段 SKIP)。
 
 `source_apply` 的分界是明的: `pending()` **不发任何请求** (纯读 `.classpath` + 算差集);
 发请求的只有 `add_serial` —— 手动经 `:Aosp!`, 或自动经 `source_apply.auto_apply()`
@@ -2060,6 +2173,9 @@ KLS 进程的孤儿/残留清理现在是**自动的** (旧的 `:AospKillOrphanK
   `return false` 中断 setup。
 - **动 `util/jvm_live.lua` 的阈值** → 基准是 §8.1.1 的两台机器实测值; 改阈值前先更新
   那一节的表, 否则下一个人没有对照就无从判断放宽是否合理。`warn` 只留给"堆真放不下"。
+- **动 `util/jvm.lua` 的 `MIN_XMX` / `HOST_RATIO_WARN`** → 前者是 §8.1.1 的堆下限实测值;
+  后者是 §8.1.2 的宿主内存上限 (80%), 依赖跑测试的机器, 所以 `jvm.assess()` 的测试
+  **必须显式传 `mem_total`**, 否则同一份断言在 15G 笔记本与 512G 工作站上结论相反。
 - **碰 BufEnter 路径** → 必须保持毫秒级; 任何扫描都异步 (`scan_async`), 结果进缓存。
 - **碰 `inject_sync`** → 它只能**同步读缓存**, 一旦引入扫描, sourcePaths 就赶不上
   `initialize` 请求了 (而 §2.5 禁止事后补救)。

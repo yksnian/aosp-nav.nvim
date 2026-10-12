@@ -17,8 +17,41 @@ local JL = require("aosp-nav.util.jvm_live")
 local function fixture(lines) return table.concat(lines, "\n") end
 
 -- ==================== util/jvm.lua: assess ====================
+-- 下面全部**显式传 mem_total**, 不依赖跑测试的这台机器的物理内存 —— 否则同一份断言
+-- 在 15G 的笔记本和 512G 的工作站上会得到不同结果。
 
-local a6 = jvm.assess({ "jdtls", "--jvm-arg=-Xmx6G" })
+-- 512G 工作站: -Xmx16G 只占 3%, 宿主检查必须沉默
+local G = 1024 ^ 3
+local a_big_host = jvm.assess({ "--jvm-arg=-Xmx16G" }, 512 * G)
+check(a_big_host.xmx_ok == true, "assess: 16G is above the heap floor")
+check(a_big_host.host_ok == true, "assess: 16G on a 512G host is fine")
+eq(a_big_host.advice, nil, "assess: no advice on a big host")
+check(a_big_host.host_ratio ~= nil and a_big_host.host_ratio < 0.05,
+  "assess: host_ratio reflects 16G/512G")
+
+-- 15G 笔记本: -Xmx16G 比机器还大 —— 必须报, 且建议是**调小**而不是调大
+local a_small_host = jvm.assess({ "--jvm-arg=-Xmx16G" }, 15 * G)
+check(a_small_host.xmx_ok == true, "assess: 16G alone is above the heap floor")
+check(a_small_host.host_ok == false, "assess: the same 16G is too large on a 15G host")
+check(type(a_small_host.advice) == "string" and a_small_host.advice:find("Lower it", 1, true) ~= nil,
+  "assess: the over-host advice says to lower -Xmx (got " .. tostring(a_small_host.advice) .. ")")
+check(not a_small_host.advice:find("Xmx8G", 1, true),
+  "assess: the over-host advice must not tell the user to raise it to 8G")
+
+-- 边界: 恰好 80% 不报, 超过才报
+local a_edge = jvm.assess({ "--jvm-arg=-Xmx12G" }, 15 * G)   -- 80.0%
+check(a_edge.host_ok == true, "assess: exactly at the 80% bound is still ok")
+local a_over = jvm.assess({ "--jvm-arg=-Xmx13G" }, 15 * G)
+check(a_over.host_ok == false, "assess: just past the 80% bound is flagged")
+
+-- 读不到物理内存时 (非 Linux) 跳过该检查, 不能因此把正常的堆判成坏的
+local a_nomem = jvm.assess({ "--jvm-arg=-Xmx16G" }, 0)
+check(a_nomem.host_ok == true and a_nomem.host_ratio == nil,
+  "assess: an unreadable MemTotal skips the host check")
+
+-- ==================== util/jvm.lua: assess ====================
+
+local a6 = jvm.assess({ "jdtls", "--jvm-arg=-Xmx6G" }, 64 * G)
 eq(a6.xmx, 6 * 1024 ^ 3, "assess: -Xmx6G parses, --jvm-arg= prefix stripped")
 eq(a6.xmx_text, "6G", "assess: xmx_text keeps the raw spelling")
 check(a6.xmx_ok == false, "assess: 6G is below the measured floor")
@@ -26,23 +59,29 @@ check(type(a6.advice) == "string" and a6.advice:find("Xmx8G", 1, true) ~= nil,
   "assess: the too-small advice names the concrete fix")
 check(a6.parallel_gc == false, "assess: no UseParallelGC -> false")
 
-local a8p = jvm.assess({ "--jvm-arg=-Xmx8G", "-XX:+UseParallelGC" })
+local a8p = jvm.assess({ "--jvm-arg=-Xmx8G", "-XX:+UseParallelGC" }, 64 * G)
 check(a8p.xmx_ok == true, "assess: 8G is enough")
 check(a8p.parallel_gc == true, "assess: UseParallelGC recognised")
 eq(a8p.advice, nil, "assess: no advice when the heap is fine")
 
 -- 两者都给时后者胜 (与 HotSpot 一致)
-local alast = jvm.assess({ "-Xmx4G", "--jvm-arg=-Xmx8G" })
+local alast = jvm.assess({ "-Xmx4G", "--jvm-arg=-Xmx8G" }, 64 * G)
 eq(alast.xmx, 8 * 1024 ^ 3, "assess: repeated -Xmx, the last one wins")
 
 -- 无 -Xmx / 无法解析
-local anone = jvm.assess({ "jdtls", "-data", "/x" })
+local anone = jvm.assess({ "jdtls", "-data", "/x" }, 64 * G)
 eq(anone.xmx, nil, "assess: no -Xmx -> nil")
 check(anone.xmx_ok == false and anone.advice ~= nil, "assess: missing -Xmx is not ok and is advised")
-local abad = jvm.assess({ "-Xmx" })
+local abad = jvm.assess({ "-Xmx" }, 64 * G)
 eq(abad.xmx, nil, "assess: bare -Xmx (no value) -> nil, not a crash")
-check(jvm.assess(nil).xmx_ok == false, "assess: tolerates a nil cmd")
-eq(jvm.assess({ "-Xmx2147483648" }).xmx_ok, false, "assess: bare bytes 2G parses and is too small")
+check(jvm.assess(nil, 64 * G).xmx_ok == false, "assess: tolerates a nil cmd")
+eq(jvm.assess({ "-Xmx2147483648" }, 64 * G).xmx_ok, false,
+  "assess: bare bytes 2G parses and is too small")
+
+-- host_mem_total() 真读本机 /proc/meminfo: 存在则必须是正数, 否则 nil (两者都不许崩)
+local mt = jvm.host_mem_total()
+check(mt == nil or (type(mt) == "number" and mt > 0),
+  "host_mem_total: returns a positive byte count or nil (got " .. tostring(mt) .. ")")
 
 -- ==================== util/jvm_live.lua: 解析 ====================
 
@@ -142,7 +181,7 @@ local function has(findings, code)
 end
 
 -- ---- 形态 A: 这台机器实测的 ParallelGC (堆够大, 面板过去显示绿灯) ----
-local A = snap(PC_PERF, "232499:\n5907.652 s\n", PC_HEAP, PC_STATUS, jvm.assess({ "-Xmx8G" }))
+local A = snap(PC_PERF, "232499:\n5907.652 s\n", PC_HEAP, PC_STATUS, jvm.assess({ "-Xmx8G" }, 64 * G))
 eq(A.pid, "232499", "assemble: pid is stringified")
 eq(A.uptime_s, 5907.652, "assemble: uptime_s")
 eq(A.rss_kb, 3037912, "assemble: rss_kb from /proc")
@@ -200,7 +239,7 @@ local SPIRAL_PERF = fixture({
   'sun.gc.generation.1.spaces=1',
 })
 local B = snap(SPIRAL_PERF, "1:\n500.0 s\n", PC_HEAP, "VmRSS:\t5000000 kB\nThreads:\t80\n",
-  jvm.assess({ "--jvm-arg=-Xmx6G" }))
+  jvm.assess({ "--jvm-arg=-Xmx6G" }, 64 * G))
 check(B.gc_pct > 80, "assemble(B): 408s of 500s in GC (got " .. ("%.1f"):format(B.gc_pct or -1) .. ")")
 check(B.live_ceiling_frac > 0.99, "assemble(B): live set == old-gen ceiling")
 local fb = JL.verdict(B)
@@ -212,6 +251,25 @@ check(has(fb, "xmx_small") ~= nil, "verdict(B): the static -Xmx6G check moved he
 local warns = 0
 for _, f in ipairs(fb) do if f.level == "warn" then warns = warns + 1 end end
 eq(warns, 3, "verdict(B): three warns total (xmx_small, gc_pct_high, live_set_ceiling)")
+
+-- ---- 形态 B2: 堆内部全绿, 但 -Xmx 比物理内存还大 (旧版漏报的那一类) ----
+-- 复用形态 A 的活进程数据 (heap 健康、无 warn), 只把宿主换成 15G、-Xmx 换成 16G。
+-- 期望: xmx_over_host 是**唯一**的 warn —— 这正是用户见到"面板 nothing to flag,
+-- 但界面卡死/被 OOM 杀掉"的场景。
+local A_small = snap(PC_PERF, "232499:\n5907.652 s\n", PC_HEAP, PC_STATUS,
+  jvm.assess({ "--jvm-arg=-Xmx16G" }, 15 * G))
+local fb2 = JL.verdict(A_small)
+check(has(fb2, "xmx_over_host") ~= nil, "verdict(B2): xmx_over_host fires when -Xmx > host RAM")
+check(has(fb2, "xmx_over_host").level == "warn", "verdict(B2): xmx_over_host is warn")
+check(has(fb2, "xmx_over_host").action ~= nil, "verdict(B2): carries the fix")
+check(has(fb2, "xmx_small") == nil, "verdict(B2): 16G is not 'too small' — xmx_small stays silent")
+local warns2 = 0
+for _, f in ipairs(fb2) do if f.level == "warn" then warns2 = warns2 + 1 end end
+eq(warns2, 1, "verdict(B2): exactly one warn (xmx_over_host)")
+-- 渲染里要有 host mem 行, 用户一眼看出 -Xmx 与 RAM 的关系
+local rb2 = table.concat(JL.render(A_small, fb2), "\n")
+check(rb2:find("host mem", 1, true) ~= nil, "render(B2): shows a host-memory row")
+check(rb2:find("too large", 1, true) ~= nil, "render(B2): marks the oversized heap")
 
 -- ---- 形态 C: 健康的空闲 G1 (policy 段几乎为空, 这是 G1 的常态) ----
 local G1_PERF = fixture({
@@ -242,7 +300,7 @@ local G1_PERF = fixture({
 })
 local G1_HEAP = "1:\ngarbage-first heap   total 6291456K, used 512000K\n  region size 8192K\n"
 local C = snap(G1_PERF, "1:\n3600.0 s\n", G1_HEAP, "VmRSS:\t1572864 kB\nThreads:\t40\n",
-  jvm.assess({ "-Xmx8G", "-XX:+UseG1GC" }))
+  jvm.assess({ "-Xmx8G", "-XX:+UseG1GC" }, 64 * G))
 eq(C.heap.kind, "g1", "assemble(C): G1 heap recognised")
 eq(C.gc_policy_name, "GarbageFirst", "assemble(C): policy name read")
 -- 关键: G1 有**第三个** collector, 它既不是 young 也不是 full, 必须不被当成 major
@@ -264,7 +322,7 @@ eq(#JL.verdict(C), 0, "verdict(C): a healthy G1 snapshot flags nothing at all")
 -- 来钉住这个边界 —— 修前它会带着错误的病因误报。
 local F = snap((G1_PERF:gsub("generation%.0%.capacity=%d+", "generation.0.capacity=343597383")),
   "1:\n3600.0 s\n", G1_HEAP, "VmRSS:\t1572864 kB\nThreads:\t40\n",
-  jvm.assess({ "-Xmx8G", "-XX:+UseG1GC" }))
+  jvm.assess({ "-Xmx8G", "-XX:+UseG1GC" }, 64 * G))
 eq(F.heap.kind, "g1", "assemble(F): still classified as G1")
 check(F.young_cap_frac < JL.THRESH.young_cap_frac_info,
   "assemble(F): young really is below the tiny-gen threshold (got " ..

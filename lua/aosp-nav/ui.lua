@@ -398,7 +398,7 @@ end
 ---     = <File(path).getName()>_<Integer.toHexString(path.toPortableString().hashCode())>
 --- 这里在 Lua 里复算: Java 的 31 进制 hashCode + 32 位环绕, toHexString 把 int
 --- 当**无符号**打印 -> string.format("%x", h) (h 已按 2^32 取模)。
---- 实测 root=/home/yangwj12/project/aosp 复算出 aosp_3f7ad7da, 与真实工作区一致。
+--- 实测 root=~/project/aosp 复算出 aosp_3f7ad7da, 与真实工作区一致。
 --- 用途: 在一次 glob 之后**精确**区分"本该有的 invisible project"与"外部工程",
 --- 名字前缀匹配 (aosp_) 会误伤名字恰好以它开头的正常工程。
 --- @param root string jdtls root_dir (无尾斜杠)
@@ -616,7 +616,7 @@ local function read_cwd(pid)
 end
 
 --- 盘点本机所有 jdtls JVM, 并追出各自的 nvim 归属。**一次 /proc 扫描**, 三个调用方
---- (单实例告警 / 孤儿回收 / 走失报告) 都从这里取数, 不再各扫一遍。
+--- (单实例告警 / 孤儿回收) 都从这里取数, 不再各扫一遍。
 ---
 --- 每条记录 { pid, data, orphan, owner_pid, owner_cwd, ours }:
 ---   data      = 它的 -data (已去尾斜杠); argv 里根本没有 -data 时为 nil
@@ -701,21 +701,10 @@ function M.foreign_jdtls(workspace_dir, records)
   return out
 end
 
---- 走失的 jdtls: -data 不落在本插件的 jdtls 缓存根之下 (含根本没有 -data 的)。
---- 成因是 §2.13 那台"取不到根"的 JVM —— nvim-jdtls 不传 -data 时, mason 的
---- python wrapper 拿它自己的默认值 ~/.cache/jdtls/jdtls-<sha1(cwd basename)>。
---- 它不共用我们的 -data, 所以单实例自检看不见它, 只有扫 /proc 才发现。
---- @param rec table jdtls_inventory 的一条记录
---- @return boolean
-function M.is_stray(rec)
-  return not rec.ours
-end
-
 --- SIGTERM 掉孤儿 jdtls JVM。**只有同时满足两条**才动手:
 ---   1. 孤儿 —— ppid 链走到 init 都没有 nvim, 没有任何会话拥有它;
 ---   2. 它的 -data 落在本插件的 jdtls 缓存根之下 —— 它抢的正是我们这份索引。
---- 第 2 条是安全闸: 别的编辑器也用 jdtls, 只认"孤儿"就杀等于越界。反过来,
---- §2.13 那种走失 JVM 即便成了孤儿也不杀 (它不跟我们抢索引, 只报告)。
+--- 第 2 条是安全闸: 别的编辑器也用 jdtls, 只认"孤儿"就杀等于越界。
 ---
 --- 杀完等它自己退场 (上限 3 秒): jdt.ls 收到 SIGTERM 会走 shutdown hook 落一次
 --- 索引, 等它写完再起我们这台 —— 既不互相覆盖, 还白捡一份现成的索引。这一步会
@@ -758,12 +747,13 @@ end
 --- "jdtls 实例"自检的报告文本 (纯函数, 便于测试)。无事可做时返回 nil ——
 --- **自动回收掉的孤儿不单独通知** (插件能自动做掉的事就自动做掉, 见 DEVELOPMENT
 --- §2.10), 它的痕迹只进日志; 只有还剩"该由用户拍板"的东西时才开口。
---- @param rep table { ws_dir, holders = {records}, strays = {records},
----                    reaped = {pids} }
+---
+--- 报告**只讲一件事**: 有**别人的** jdtls 正在用同一个 `-data` (两个 JVM 互相覆盖
+--- 索引 = 真会坏, 必须让用户去关掉一个)。别的都自己处理掉了或不再提 (见下)。
+--- @param rep table { ws_dir, holders = {records}, reaped = {pids} }
 --- @return string|nil
 function M.instances_message(rep)
   local holders = rep.holders or {}
-  local strays = rep.strays or {}
   local reaped = rep.reaped or {}
   -- 刚被回收掉的孤儿**已不在 holders 里** (reap 跑在这次盘点之后)? 不 —— holders
   -- 是回收**之前**那份盘点, 孤儿两种身份都在里面。这里按 pid 扣掉, 否则同一台会
@@ -775,7 +765,7 @@ function M.instances_message(rep)
   for _, r in ipairs(holders) do
     if not gone[tostring(r.pid)] then live[#live + 1] = r end
   end
-  if #live == 0 and #strays == 0 then return nil end
+  if #live == 0 and #reaped == 0 then return nil end
   local parts = {}
   if #live > 0 or #reaped > 0 then
     local l = {
@@ -803,18 +793,6 @@ function M.instances_message(rep)
     end
     l[#l + 1] = "This does not need :AospCleanWorkspace unless the index turns out "
       .. "broken afterwards."
-    parts[#parts + 1] = table.concat(l, "\n")
-  end
-  if #strays > 0 then
-    local l = {
-      ("%d jdtls JVM(s) point -data outside %s:"):format(#strays, jdtls_cache_root()),
-    }
-    for _, r in ipairs(strays) do
-      l[#l + 1] = ("  pid %s — -data %s"):format(r.pid, r.data or "(none)")
-    end
-    l[#l + 1] = "That is the JVM started for a buffer with no project root "
-      .. "(DEVELOPMENT.md §2.13). It does not share your index, but it burns a heap. "
-      .. "Kill it and delete the directory it names."
     parts[#parts + 1] = table.concat(l, "\n")
   end
   return table.concat(parts, "\n\n")
@@ -960,14 +938,15 @@ function M.debug_panel(bang)
           local jcmd = snap.jcmd or (jl.find_jcmd(pid))
           local path = thread_dump_path(client, pid)
           local ok, derr = jl.thread_dump(jcmd, pid, path)
-          -- 必须走 log.user: 默认日志阈值是 warn, log.info 会被吞掉, 用户就
-          -- 只看到面板里一行字, 不知道文件在哪
+          -- 走 log.info 而不是 log.user: 这是对用户刚敲的 :AospDebug! 的回应, 不是
+          -- 需要用户做决定的主动播报 (DEVELOPMENT.md §2.10 的席位纪律)。路径同时已经
+          -- 写进面板, 因此即使默认阈值 (warn) 吞掉这行, 信息也没丢。
           if ok then
             out[#out + 1] = "thread dump -> " .. path
-            log.user("thread dump written to " .. path)
+            log.info("thread dump written to " .. path, { timeout = 10000 })
           else
             out[#out + 1] = "thread dump failed: " .. tostring(derr)
-            log.user("thread dump failed: " .. tostring(derr), { level = "error" })
+            log.error("thread dump failed: " .. tostring(derr))
           end
         end
       end
@@ -1306,9 +1285,9 @@ function M.clean_workspace(opts)
     if choice ~= 1 then return end
   else
     -- 破坏性操作必须让用户看到 (必须可见情形 #3)。bang 跳过了模态确认, 这里补一条
-    -- 绕过阈值、必定可见的告知 —— 删数据目录是不可逆的。
-    log.user("deleting the jdtls workspace (forced, no confirmation): " .. dir,
-      { level = "warn" })
+    -- 绕过阈值、必定可见的告知 —— 删数据目录是不可逆的。文案只陈述**正在发生什么**,
+    -- 用户刚刚主动敲了 :AospCleanWorkspace! (level 也无需重复 log.user 的默认 warn)。
+    log.user("removing the jdtls workspace: " .. dir)
   end
 
   -- 先停客户端再删, 否则 jdtls 还在写这个目录

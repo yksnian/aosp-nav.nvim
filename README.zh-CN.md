@@ -179,7 +179,7 @@ return {
 **不等于**进程健康。
 
 - **看什么** —— pid 与实际用到的 `jcmd` / uptime / RSS 与线程数 / GC 策略与 GC 占墙钟的比例 / young 与 full GC 的次数及真实平均间隔 / 每次 young GC 的晋升量 / 新生代与老年代的 used-committed-max / 上次 full GC 实测的存活集 / 原样的 `GC.heap_info` / `vm flags`。
-- **查什么** —— 启动命令行里的 `-Xmx` (按数值判; 这一行已从 `:Aosp` 搬来), 外加活进程的病态形态: 新生代被自适应策略压到远小于堆 / GC 吃掉墙钟 / 每几秒一次 full GC / 存活集放不进老年代 / RSS 超过 `-Xmx`。
+- **查什么** —— 启动命令行里的 `-Xmx` (按数值判; 这一行已从 `:Aosp` 搬来), 以及它是否比宿主物理内存还大 (堆上限高过整机时 JVM 够不着自己的天花板, 先被 OOM 杀掉), 外加活进程的病态形态: 新生代被自适应策略压到远小于堆 / GC 吃掉墙钟 / 每几秒一次 full GC / 存活集放不进老年代 / RSS 超过 `-Xmx`。
 - **判定** 只标出需要动手的; "偏高但在导入期正常"的形态另列, 每条都给具体建议。
 - **`:AospDebug!`** 另外落一份 thread dump 到 `~/.cache/nvim/aosp_nav/` 并给出路径 —— 界面像卡住时用它; 抓完读文件, 不必占着 nvim。
 - **按树** —— 头部写明是哪棵树及其 `-data`, 一个会话里有两套 AOSP 检出时知道报的是谁。
@@ -188,9 +188,11 @@ return {
 
 ### :Aosp!
 
-把已累积的源码根重新注入**正在运行**的 jdtls —— 自动注入触发每会话上限时的手动兜底。
+把已累积的源码根重新注入**正在运行**的 jdtls —— 自动注入被上限截断、或一直没等到就绪窗口时的兜底。
 
 自动注入每会话做一次, 单次最多 5 条; 想关掉设 `java.source_apply_auto = false`。`:Aosp!` 越过上限, 立即注入当前全部累积。
+
+**优先重启 jdtls。** 累积的源码根会在下次启动经 `initialize.sourcePaths` 一次性注入 —— 更省内存, 且顺序排在 jar 之前。`:Aosp!` 每注入一条就重建一次整条 classpath, 批量大时会把 JVM 堆 (`-Xmx`) 撑爆而被 OOM 杀掉。只在**现在就要**用上这些根时才敲它。
 
 ### :AospRescan
 
@@ -320,7 +322,7 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 1. `:Aosp` 面板的 `sourcePaths` 一行必须是 `injected (N entries)`。`java.mode = "aosp"` 时若显示 "NOT injected", 说明 `java.core_source_roots` 在磁盘上没解析出来 (AOSP 版本不同或写错了) —— 源码根一栏会给存在的条目标 `x`; `project` 模式若显示 "NOT injected", 说明当前项目目录下没扫出源码根。
 2. 同一页的 `source projects` 一行形如 `core=N projects=N installed=N pending=N`。`pending > 0` 表示累积的源码根还没进当前工作区, 见下一条。`project` 模式下这一栏改为 `project :` / `src roots : N root(s) of this project injected`。
 3. `:Aosp` 源码根一栏 —— 如果这个类所属项目不在列表里, 打开该项目下任意一个 `.java` 文件一次, 它的源码根会在后台扫出来并写进缓存。若该项目被 `source_paths_max_projects` 挤掉了, 提高上限或再打开一次它的文件 (`:AospRescan` 清空累积)。
-4. `pending > 0` 时插件会自动应用 (每会话一次, 最多 5 条); 若仍未生效, 跑 `:Aosp!` 强制注入。
+4. `pending > 0` 时插件会自动应用 (每会话一次, 最多 5 条); 若仍未生效, **重启 nvim** —— 下次启动会一次性注入。`:Aosp!` 能立刻强行注入, 但它每注入一条就重建一次 classpath, 批量大时可能把 JVM 撑到 OOM。
 5. 想让新源码根也排到 jar **之前** → `:AospCleanWorkspace` 后重开。这条路的代价是整库重新索引, 且只重启 LSP 客户端不够 —— jdt.ls 会跳过它已经认识的工程。
 
 注意**构建生成**的类 (AIDL/proto/aconfig 的 Stub/Proxy, 例如 `INetworkOfferCallback`) 在源码树里根本没有 `.java`, jar 是它们的唯一来源, 落到反编译视图是正确结果。
@@ -361,7 +363,7 @@ AOSP 重新编译后:
 :AospRescan
 ```
 
-之后重启 LSP 客户端让刷新后的 jar 列表生效; 累积的源码根由插件自动应用, 或用 `:Aosp!` 越过上限强制注入。
+之后重启 LSP 客户端让刷新后的 jar 列表生效; 累积的源码根由插件自动应用 (重启 nvim 则会一次性注入)。
 
 ### Kotlin 跳转到测试 stub 文件
 

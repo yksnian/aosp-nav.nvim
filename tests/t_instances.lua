@@ -1,5 +1,5 @@
 -- t_instances.lua: jdtls 实例盘点 (ui.jdtls_inventory / reap_orphan_jdtls /
--- instances_message) —— 归属判定、孤儿回收、走失 JVM、报告文本。
+-- instances_message) —— 归属判定、孤儿回收、报告文本。
 --
 -- 全部走**注入的假 /proc** (同 t_jvm 对 find_jcmd 的做法)。真起一台 jdtls 才能测的
 -- 话, 这个套件就只在"恰好有 jdtls 在跑"的机器上才算数 —— 而它要测的恰恰是 jdtls
@@ -14,7 +14,7 @@ local ui = require("aosp-nav.ui")
 local LAUNCHER = "org.eclipse.equinox.launcher_1.6.0.jar"
 local CACHE_ROOT = vim.fn.stdpath("cache") .. "/jdtls" -- 本插件的 jdtls 缓存根
 local WS = CACHE_ROOT .. "/qssi/workspace"             -- 我们这份 -data
-local STRAY_WS = vim.fn.expand("~/.cache/jdtls") .. "/jdtls-6577a689" -- mason 默认
+local FOREIGN_WS = vim.fn.expand("~/.cache/jdtls") .. "/jdtls-6577a689" -- 别人的 -data
 
 --- jdtls 的启动命令行; data 为 nil 时压根不传 -data
 local function jdtls_argv(data)
@@ -48,8 +48,9 @@ local f = fake_proc({
   -- 抢我们这份 -data 且**有主**: nvim 300 还活着
   ["200"] = { argv = jdtls_argv(WS), comm = "java", ppid = 300 },
   ["300"] = { argv = { "nvim", "-u", "NONE" }, comm = "nvim", ppid = 1 },
-  -- §2.13 的走失 JVM: -data 落在 mason wrapper 自己的默认目录, 也是孤儿
-  ["400"] = { argv = jdtls_argv(STRAY_WS), comm = "java", ppid = 1 },
+  -- 别的程序起的 jdtls: -data 在别处 (不抢我们索引), 也是孤儿 —— 但既不该被回收,
+  -- 也不该出现在任何报告里 (早先会把它当"走失 JVM"报出来)。
+  ["400"] = { argv = jdtls_argv(FOREIGN_WS), comm = "java", ppid = 1 },
   -- 子串陷阱: 命令行里**含**那个 jar 名, 但它不是 jdtls (旧的子串搜索会咬到这里)
   ["500"] = { argv = { "grep", LAUNCHER }, comm = "grep", ppid = 1 },
   -- 是 java, 但 -jar 指的是别的 jar
@@ -78,11 +79,6 @@ H.eq(#ui.jdtls_holders(nil), 0, "jdtls_holders(nil) -> 空")
 H.eq(#ui.foreign_jdtls(WS, inv), 2, "foreign_jdtls: 抢同一份 -data 的两台都有记录")
 H.eq(#ui.foreign_jdtls(WS, inv) == 2 and ui.foreign_jdtls(WS, inv)[1].pid, "100",
   "foreign_jdtls: 返回记录 (带归属) 而不是光秃秃的 pid")
-
--- ---- 走失判定 ----
-H.eq(ui.is_stray(by_pid["400"]), true, "is_stray: -data 在 mason 默认目录")
-H.eq(ui.is_stray(by_pid["100"]), false, "is_stray: 我们自己的那份索引不算走失")
-H.eq(ui.is_stray({ data = nil, ours = false }), true, "is_stray: 连 -data 都没有的也算")
 
 -- ---- 孤儿回收: 两条安全闸都要成立才动手 ----
 local killed = {}
@@ -114,10 +110,10 @@ H.eq(#ui.reap_orphan_jdtls({ { pid = "999999", data = WS, orphan = true, ours = 
   { wait_ms = 0 }), 0, "回收: 默认 killer 对已消失的 pid 静默失败, 不报错")
 
 -- ---- 报告文本 (纯函数) ----
-H.eq(ui.instances_message({ ws_dir = WS, holders = {}, strays = {}, reaped = { "100" } }),
-  nil, "报告: 孤儿已自动回收且别无他事 -> 一个字都不说 (自动化成功不是通知)")
+H.eq(ui.instances_message({ ws_dir = WS, holders = {}, reaped = {} }),
+  nil, "报告: 无事可做 -> 一个字都不说")
 
-local m = ui.instances_message({ ws_dir = WS, holders = { by_pid["200"] }, strays = {} })
+local m = ui.instances_message({ ws_dir = WS, holders = { by_pid["200"] } })
 H.check(m ~= nil, "报告: 还剩有主的重复 -> 开口")
 H.check(m and m:find("1 other jdtls", 1, true) ~= nil, "报告: 数的是'别的' JVM, 不是总数")
 H.check(m and m:find("nvim 300", 1, true) ~= nil, "报告: 列出归属 nvim 300")
@@ -127,20 +123,23 @@ H.check(m and m:find("run :AospCleanWorkspace", 1, true) == nil,
 H.check(m and m:find("does not need :AospCleanWorkspace", 1, true) ~= nil,
   "报告: 反而明说这一次不需要 :AospCleanWorkspace")
 
-local m2 = ui.instances_message({ ws_dir = WS, holders = {}, strays = { by_pid["400"] } })
-H.check(m2 ~= nil, "报告: 只有走失 JVM 时也要开口")
-H.check(m2 and m2:find(STRAY_WS, 1, true) ~= nil, "报告: 给出走失 JVM 的 -data")
-H.check(m2 and m2:find("2.13", 1, true) ~= nil, "报告: 指向 DEVELOPMENT §2.13")
+-- 只有 -data 落在别处的 JVM (别的编辑器起的): configure 侧压根不会把它放进 holders
+-- (holders 来自 `foreign_jdtls(ws_dir, inv)`, 只收 `data == ws_dir` 的), 所以报告里
+-- 天然不出现。早先有一版还额外把它当"走失 JVM"报出来并劝人杀+删目录, 结果把用户
+-- 自己的 VSCode 报了进去 —— 那条路径已整个删掉。这里守着"别人家的 JVM 不冒头"。
+local foreign = { pid = "400", data = FOREIGN_WS, ours = false, orphan = true, owner_pid = nil }
+H.eq(#ui.foreign_jdtls(WS, { foreign }), 0, "报告: -data 不同的 JVM 不混进 holders")
+H.eq(ui.instances_message({ ws_dir = WS, holders = ui.foreign_jdtls(WS, { foreign }) }), nil,
+  "报告: 只有别人家的 jdtls -> 一个字都不说")
 
-local m3 = ui.instances_message({ ws_dir = WS, holders = { by_pid["100"] }, strays = {} })
+local m3 = ui.instances_message({ ws_dir = WS, holders = { by_pid["100"] } })
 H.check(m3 and m3:find("ORPHAN", 1, true) ~= nil, "报告: 关掉回收时孤儿单独标出")
 H.check(m3 and m3:find("close nvim", 1, true) == nil, "报告: 全是孤儿时不说'去关 nvim'")
 
--- 两段都在时: 段落分开, 都要有
-local m4 = ui.instances_message({ ws_dir = WS, holders = { by_pid["200"] },
-  strays = { by_pid["400"] }, reaped = { "100" } })
+-- 回收过 + 还剩有主重复: 两件事都要交代
+local m4 = ui.instances_message({ ws_dir = WS, holders = { by_pid["200"] }, reaped = { "100" } })
 H.check(m4 and m4:find("killed just now", 1, true) ~= nil, "报告: 交代已经替你回收掉的那台")
-H.check(m4 and m4:find(STRAY_WS, 1, true) ~= nil, "报告: 两段并存")
+H.check(m4 and m4:find("kill 200", 1, true) ~= nil, "报告: 同时给出活着的那个的 kill 行")
 
 -- 关键回归: holders 是**回收之前**那份盘点, 孤儿两种身份都在里面。
 -- 不按 pid 扣掉的话, 同一台会被列两遍, 还被塞进 kill 行让用户去杀一个死 pid。
@@ -148,7 +147,6 @@ H.check(m4 and m4:find(STRAY_WS, 1, true) ~= nil, "报告: 两段并存")
 local m5 = ui.instances_message({
   ws_dir = WS,
   holders = { by_pid["200"], by_pid["100"] },
-  strays = {},
   reaped = { "100" },
 })
 H.check(m5 ~= nil, "报告: 有主重复 -> 开口")

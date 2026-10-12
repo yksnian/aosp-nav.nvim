@@ -60,7 +60,8 @@ vim.fn.delete(TMP, "rf")
 -- 本仓库的硬约束禁止触碰该目录, 因此默认不跑; 需要端到端集成覆盖时显式
 --     AOSPNAV_LIVE_TEST=1 bash tests/run.sh
 -- 开启 (此时代码会读该目录, 由运行者自行确认合适)。
-local LIVE = "/home/yangwj12/project/aosp"
+-- 真树路径由 $HOME 拼出 (~ 在 Lua 字符串里不会展开), 不写死任何用户名
+local LIVE = (vim.env.HOME or "") .. "/project/aosp"
 local HANDLER = LIVE .. "/frameworks/base/core/java/android/os/Handler.java"
 if vim.env.AOSPNAV_LIVE_TEST == "1" and vim.fn.filereadable(HANDLER) == 1 then
   local pending, err = sa.pending(HANDLER)
@@ -164,19 +165,42 @@ check(sa.auto({}) == "off", "auto() returns off when source_apply_auto = false")
 nav.config.java.source_apply_auto = saved_auto
 
 -- report() 每**棵树**只提示一次 (分区键 = client 的 workspace 根)。
--- 不是"每会话一次": 多树会话里两棵树各有自己的 pending, 而 :Aosp! 只作用于当前
--- buffer 所在的那棵树, 所以两棵树各说一次才可行动 (util/log 的 _seen 也按 id 去重,
--- 故 id 必须带 key, 否则第二棵树被静默吞掉)。
+-- 不是"每会话一次": 多树会话里两棵树各有自己的累积, 两棵树各说一次才讲得清。
+-- (util/log 的 _seen 也按 id 去重, 故 id 必须带 key, 否则第二棵树被静默吞掉。)
+-- 注意它走 log.info: 默认阈值 (warn) 下**不可见**, 这里先把阈值调到 info。
+local logl = require("aosp-nav.util.log")
+local saved_level = logl.get_level()
+logl.set_level("info")
 local notes = {}
 local real_notify = vim.notify
 vim.notify = function(msg) notes[#notes + 1] = msg end
 sa.report("no-client", nil, "/aosp/A")
-sa.report("toomany", 99, "/aosp/A")       -- 同一棵树: 被闸住
-sa.report("no-client", nil, "/aosp/B")    -- 另一棵树: 放行
+sa.report("not-ready", nil, "/aosp/A")     -- 同一棵树: 被闸住 (返回 nil)
+sa.report("no-client", nil, "/aosp/B")     -- 另一棵树: 放行
 vim.notify = real_notify
+logl.set_level(saved_level)
 check(#notes == 2, "report() 每棵树至多一次 (got " .. #notes .. ")")
--- 具体命令名随重构变化 (:AospApplySourceRoots -> :Aosp!), 只断言"指向一条 Aosp 命令"
-check(type(notes[1]) == "string" and notes[1]:find("Aosp", 1, true) ~= nil,
-  "the single report points at an :Aosp command")
+
+-- 文案契约 (2026-10-12 改): 它讲的是一次**自动失败**的后果与自愈, 不是故障。
+-- 刻意**不再指向 :Aosp!** —— 运行期 addToSourcePath 是整条 classpath 重建, 批量大
+-- 会把堆顶上 -Xmx 触发 OOM (实测把 jdtls 杀掉), 不该在自动失败的提示里劝人去敲。
+-- 必须说清"本次退回 jar"与"下次自动生效"。
+local msg = notes[1]
+check(type(msg) == "string" and msg:find("Aosp", 1, true) == nil,
+  "the report no longer suggests :Aosp! (got " .. tostring(msg) .. ")")
+check(msg and msg:find("jars", 1, true) ~= nil,
+  "the report says jumps fall back to jars this session")
+check(msg and msg:find("next start", 1, true) ~= nil,
+  "the report promises automatic apply on next start")
+
+-- 默认阈值 (warn) 下它必须**不可见** —— 这是它相对旧 warn 版的核心变化:
+-- "无需动作"的提示不该顶着 warn 的音量。用一个全新 key 避免上面那条 id 已登记。
+logl.reset()
+logl.set_level("warn")
+local quiet = {}
+vim.notify = function(m) quiet[#quiet + 1] = m end
+sa.report("not-ready", nil, "/aosp/C")
+vim.notify = real_notify
+check(#quiet == 0, "report() is silent at the default (warn) threshold (got " .. #quiet .. ")")
 
 H.finish("t_source_apply")

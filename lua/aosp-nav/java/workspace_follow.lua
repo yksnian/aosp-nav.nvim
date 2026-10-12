@@ -108,10 +108,13 @@ function M.on_buf_enter(fname)
   })
 
   -- 换根是整份重导入, 用户必须知道接下来这一分钟为什么卡。
+  -- once 是**布尔**旗标, 去重键走 id (util/log.lua:71: id = opts.id or (opts.once and msg))。
+  -- 把字符串塞进 once 不会报错, 但去重键会退化成**消息正文** —— 同一个目标换一次文案
+  -- 就再弹一次 (实测 emitted=2)。键必须带 target 才兑现"每个目标只提醒一次"。
   require("aosp-nav.util.log").user(
     ("importing %s — cross-project jumps will land on jars; expect ~1 min"):format(
       rel ~= "" and rel or target),
-    { once = "follow:" .. target })
+    { once = true, id = "follow:" .. target })
 
   return true
 end
