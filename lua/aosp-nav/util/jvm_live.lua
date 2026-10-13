@@ -493,6 +493,27 @@ function M.find_jcmd(pid, opts)
   return nil, nil
 end
 
+--- 从子进程 stderr 取一行人话失败原因。
+--- 朴素取"第一行"会被**启动环境注入的横幅行**抢走 (实测 2026-10-13, 与 #6 同类):
+--- 某些执行沙箱/包装器会在子进程 stderr 的**最前面**插一行形如
+---   [pid:pid:时间戳: WARNING crashpad_client_linux.cc:377] prctl: Invalid argument (22)
+--- 的日志, 而程序自己的报错 (jcmd 的 MonitorException 栈) 从第二行才开始 ——
+--- 取首行得到的是噪声, 真正的原因被丢掉。
+--- 规则: 跳过空行与"方括号 pid:pid:"横幅形状 (^%[%d+:%d+:) 的行, 取第一条有内容的。
+--- 干净机器上第一行就是程序自己的报错, 行为与旧实现完全一致; 该形状是已观测的
+--- 噪声类, 不是假装的通用解。一条可用的都没有返回 nil, 调用方落各自的兜底文案。
+--- @param stderr string|nil
+--- @return string|nil
+local function stderr_reason(stderr)
+  if type(stderr) ~= "string" then return nil end
+  for line in stderr:gmatch("[^\r\n]+") do
+    if line:find("%S") and line:match("^%[%d+:%d+:") == nil then
+      return line
+    end
+  end
+  return nil
+end
+
 --- 跑一次 jcmd 并拿到 stdout。用 vim.system 而不是 vim.fn.systemlist: 后者只收
 --- stdout, jcmd 的报错 (attach failed 等) 会直接漏到 nvim 的终端上, 把界面写花。
 --- @param jcmd string
@@ -509,7 +530,7 @@ function M.run_jcmd(jcmd, pid, args)
     return nil, "could not run jcmd: " .. tostring(res)
   end
   if res.code ~= 0 then
-    local msg = (type(res.stderr) == "string" and res.stderr:match("([^\n]+)"))
+    local msg = stderr_reason(res.stderr)
       or (type(res.stdout) == "string" and res.stdout:match("([^\n]+)"))
       or ("jcmd exited with " .. tostring(res.code))
     return nil, msg
@@ -522,7 +543,7 @@ function M.run_jcmd(jcmd, pid, args)
   -- **之后**再判有没有实质内容 —— 空输出必须自己判成失败, 否则面板会拿一份空快照
   -- 渲染出一整屏 n/a, 比报错还难懂。
   if out:find("%S") == nil then
-    return nil, (type(res.stderr) == "string" and res.stderr:match("([^\n]+)"))
+    return nil, stderr_reason(res.stderr)
       or ("jcmd produced no output (exit " .. tostring(res.code) .. ")")
   end
   -- 尾部换行也去掉: 它是 stdout 的收尾符, 不是内容。留着的话任何把它拼进一行的
@@ -577,7 +598,7 @@ function M.thread_dump(jcmd, pid, path)
     return false, "could not run jcmd: " .. tostring(res)
   end
   if res.code ~= 0 then
-    local msg = (type(res.stderr) == "string" and res.stderr:match("([^\n]+)"))
+    local msg = stderr_reason(res.stderr)
       or ("jcmd exited with " .. tostring(res.code))
     return false, msg
   end

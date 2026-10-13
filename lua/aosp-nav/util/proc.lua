@@ -1,7 +1,7 @@
 -- proc.lua: 从 /proc 读进程信息 (参数表、父进程、后代判定、可执行名、祖先上溯)
 --
--- 只读, 不杀进程 (唯一的例外是 ui.reap_orphan_jdtls, 它自己调 vim.uv.kill)。
--- 用途见 ui.jdtls_inventory: 判断有没有**别的** JVM 正在用同一份 jdtls 数据目录
+-- 只读, 不杀进程 (唯一的例外是 instances.reap_orphan_jdtls, 它自己调 vim.uv.kill)。
+-- 用途见 instances.jdtls_inventory: 判断有没有**别的** JVM 正在用同一份 jdtls 数据目录
 -- (-data), 以及那个 JVM 是哪个 nvim 会话拉起来的。两个 JVM 共用一份 .metadata
 -- 会互相覆盖索引。
 

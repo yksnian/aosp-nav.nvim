@@ -3,8 +3,8 @@
 -- 三种模式 (java.mode):
 --   "aosp" (默认) = **AOSP 根 = jdtls workspace 根**, 整棵树共用一个索引,
 --                   并按 (预置核心集 + 逐项目累积) 注入 sourcePaths。
---                   跨模块跳转落到可编辑源码 (受 jdt.ls 每工程字母序前缀截断,
---                   见 DEVELOPMENT.md §2.17)。
+--                   跨模块跳转落到可编辑源码 (注入根受 jdt.ls 的 exists() 资源树
+--                   过滤约束, 见 DEVELOPMENT.md §2.17b 的 2026-10-13 更正)。
 --   "infer"       = AOSP 根仍是 jdtls workspace 根, 但**不注入 sourcePaths**,
 --                   交给 jdt.ls 逐文件的 package 推断源码根。
 --                   **索引仍覆盖全树, 不比 aosp 快** —— 差别只在跨模块跳转。

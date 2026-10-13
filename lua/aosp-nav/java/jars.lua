@@ -9,11 +9,11 @@ local log = require("aosp-nav.util.log")
 local CACHE_VERSION = 6  -- v6: filters 指纹进缓存头 + 目录优先级排序
                          --      + %-headers 桩家族排除 (默认值在 config.lua)
 
--- 模块级缓存状态 (从 jdtls.lua 迁移)
-local _jars_cache = nil       -- 缓存的 jar 列表
-local _jars_cache_root = nil  -- 缓存对应的 android_root
-local _jars_computed = false  -- 是否已计算过
-local _jars_origin = nil      -- "cache" | "soong" | "make" | "fallback"
+-- 模块级缓存状态 [#3 重构]: **按 AOSP 树分区**。双树会话里交替打开两个树的文件
+-- 不再把对方的内存缓存挤掉 (旧版单槽, 每次切树都重读整份文件缓存)。
+local _jars_cache = {}       -- [android_root] = jar 列表 (nil = 该树未计算)
+local _jars_origin = {}      -- [android_root] = "cache" | "soong" | "make" | "fallback"
+local _last_root = nil       -- 最近一次 find_android_jars 解析出的树 (无参调用的兜底)
 
 -- 后台刷新状态 (R1: refresh_async)
 local _refresh_inflight = false  -- 有刷新在跑 (防重入)
@@ -24,19 +24,18 @@ local function get_cfg()
   return require("aosp-nav").config
 end
 
---- jar 文件缓存路径 (键规则与 import_exclusions 一致)
+--- jar 文件缓存路径 (键规则与 import_exclusions / source_roots 一致, [#8] 单射)
 --- @param root string android_root
 --- @return string|nil
 local function cache_file_for(root)
   local cfg = get_cfg()
   if not cfg.cache_dir or not root or root == "" then return nil end
-  local key = root:gsub("/", "-"):gsub("^-", "")
-  return cfg.cache_dir .. "/" .. key .. ".txt"
+  return cfg.cache_dir .. "/" .. require("aosp-nav.util.path").cache_key(root) .. ".txt"
 end
 
 --- 写 jar 缓存文件 (同步扫描与后台刷新共用的唯一写路径)。
---- 头部字节必须与读侧校验一致 (# version= / # filters=), 否则下次启动
---- 读缓存不命中会重扫 —— 所以两条路径都走这里, 不允许各写一份格式。
+--- 头部字节必须与读侧校验一致 (# version= / # filters= / # android_root=), 否则下次
+--- 启动读缓存不命中会重扫 —— 所以两条路径都走这里, 不允许各写一份格式。
 --- @param cache_file string
 --- @param android_root string
 --- @param fhash string filters 指纹
@@ -353,13 +352,15 @@ end
 
 --- 主入口: 收集 AOSP jar 列表
 --- 顺序: soong intermediates -> make JAVA_LIBRARIES -> fallback
---- 支持内存缓存 + 文件缓存
+--- 支持内存缓存 (按树分区) + 文件缓存
 --- @param opts table|nil { no_cache = boolean, fname = string }
 ---   no_cache: 跳过一次文件缓存读取 (:AospRescan 用)
 ---   fname:    推断 AOSP 根的基准文件。调用方 (java/init.lua configure) 必须传 ——
 ---             buf 0 在 LazyVim 的 ft=java 求值时机里未必是 java 文件, 而 jar 列表
 ---             与 sourcePaths/exclusions 必须以同一个 AOSP 根为准
 --- @return table jars jar 路径列表
+--- @return string|nil android_root 解析出的树根 (nil = 非 AOSP); [#3] 起调用方
+---   应该用它而非 cache_status().root 判定 is_android
 function M.find_android_jars(opts)
   local cfg = get_cfg()
   local java_cfg = cfg.java
@@ -370,12 +371,13 @@ function M.find_android_jars(opts)
 
   -- 非 android 项目: 返回空 (不加载任何 android jar, 仅用 JDK 基础库)
   if not android_root then
-    return {}
+    return {}, nil
   end
+  _last_root = android_root
 
-  -- 命中内存缓存直接返回
-  if _jars_computed and _jars_cache_root == android_root then
-    return _jars_cache
+  -- 命中内存缓存直接返回 ([#3] 按树分区: 双树交替打开互不挤掉)
+  if _jars_cache[android_root] then
+    return _jars_cache[android_root], android_root
   end
 
   local jars = {}
@@ -387,33 +389,36 @@ function M.find_android_jars(opts)
   -- 带版本标记: 过滤算法升级时旧缓存自动作废重扫
   -- 手动清除: rm ~/.cache/nvim/aosp_nav/*.txt (AOSP 重新编译后需要)
   local cache_file = nil
-  local from_cache = false
   local fhash = filters_hash(java_cfg)
   if cfg.cache_dir and android_root then
     cache_file = cache_file_for(android_root)
     if cache_file and not (opts and opts.no_cache) and vim.fn.filereadable(cache_file) == 1 then
       local lines = vim.fn.readfile(cache_file)
-      -- version 与 filters 指纹都匹配才复用缓存:
-      --   version  = 算法变更 (插件升级)
-      --   filters  = 用户排除配置变更 (改 exclude_globs 等, 免手动 rm)
+      -- version / filters 指纹 / 树根三者都匹配才复用缓存:
+      --   version      = 算法变更 (插件升级)
+      --   filters      = 用户排除配置变更 (改 exclude_globs 等, 免手动 rm)
+      --   android_root = [#8] 缓存键旧版不单射 (/work/a/b 与 /work/a-b 同键),
+      --                  头部树根不符说明这份文件是**别的树**写的, 绝不串台
       if lines[1] == "# version=" .. CACHE_VERSION
-          and lines[2] == "# filters=" .. fhash then
+          and lines[2] == "# filters=" .. fhash
+          and lines[3] == "# android_root=" .. android_root then
+        local stat = vim.uv.fs_stat
         for _, line in ipairs(lines) do
           if line ~= "" and line:sub(1, 1) ~= "#" then
-            if vim.fn.filereadable(line) == 1 then
+            -- [#9] uv.fs_stat 直接走 libuv, 免去 vim.fn.filereadable 的 vimscript
+            -- 派发开销: 命中路径要对 ~1100 个 jar 逐个验证, 热缓存下差一个数量级
+            local st = stat(line)
+            if st and st.type == "file" then
               jars[#jars + 1] = line
               seen_paths[line] = true
             end
           end
         end
         if #jars > 0 then
-          from_cache = true
-          _jars_cache = jars
-          _jars_cache_root = android_root
-          _jars_computed = true
-          _jars_origin = "cache"  -- 缓存命中路径也要记来源 (状态/诊断读它)
+          _jars_cache[android_root] = jars
+          _jars_origin[android_root] = "cache"  -- 缓存命中路径也要记来源 (状态/诊断读它)
           log.debug("JAR loaded from cache (" .. #jars .. " jars)")
-          return jars
+          return jars, android_root
         end
       end
     end
@@ -451,11 +456,11 @@ function M.find_android_jars(opts)
     end
   end
 
-  -- 通知降噪: 仅首次计算时提示来源
+  -- 通知降噪: 仅该树的首次计算时提示来源
   -- 通知降噪: 扫描来源/统计属例行进度 (log.debug); 只有"识别出 android 工程
   -- 却一个 jar 都没有"值得冒泡 (jdtls 会被降级到只剩 JDK 基础库)
   local source_label = #source_parts > 0 and table.concat(source_parts, " + ") or nil
-  if not _jars_computed then
+  if _jars_cache[android_root] == nil then
     if source_label then
       log.debug("JAR source -> " .. source_label .. " (" .. #jars .. " jars)")
     else
@@ -463,20 +468,18 @@ function M.find_android_jars(opts)
     end
   end
 
-  -- 写文件缓存 (仅扫描到 jar 且非缓存加载时)
-  if #jars > 0 and not from_cache and cache_file then
+  -- 写文件缓存 (仅扫描到 jar 时; 缓存命中路径不会走到这里)
+  if #jars > 0 and cache_file then
     -- [v6] 固化目录优先级顺序 (桩与真身同 FQN 时真身在前)
     sort_by_dir_priority(jars)
     write_cache(cache_file, android_root, fhash, jars)
   end
 
-  -- 更新内存缓存
-  _jars_cache = jars
-  _jars_cache_root = android_root
-  _jars_computed = true
-  _jars_origin = from_cache and "cache" or (source_parts[1] or nil)
+  -- 更新内存缓存 ([#3] 按树分区)
+  _jars_cache[android_root] = jars
+  _jars_origin[android_root] = source_parts[1] or nil
 
-  return jars
+  return jars, android_root
 end
 
 --- 内部: 旧 make / fallback 树的兜底重扫 (同步, 只在延迟回调里跑)。
@@ -592,10 +595,10 @@ function M.refresh_status()
 end
 --- 判据: out/soong/build.ninja (每次构建都会重写) 或 make 时代 JAVA_LIBRARIES
 --- 目录的 mtime 比缓存文件新。只有一次 getftime, 可在启动路径上调用。
---- @param root string|nil android_root (nil = 用当前内存缓存对应的 root)
+--- @param root string|nil android_root (nil = 最近一次 find_android_jars 的树)
 --- @return boolean
 function M.cache_stale(root)
-  local r = root or _jars_cache_root
+  local r = root or _last_root
   if not r or r == "" then return false end
   local f = cache_file_for(r)
   if not f or vim.fn.filereadable(f) ~= 1 then return false end
@@ -613,18 +616,22 @@ end
 
 --- 清除 jar 缓存 (默认只清内存态; 文件缓存留作下次启动的兜底)
 --- 调用方:
----   :AospCollectJars — 只清内存 (fallback jar 变化不影响命中自身 out 的项目)
+---   :AospCollectJars — 只清内存 (fallback jar 变化不影响命中自身 out 的树);
+---     [#3] 起 root 缺省清**全部树**的内存缓存 (fallback 对所有树生效)
 ---   :AospRescan     — 只清内存 + find_android_jars({ no_cache = true }), 重扫完
 ---                     会把新结果写回文件; 重扫失败时旧文件仍在, 下次启动不至于裸奔
---- @param root string|nil android_root (nil = 用当前内存缓存对应的 root)
+--- @param root string|nil android_root (nil = 清全部树的内存缓存)
 --- @param opts table|nil { delete_file = boolean } true 时连文件缓存一起删
 --- @return string|nil cache_file 被删除的缓存文件路径 (仅在 delete_file 时)
 function M.reset_cache(root, opts)
-  local r = root or _jars_cache_root
-  _jars_cache = nil
-  _jars_cache_root = nil
-  _jars_computed = false
-  _jars_origin = nil
+  local r = root and (root ~= "" and root or nil) or nil
+  if r then
+    _jars_cache[r] = nil
+    _jars_origin[r] = nil
+  else
+    _jars_cache = {}
+    _jars_origin = {}
+  end
   if not (opts and opts.delete_file) then return nil end
   local f = r and cache_file_for(r)
   if f and vim.fn.filereadable(f) == 1 then
@@ -634,15 +641,18 @@ function M.reset_cache(root, opts)
   return nil
 end
 
---- 获取当前缓存状态 (供诊断/状态反馈)
+--- 获取当前缓存状态 (供诊断/状态反馈)。[#3] 按树取; root 缺省用最近一次解析的树。
+--- @param root string|nil android_root
 --- @return table {computed, root, count, origin, stale}
-function M.cache_status()
+function M.cache_status(root)
+  local r = root or _last_root
+  local jars = r and _jars_cache[r] or nil
   return {
-    computed = _jars_computed,
-    root = _jars_cache_root,
-    count = _jars_cache and #_jars_cache or 0,
-    origin = _jars_origin,
-    stale = M.cache_stale(),
+    computed = jars ~= nil,
+    root = r,
+    count = jars and #jars or 0,
+    origin = r and _jars_origin[r] or nil,
+    stale = M.cache_stale(r),
   }
 end
 

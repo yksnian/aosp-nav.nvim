@@ -55,8 +55,8 @@ function M.isolation_name(base, pid)
 end
 
 --- "我本该用的那个 `-data`" —— 即不隔离时 LazyVim 会给的路径。
---- **不能**用 ui._workspace_dir: 它在已有 client 时读第一个 client 的 `-data`, 那是
---- "现在在用的", 而我们要的是"我会不会撞上它"。用 ui.expected_workspace_dir 复算。
+--- **不能**用 workspace.workspace_dir: 它在已有 client 时读第一个 client 的 `-data`, 那是
+--- "现在在用的", 而我们要的是"我会不会撞上它"。用 workspace.expected_workspace_dir 复算。
 ---
 --- 这条链 (project_dir -> workspace_root -> aosp_root) 刻意与 root.jdtls_root_fn 里
 --- "根从哪来"的算法对齐 —— LazyVim 的 -data 就是 project_name(root_dir(...)) 派生的:
@@ -71,11 +71,11 @@ function M.workspace_dir(fname)
   local rm = require("aosp-nav.java.root")
   local bufname = fname or vim.api.nvim_buf_get_name(0)
   local root = rm.project_dir(bufname) or rm.workspace_root(bufname) or rm.aosp_root(bufname)
-  return require("aosp-nav.ui").expected_workspace_dir(root)
+  return require("aosp-nav.java.workspace").expected_workspace_dir(root)
 end
 
 --- 有没有别的活 nvim 的 jdtls 正占着我本该用的那份 `-data`?
---- 只认"**有主的**别的 jdtls" (ui.foreign_jdtls 已排除本 nvim 的后代):
+--- 只认"**有主的**别的 jdtls" (instances.foreign_jdtls 已排除本 nvim 的后代):
 ---   - 孤儿不算 —— 它会被 reap_orphan_jdtls 自动收走 (§2.16), 不必为它隔离;
 ---   - `-data` 在别处的更不算 —— 别的编辑器起的, 跟我们不共用索引 (§2.16 明令不理)。
 --- 结果按 ws_dir 缓存 (spec 求值到 attach 之间不会变)。
@@ -89,7 +89,7 @@ function M.check(fname, deps)
   if _cache and _cache.ws_dir == ws_dir and not deps.force then return _cache end
 
   local foreign = (deps.foreign or function(d)
-    return require("aosp-nav.ui").foreign_jdtls(d)
+    return require("aosp-nav.java.instances").foreign_jdtls(d)
   end)(ws_dir)
 
   _cache = { ws_dir = ws_dir, conflict = #foreign > 0, foreign = foreign }

@@ -165,12 +165,12 @@ return {
 
 一个面板, 两部分:
 
-- **diagnostics** —— 一份检查清单, 逐项带 `v`/`!` 标记与下一步动作提示: 插件版本 / jdtls 客户端与其 root_dir / `referencedLibraries` 条数 / `java.project.sourcePaths` 是否被注入 (两种模式都期望"已注入", 缺失即故障) / `java.import.exclusions` 条数 / gradle+maven 是否关闭 / AOSP 根与工作区根及当前模式 / 会话 phase / jar 缓存新鲜度 / Eclipse 残留 blockers / jdtls workspace 目录与 "jdtls index" 行 / Kotlin 脚本归属与 KLS 客户端数 / 是否有外部 jdtls 共用同一 `-data` 以及它属于谁 (`nvim <pid>` 还是孤儿)。**JVM `-Xmx` 检查不在这里** —— 已搬到 `:AospDebug` (见下), 那里读的是活进程而不是启动命令行。
+- **diagnostics** —— 一份检查清单, 逐项带 `v`/`!` 标记与下一步动作提示: 插件版本 / jdtls 客户端与其 root_dir / `referencedLibraries` 条数 / `java.project.sourcePaths` 是否被注入 (两种模式都期望"已注入", 缺失即故障) / `java.import.exclusions` 条数 / gradle+maven 是否关闭 / AOSP 根与工作区根及当前模式 / 会话 phase / jar 缓存新鲜度 / Eclipse 残留 blockers / jdtls workspace 目录与 "jdtls index" 行 / Kotlin 脚本归属与 KLS 客户端数 / 是否有外部 jdtls 共用同一 `-data` 以及它属于谁 (`nvim <pid>` 还是孤儿) / `jdtls contract` 一行 (对正在运行的 jdt.ls 的内部契约自检: invisible project 命名与 `addToSourcePath` 返回文案 —— 不匹配意味着 jdt.ls 改了本插件依赖的实现细节)。**JVM `-Xmx` 检查不在这里** —— 已搬到 `:AospDebug` (见下), 那里读的是活进程而不是启动命令行。
 - **source roots** —— 当前注入 `java.project.sourcePaths` 的全部源码根: 配置的核心集 (存在磁盘上的条目标 `x`), 以及每个已累积项目的源码根 (按 LRU 顺序)。当跳转落到同名类的意外实现时用来看清来源。
 
 出问题时先跑这个。
 
-`phase` 是活状态: `idle` (尚未配置) / `indexing` (AOSP 树, 已找到 jar, jdt.ls 仍在导入与构建 —— 状态栏显示 `AOSP:n(idx)`) / `ready` (jdt.ls 已报 `ServiceReady`) / `no-out` (AOSP 树里没有编译产物, 走的 fallback) / `failed` (非 AOSP 文件)。
+`phase` 是活状态: `idle` (尚未配置) / `indexing` (AOSP 树, 已找到 jar, jdt.ls 仍在导入与构建 —— 状态栏显示 `AOSP:n(idx)`) / `ready` (jdt.ls 已报 `ServiceReady`) / `no-out` (AOSP 树里没有编译产物, 走的 fallback)。非 AOSP 文件**没有** phase —— 状态栏对它们保持空串, 面板的 `aosp root` 行显示 `<not an AOSP file>`。
 
 ### :AospDebug
 
@@ -236,7 +236,7 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 { function() return require("aosp-nav").statusline() end }
 ```
 
-`statusline()` 在非 AOSP 场景返回 `""`, 可以常驻状态栏。
+`statusline()` 在非 AOSP 场景返回 `""` —— 包括普通 (非 AOSP) Java 工程, 它们什么都不显示而不是报错 —— 可以常驻状态栏。同一个会话里开着两棵 AOSP 树时, 状态栏始终反映**当前 buffer 所属树**的状态。
 
 `status()` 字段: `phase`、`root`、`android_root`、`jars`、`cache_origin`、`jdtls_clients`、`mode`、`source_roots`、`source_projects`。
 
@@ -245,6 +245,7 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 | 项                                | 默认                                                         | 说明                                                         |
 | --------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
 | android_root                      | nil                                                          | nil=自动检测, 或指定 AOSP 根目录                             |
+| sibling_projects                  | {soc/qcom/qssi, google/aosp}                                 | 兄弟子项目布局: 打开的文件祖先里没有 `out/` 时, 在最近的顶层根下按此顺序找兄弟项目的 `out/` (根探测与 KLS classpath 脚本共用) |
 | cache_dir                         | ~/.cache/nvim/aosp_nav                                       | jar 列表缓存目录                                             |
 | log_level                         | warn                                                         | 消息阈值 (`debug`/`info`/`warn`/`error`/`off`); 低于阈值的一律静默丢弃。见 [消息与通知](#消息与通知) |
 | java.enabled                      | true                                                         | 启用 java 子模块                                             |

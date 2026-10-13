@@ -41,14 +41,13 @@ end
 local function list_kls()
   local pids = {}
   local ok, out = pcall(vim.fn.system, { "pgrep", "-f", "org[.]javacs[.]kt[.]MainKt" })
+  -- pgrep 无匹配时 exit 1 (不是错误); 非 0 一律视为"没有"
   if not ok or vim.v.shell_error ~= 0 or not out or out == "" then
     return pids
   end
-  if vim.v.shell_error == 0 and out ~= "" then
-    for _, tok in ipairs(vim.split(vim.trim(out), "\n", { plain = true })) do
-      local pid = tonumber(tok)
-      if pid and pid ~= vim.uv.os_getpid() then pids[pid] = true end
-    end
+  for _, tok in ipairs(vim.split(vim.trim(out), "\n", { plain = true })) do
+    local pid = tonumber(tok)
+    if pid and pid ~= vim.uv.os_getpid() then pids[pid] = true end
   end
   return pids
 end
@@ -79,16 +78,21 @@ local function is_orphan(pid)
   return true   -- PPid=1 的 MainKt: 孤儿 (KLS 非 daemon)
 end
 
---- 杀单个 pid: TERM → 等 500ms → 存活则 KILL
+--- 杀单个 pid: TERM -> 等最长 500ms -> 仍存活则 KILL。
+--- [#9] 全程 libuv (uv.kill + 轮询 uv.kill(pid, 0)), 不再 fork `kill` 子进程、
+--- 不再 uv.sleep 硬等 —— 死了立刻返回, 存活才继续等; 巡检 timer 路径上不再
+--- 为每个 pid 付 5 次进程创建 + 500ms 固定阻塞。
+--- @param pid number
+--- @return boolean true = 已确认死亡
 local function terminate(pid)
-  vim.fn.system({ "kill", tostring(pid) })
-  -- 分段短等待, 最多 500ms, 进程死了立刻返回
+  local ok = pcall(vim.uv.kill, pid, "sigterm")
+  if not ok then return true end -- 进程已不存在, 视作完成
   for _ = 1, 5 do
     vim.uv.sleep(100)
-    vim.fn.system({ "kill", "-0", tostring(pid) })
-    if vim.v.shell_error ~= 0 then return true end   -- 已死, 免 KILL
+    local alive = pcall(vim.uv.kill, pid, 0) -- signal 0 = 只探活
+    if not alive then return true end
   end
-  vim.fn.system({ "kill", "-9", tostring(pid) })
+  pcall(vim.uv.kill, pid, "sigkill")
   return true
 end
 
@@ -168,14 +172,11 @@ function M.mark_session_active()
   -- Linux 下祖先链无需标记
 end
 
---- LspDetach(kotlin) 时调用: 停掉巡检 (会话不再使用 KLS)
+--- LspDetach(kotlin) 时调用: 本会话已无 KLS 客户端时**停掉巡检 timer** ——
+--- 旧实现是空函数 (timer 常驻, 每 10 分钟空扫一次); 之后重新 attach 时
+--- M.setup() 会把它再建起来。有 KLS 挂着 (多 .kt buffer 先后 detach) 则保留。
 function M.on_detach()
-  -- 保留 timer (会话可能重新打开 kt); 仅在关闭前清理时统一停
-end
-
---- 插件彻底停用/teardown 时调用 (当前无调用点, 预留)
-function M.teardown()
-  if M._timer then
+  if M._timer and #vim.lsp.get_clients({ name = "kotlin_language_server" }) == 0 then
     M._timer:stop()
     M._timer:close()
     M._timer = nil

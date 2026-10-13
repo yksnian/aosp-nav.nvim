@@ -1,4 +1,4 @@
--- t_instances.lua: jdtls 实例盘点 (ui.jdtls_inventory / reap_orphan_jdtls /
+-- t_instances.lua: jdtls 实例盘点 (instances.jdtls_inventory / reap_orphan_jdtls /
 -- instances_message) —— 归属判定、孤儿回收、报告文本。
 --
 -- 全部走**注入的假 /proc** (同 t_jvm 对 find_jcmd 的做法)。真起一台 jdtls 才能测的
@@ -9,7 +9,8 @@ local PLUGIN = vim.fn.fnamemodify(here .. "/..", ":p"):gsub("/$", "")
 vim.opt.runtimepath:prepend(PLUGIN)
 local H = dofile(here .. "/helper.lua")
 
-local ui = require("aosp-nav.ui")
+-- [#1 重构] 实例盘点从 ui.lua 拆到了 java/instances.lua; 局部名沿用 `ui` 减少噪音
+local ui = require("aosp-nav.java.instances")
 
 local LAUNCHER = "org.eclipse.equinox.launcher_1.6.0.jar"
 local CACHE_ROOT = vim.fn.stdpath("cache") .. "/jdtls" -- 本插件的 jdtls 缓存根

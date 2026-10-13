@@ -169,6 +169,7 @@ local function config_hash(cfg, branches)
   local subset = {
     cache_dir = cfg.cache_dir,
     fallback = cfg.java.jar_fallback_dir,
+    sibling_projects = cfg.sibling_projects,
     exclude_jars = cfg.java.exclude_jars,
     exclude_paths = cfg.java.exclude_paths,
     jar_mode = cfg.kotlin.jar_mode,
@@ -274,7 +275,15 @@ function M.render(branches)
     table.insert(lines, "  " .. q)
   end
   table.insert(lines, ")")
-  table.insert(lines, "SIBLINGS=( 'soc/qcom/qssi' 'google/aosp' )")
+  -- [v13] 兄弟项目从配置取 (与 android_root.lua 的 sibling_projects 同一份,
+  -- 不再两处硬编码); 脚本 marker 的 hash 里也带它, 改配置即重新生成脚本
+  local siblings = {}
+  for _, s in ipairs(cfg.sibling_projects or { "soc/qcom/qssi", "google/aosp" }) do
+    local q = shq(tostring(s))
+    if not q then return nil, "sibling_projects contains single quote: " .. tostring(s) end
+    siblings[#siblings + 1] = q
+  end
+  table.insert(lines, "SIBLINGS=( " .. table.concat(siblings, " ") .. " )")
 
   local body = [[
 

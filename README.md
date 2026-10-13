@@ -165,12 +165,12 @@ For unbuilt projects — e.g. you have multiple Android checkouts, some built an
 
 One panel with two sections:
 
-- **diagnostics** — a checklist, each row marked `v`/`!` with a suggested next action: plugin version / jdtls clients and their root_dir / `referencedLibraries` count / whether `java.project.sourcePaths` was injected (expected in both modes; the row is a failure if it is missing) / `java.import.exclusions` count / gradle+maven disabled / AOSP root and workspace root with the active mode / session phase / jar cache freshness / stale Eclipse blockers / jdtls workspace directory and the "jdtls index" row / Kotlin script ownership and KLS client count / whether a foreign jdtls shares the same `-data` and who owns it (`nvim <pid>`, or an orphan). **The JVM `-Xmx` check is not here** — it moved to `:AospDebug` (below), which reads the live process instead of the launch command.
+- **diagnostics** — a checklist, each row marked `v`/`!` with a suggested next action: plugin version / jdtls clients and their root_dir / `referencedLibraries` count / whether `java.project.sourcePaths` was injected (expected in both modes; the row is a failure if it is missing) / `java.import.exclusions` count / gradle+maven disabled / AOSP root and workspace root with the active mode / session phase / jar cache freshness / stale Eclipse blockers / jdtls workspace directory and the "jdtls index" row / Kotlin script ownership and KLS client count / whether a foreign jdtls shares the same `-data` and who owns it (`nvim <pid>`, or an orphan) / the live `jdtls contract` verdict (an internal-consistency check against the running jdt.ls: the invisible-project naming and the `addToSourcePath` replies — a mismatch here means jdt.ls changed an implementation detail this plugin relies on). **The JVM `-Xmx` check is not here** — it moved to `:AospDebug` (below), which reads the live process instead of the launch command.
 - **source roots** — every source root currently injected into `java.project.sourcePaths`: the configured core set (with an `x` marking entries that exist on disk), and for each accumulated project its roots in LRU order. Useful when navigation lands in an unexpected implementation of a duplicated class.
 
 Run it first when something is off.
 
-`phase` is a live state: `idle` (nothing configured yet) / `indexing` (AOSP tree, jars found, jdt.ls still importing and building — the statusline shows `AOSP:n(idx)`) / `ready` (jdt.ls reported `ServiceReady`) / `no-out` (AOSP tree has no build output, running off the fallback dir) / `failed` (non-AOSP file).
+`phase` is a live state: `idle` (nothing configured yet) / `indexing` (AOSP tree, jars found, jdt.ls still importing and building — the statusline shows `AOSP:n(idx)`) / `ready` (jdtls reported `ServiceReady`) / `no-out` (AOSP tree has no build output, running off the fallback dir). Files outside an AOSP tree get no phase at all — the statusline stays empty for them and the panel's `aosp root` row reads `<not an AOSP file>`.
 
 ### :AospDebug
 
@@ -236,7 +236,10 @@ Collects jars from a built project's `out/` directory into the fallback dir (`~/
 { function() return require("aosp-nav").statusline() end }
 ```
 
-`statusline()` returns `""` outside AOSP, so it can live permanently in a status line.
+`statusline()` returns `""` outside an AOSP tree — including plain (non-AOSP) Java
+projects, which show nothing rather than an error — so it can live permanently in a
+status line. With two AOSP checkouts open in one session, the fragment always
+reflects the tree of the **current buffer**.
 
 `status()` fields: `phase`, `root`, `android_root`, `jars`, `cache_origin`, `jdtls_clients`, `mode`, `source_roots`, `source_projects`.
 
@@ -245,6 +248,7 @@ Collects jars from a built project's `out/` directory into the fallback dir (`~/
 | Option                            | Default                                                      | Description                                                  |
 | --------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
 | android_root                      | nil                                                          | nil = auto-detect, or an explicit AOSP root path             |
+| sibling_projects                  | {soc/qcom/qssi, google/aosp}                                 | Vendor sub-project layout: when the opened file's ancestors have no `out/`, look for these sibling projects' `out/` under the closest top-level root (shared by root detection and the KLS classpath script) |
 | cache_dir                         | ~/.cache/nvim/aosp_nav                                       | jar list cache directory                                     |
 | log_level                         | warn                                                         | Message threshold (`debug`/`info`/`warn`/`error`/`off`); everything below is dropped silently. See [Messages and notifications](#messages-and-notifications) |
 | java.enabled                      | true                                                         | Enable the java sub-module                                   |

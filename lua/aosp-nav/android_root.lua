@@ -9,12 +9,14 @@ local M = {}
 
 local path_util = require("aosp-nav.util.path")
 
--- 兄弟子项目优先级 (文件不在自带 out 的子项目内时, 在顶层根下按此顺序查找)
--- 越靠前越优先; 按需调整
-local sibling_project_order = {
-  "soc/qcom/qssi",
-  "google/aosp",
-}
+-- 兄弟子项目优先级: 配置 sibling_projects (缺省 = 这份历史默认; 顶层根下按此顺序
+-- 查找, 越靠前越优先)。[v13] 从写死改为配置 —— 别家厂商布局不必再改插件源码。
+local function sibling_order()
+  local ok, cfg = pcall(function() return require("aosp-nav").config end)
+  local list = ok and cfg and cfg.sibling_projects
+  if type(list) == "table" and #list > 0 then return list end
+  return { "soc/qcom/qssi", "google/aosp" }
+end
 
 --- 判断目录是否自带 out 产物 (含 jar 源)
 --- @param dir string 目录路径
@@ -69,7 +71,7 @@ function M.find_android_platform_root(fname, opts)
   -- 在最近的顶层根下, 按优先级查找兄弟子项目
   local top = fallback_mk or fallback_repo
   if top and allow_sibling then
-    for _, sub in ipairs(sibling_project_order) do
+    for _, sub in ipairs(sibling_order()) do
       local cand = top .. "/" .. sub
       if M.has_jar_source(cand) then
         return cand

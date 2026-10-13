@@ -128,9 +128,48 @@ function M.install_phase_handler(client)
     if err or type(result) ~= "table" or result.type ~= "ServiceReady" then return end
     -- 只把 indexing 翻成 ready。no-out / failed 不是"索引中", ServiceReady 到来
     -- 也不代表那个会话的归类该改 (非 AOSP 文件照样会 attach 到 jdtls)。
+    -- [#3] 按树翻牌: 从 client 的 root_dir 解析它属于哪棵树 (state 的分区键);
+    -- 解析不出 (反编译视图 / 测试假 client) 时落回 _active 兜底槽。
     local state = require("aosp-nav.state")
-    if state.get().phase == "indexing" then state.set({ phase = "ready" }) end
+    local key = require("aosp-nav.java.root").aosp_root(
+      client.root_dir or (client.config and client.config.root_dir) or "")
+    if state.get(key).phase == "indexing" then
+      state.set({ phase = "ready" }, key)
+    end
+    -- [#4] ServiceReady = 导入完成的真信号: 此时做 jdt.ls 契约自检 (invisible
+    -- project 命名)。廉价、只读磁盘; 结果进 :Aosp 面板的 "jdtls contract" 行。
+    if key and key ~= "" then
+      pcall(require("aosp-nav.java.contract").check,
+        require("aosp-nav.java.instances").data_dir(client), key)
+    end
   end
+end
+
+-- [#2] attach 期一致性自检的"已告警树"集合 (每棵树一次)
+local _attach_tree_warned = {}
+
+--- attach 期一致性自检 ([#2] 的兜底半边): 这台 client 拿到的 jars/sourcePaths 是不是
+--- 真的按**它 rooted 的那棵树**组装的。
+--- 判据: state 里有没有这棵树的条目 (configure 组装完必写)。LazyVim 路径下 root_dir fn
+--- 会在 full_cmd 里以真实文件重入 configure 重组装, 恒命中; 纯 nvim-jdtls (root_dir 是
+--- 用户配置里算好的字符串) 没有重入时机, 单树设置不会踩 (任何 java 文件推的是同一个
+--- 根), 多树会话里这是唯一可靠的暴露点 —— 把静默错配变成一条可行动的告警。
+--- @param client table|nil
+function M.check_attach_tree(client)
+  if not (client and client.name == "jdtls") then return end
+  local rm = require("aosp-nav.java.root")
+  local rd = client.root_dir or (client.config and client.config.root_dir)
+  local key = rd and rm.aosp_root(rd) or nil
+  if not key or _attach_tree_warned[key] then return end
+  local st = require("aosp-nav.state").get(key)
+  if st.android_root ~= nil then return end -- 这棵树组装过, 一致
+  _attach_tree_warned[key] = true
+  log.user(("jdtls started rooted at %s, but the jars/sourcePaths in its settings were "
+    .. "assembled for another tree (this setup resolves root_dir outside aosp-nav's "
+    .. "root_dir fn, so the re-assembly pass never ran). Cross-tree navigation in THIS "
+    .. "client may resolve against the wrong jars — reopen the client or switch to "
+    .. "LazyVim-style jdtls opts so root_dir stays a function.")
+    :format(key), { id = "attach-tree:" .. key, timeout = 15000 })
 end
 
 local function hint_if_jar_jump(buf)
@@ -161,34 +200,73 @@ end
 --- 不覆盖用户已有配置 (deep_extend force 合并, AOSP 字段优先)
 --- @param opts table jdtls opts
 --- @return table opts 修改后的 opts
-function M.configure(opts)
+--- [#2] opts 可带第二参 ctx: { fname = string, reentry = boolean }。
+---   fname = 组装的基准文件 (重入时是 root_dir fn 拿到的**真实**文件);
+---   reentry = 本次是 root_dir fn 触发的重入 (跳过重复包装)。
+function M.configure(opts, ctx)
   local cfg = require("aosp-nav").config
   if not cfg or not cfg.java.enabled then
     return opts
   end
 
   local java_cfg = cfg.java
-  -- 确保 settings/capabilities 表存在
+  -- 确保 settings 表存在 (capabilities 不在这里动: nvim-jdtls 会自行把用户值与
+  -- 默认 capabilities 合并; 本插件只做 attach 后摘除, 见下面的 strip_caps)
   opts.settings = opts.settings or {}
-  opts.capabilities = opts.capabilities or vim.lsp.protocol.make_client_capabilities()
 
   local root_mod = require("aosp-nav.java.root")
-  local bufname = probe_file(root_mod)
+  -- [#2] 组装基准文件: 首次 = probe_file 的最佳猜测 (lazy 求 opts 时机里 buf 0 未必
+  -- 是触发 ft=java 的那个文件); 重入 = root_dir fn 拿到的真实文件, 不再猜。
+  local bufname = (ctx and ctx.fname) or probe_file(root_mod)
   local session_conflict = require("aosp-nav.java.session_conflict")
 
   -- 1. workspace root: "aosp" 模式下 = AOSP 根, 整棵树共用一个索引; "project"
   --    模式下交还给 .git/.project 就近取根 (旧行为)。非 AOSP 时原样交还用户的
   --    root_dir。必须在收集 jar 之前装好 —— 后面所有步骤都以它为准。
-  local user_root = opts.root_dir
-  opts.root_dir = root_mod.jdtls_root_fn(user_root)
+  --    [#2] 包装只做一次 (带标记); 包装体在 root_dir 解析时比较真实树与上次组装
+  --    的树, 换了树就**重入** configure —— 以真实文件为基准重算 jars/sourcePaths/
+  --    exclusions 并改写 opts.settings / opts.init_options。之所以可行 (已实测时序):
+  --    LazyVim 的 attach_jdtls 是 full_cmd(opts) -> (内部调 root_dir) -> extend_or_override
+  --    -> start_or_attach, opts 的子表按引用流入 config, 此刻的改写本次启动就能看到;
+  --    纯 nvim-jdtls (root_dir 是用户算好的字符串) 没有这个时机, 由 attach 期的
+  --    M.check_attach_tree 兜底告警。全部副作用幂等或按树分区, 重入安全。
+  if not opts._aosp_nav_re then
+    -- 标记挂在 opts 上 (Lua 的 function 值不可挂字段); opts 是跨重入持久的同一张表,
+    -- 重入时凭它跳过重复包装。
+    opts._aosp_nav_re = true
+    local user_root = opts.root_dir
+    local base_fn = root_mod.jdtls_root_fn(user_root)
+    local last_aosp = root_mod.aosp_root(bufname)
+    local busy = false
+    opts.root_dir = function(fname)
+      local r = base_fn(fname)
+      local a = r and root_mod.aosp_root(r) or nil
+      if a and a ~= last_aosp and not busy then
+        last_aosp = a
+        busy = true
+        pcall(M.configure, opts, { fname = fname, reentry = true })
+        busy = false
+      end
+      return r
+    end
+  end
 
   -- 1b. [v12] 会话隔离: 另一个 nvim 已经占着这棵树本该用的 `-data` 时, 本会话改用一份
   --     独立索引 (换 project_name -> 派生出不同的 -data/-configuration), 并**限制**本
   --     会话的注入 (sourcePaths/jars 不注入)。机制与代价见 java/session_conflict.lua。
   --     limited 同时挡三处注入 (源码根 / jars / init_settings), 见下面各步。
+  --     [#7] 隔离的**唯一**实现手段是包装 project_name —— `-data` 由它派生 (LazyVim
+  --     的 full_cmd; 纯 nvim-jdtls 根本不认 project_name, `-data` 是用户写死在 cmd 里
+  --     的)。所以: 有 project_name 才隔离; 检测到冲突却隔离不了时**不做 limited**
+  --     —— 那会留下最差组合 (注入被禁了, 两个 JVM 还在抢同一份索引)。此时退回
+  --     原有行为: 注入照旧 + 第 14 步的冲突告警 (instances_message)。
   local conflict = session_conflict.check(bufname)
-  local limited = conflict.conflict
-  if limited and opts.project_name then
+  local can_isolate = opts.project_name ~= nil
+  local limited = conflict.conflict and can_isolate
+  -- [#2] 包装只做一次 (标记挂 opts; function 值不可挂字段): 重入时 project_name 已是
+  -- 我们的包装体, 再包一层会把隔离名当 base 再派生一次 (隔离名套隔离名)。
+  if limited and not opts._aosp_nav_iso then
+    opts._aosp_nav_iso = true
     local user_pn = opts.project_name
     opts.project_name = function(rd)
       local base = user_pn(rd)
@@ -208,11 +286,12 @@ function M.configure(opts)
 
   -- 2. JAR 收集 (jars.lua 自己按 android_root 检测/缓存)。
   --    fname 显式传入: jars.lua 若自己读 buf 0, 会与上面的 probe_file 得出不同的
-  --    AOSP 根 (或取不到), jar 与 sourcePaths/exclusions 就不同源了
+  --    AOSP 根 (或取不到), jar 与 sourcePaths/exclusions 就不同源了。
+  --    [#3] 起用第二个返回值判 is_android (cache_status 是按树/按最近树的状态,
+  --    不再是"这次调用解析出了什么"的信号)。
   local jars_mod = require("aosp-nav.java.jars")
-  local jars = jars_mod.find_android_jars({ fname = bufname })
-  local jar_status = jars_mod.cache_status()
-  local is_android = jar_status.root ~= nil
+  local jars, jar_root_found = jars_mod.find_android_jars({ fname = bufname })
+  local is_android = jar_root_found ~= nil
 
   -- 3. 源码根 (java.project.sourcePaths)。
   --    显式 java.source_paths 非空时完全接管; 否则 mode == "aosp" 走
@@ -438,27 +517,35 @@ function M.configure(opts)
     schedule_exclusions_refresh(java_cfg, aosp_root)
   end
 
-  -- 11. 会话状态 (供 :AospStatus / :AospDiagnostics / statusline 读取)
-  require("aosp-nav.state").set({
-    -- phase 由**真信号**驱动 (见下面的 11b): 这里先给出"jdt.ls 即将导入+构建"
-    -- 这个初值, 等 jdt.ls 自己报 ServiceReady 才翻成 "ready"。绝不在 configure
-    -- 就写 "ready" —— 新工作区此刻才开始索引, 那是假绿灯。
-    phase = is_android and (#jars > 0 and "indexing" or "no-out") or "failed",
-    root = root_path,
-    android_root = jar_status.root,
-    jars = #jars,
-    cache_origin = jar_status.origin,
-    source_roots = source_paths and #source_paths or 0,
-    -- [v10] 单一 mode 键; 旧字段 (source_paths_mode / workspace_mode) 已彻底移除,
-    -- 不再派生 —— 所有读者一律读 cfg.java.mode。
-    mode = java_cfg.mode,
-    source_projects = source_inject and #source_inject.state().projects or 0,
-    -- [v12] 会话隔离标记 (见 java/session_conflict.lua): true = 另一个 nvim 正占着
-    -- 本棵树本该用的 `-data`, 本会话改用独立索引且**没有**注入 sourcePaths/jars。
-    -- 面板靠它解释"为什么这个窗口跳转落 jar"。
-    limited = limited or false,
-    isolated_index = limited and conflict.ws_dir or nil,
-  })
+  -- 11. 会话状态 (供 :Aosp / statusline 读取)。[#3 重构] **按树分区**写入: key 用
+  --     aosp_root (与 jars/source_inject 的分区键同一套); 展示方 (ui.status) 按当前
+  --     buffer 所属的树取自己那份 —— 双树会话不再"谁后 configure 谁说了算"。
+  --     [#5] 非 AOSP 文件**不写**状态: 旧版写 phase="failed", 状态栏在任何普通 Java
+  --     工程常驻一条假的 "AOSP(err)" (注释却承诺"非 AOSP 返回空串")。"这不是我管的
+  --     树"由面板的 "aosp root: <not an AOSP file>" 行表达, 状态栏对它返回空串。
+  if is_android then
+    local jar_status = jars_mod.cache_status(jar_root_found)
+    require("aosp-nav.state").set({
+      -- phase 由**真信号**驱动 (见下面的 11b): 这里先给出"jdt.ls 即将导入+构建"
+      -- 这个初值, 等 jdt.ls 自己报 ServiceReady 才翻成 "ready"。绝不在 configure
+      -- 就写 "ready" —— 新工作区此刻才开始索引, 那是假绿灯。
+      phase = #jars > 0 and "indexing" or "no-out",
+      root = root_path,
+      android_root = jar_root_found,
+      jars = #jars,
+      cache_origin = jar_status.origin,
+      source_roots = source_paths and #source_paths or 0,
+      -- [v10] 单一 mode 键; 旧字段 (source_paths_mode / workspace_mode) 已彻底移除,
+      -- 不再派生 —— 所有读者一律读 cfg.java.mode。
+      mode = java_cfg.mode,
+      source_projects = source_inject and #source_inject.state(jar_root_found).projects or 0,
+      -- [v12] 会话隔离标记 (见 java/session_conflict.lua): true = 另一个 nvim 正占着
+      -- 本棵树本该用的 `-data`, 本会话改用独立索引且**没有**注入 sourcePaths/jars。
+      -- 面板靠它解释"为什么这个窗口跳转落 jar"。
+      limited = limited or false,
+      isolated_index = limited and conflict.ws_dir or nil,
+    }, jar_root_found)
+  end
 
   -- 11b. phase 的**第二个写入者**: jdt.ls 报导入+构建结束时翻牌 (实现与理由见
   --      M.install_phase_handler)。信号是 jdt.ls 的 `language/status` 通知, payload
@@ -470,7 +557,11 @@ function M.configure(opts)
     group = phase_grp,
     desc = "aosp-nav: flip phase to ready once jdt.ls reports ServiceReady",
     callback = function(args)
-      M.install_phase_handler(vim.lsp.get_client_by_id(args.data.client_id))
+      local client = vim.lsp.get_client_by_id(args.data.client_id)
+      M.install_phase_handler(client)
+      -- [#2] 一致性自检: client 的树与组装基准树是否一致 (错配只在纯 nvim-jdtls
+      -- 多树会话出现, 见函数注释)
+      M.check_attach_tree(client)
     end,
   })
 
@@ -478,30 +569,33 @@ function M.configure(opts)
   --     让下次会话开箱即用。绝不在 configure 里同步扫描 —— 那是
   --     out/soong/.intermediates 的全树 walk, 数秒级, 会卡启动。
   --     jars.refresh_async 由并行工作流新增, pcall 兜底: 缺函数也不影响启动。
-  if is_android and jar_status.origin == "cache" and jar_status.stale then
+  if is_android then
+    local jar_status = jars_mod.cache_status(jar_root_found)
     local stale_root = jar_status.root
-    local function refresh()
-      local ok, fn = pcall(function()
-        return require("aosp-nav.java.jars").refresh_async
-      end)
-      if ok and type(fn) == "function" then
-        pcall(fn, stale_root)
-      else
-        log.debug("jar cache stale, but jars.refresh_async is not available yet")
+    if jar_status.origin == "cache" and jar_status.stale then
+      local function refresh()
+        local ok, fn = pcall(function()
+          return require("aosp-nav.java.jars").refresh_async
+        end)
+        if ok and type(fn) == "function" then
+          pcall(fn, stale_root)
+        else
+          log.debug("jar cache stale, but jars.refresh_async is not available yet")
+        end
       end
-    end
-    -- configure 可能发生在非常早的启动阶段 (VimEnter 之前): 那时挂到 VimEnter,
-    -- 否则直接 defer 一次。
-    if vim.v.vim_did_enter == 1 then
-      vim.defer_fn(refresh, 0)
-    else
-      local grp = vim.api.nvim_create_augroup("aosp_nav_jar_refresh", { clear = true })
-      vim.api.nvim_create_autocmd("VimEnter", {
-        group = grp,
-        once = true,
-        desc = "aosp-nav: silent jar cache refresh (cache was stale)",
-        callback = refresh,
-      })
+      -- configure 可能发生在非常早的启动阶段 (VimEnter 之前): 那时挂到 VimEnter,
+      -- 否则直接 defer 一次。
+      if vim.v.vim_did_enter == 1 then
+        vim.defer_fn(refresh, 0)
+      else
+        local grp = vim.api.nvim_create_augroup("aosp_nav_jar_refresh", { clear = true })
+        vim.api.nvim_create_autocmd("VimEnter", {
+          group = grp,
+          once = true,
+          desc = "aosp-nav: silent jar cache refresh (cache was stale)",
+          callback = refresh,
+        })
+      end
     end
   end
 
@@ -509,8 +603,8 @@ function M.configure(opts)
   --     InvisibleProjectImporter 就被第一道闸挡死
   --     (ProjectUtils.getVisibleProjects(rootPath).isEmpty()), 整个根再也建不出
   --     invisible project —— 症状是"jdtls 没怎么索引就结束了、跳转全不工作",
-  --     完全看不出原因 (见 lua/aosp-nav/ui.lua M.workspace_blockers)。
-  --     [v10] 分两类处置 (判据都在 ui.lua):
+  --     完全看不出原因 (见 java/workspace.lua M.workspace_blockers)。
+  --     [v10] 分两类处置 (判据都在 java/workspace.lua):
   --       a) **空壳** (`.projects/<名>/` 只剩一层, 资源树里已经没有它) —— 直接删。
   --          源码在树里、树里也没有它的位置, 删掉不丢任何索引, 却省下
   --          :AospCleanWorkspace 的数十分钟重建 + 全量重索引。这正是把
@@ -526,16 +620,19 @@ function M.configure(opts)
   --          java.import.gradle.enabled = false 只挡新导入, 唯一出路是重建。
   --     [v10] 判据用 "根是 AOSP 根" <=> mode ~= "project" (aosp 与 infer 都成立)。
   if is_android and java_cfg.mode ~= "project" and root_path then
-    local ui = require("aosp-nav.ui")
-    local ws_dir = ui._workspace_dir(bufname)
-    local blockers = ui.workspace_blockers(ws_dir, root_path)
+    -- [#1 重构] 工作区元数据在 java/workspace.lua, JVM 实例盘点在 java/instances.lua;
+    -- 这段自愈/自检逻辑是核心路径, 不再依赖展示层 (ui.lua)。
+    local workspace = require("aosp-nav.java.workspace")
+    local instances = require("aosp-nav.java.instances")
+    local ws_dir = workspace.workspace_dir(bufname)
+    local blockers = workspace.workspace_blockers(ws_dir, root_path)
 
     -- (a) 空壳自清 (静默; 结果只进日志, 用户不需要知道插件替他扫了地)
-    if #blockers > 0 and ws_dir and #ui.jdtls_holders(ws_dir) == 0 then
+    if #blockers > 0 and ws_dir and #instances.jdtls_holders(ws_dir) == 0 then
       local kept = {}
       for _, name in ipairs(blockers) do
-        if ui.orphan_project(ws_dir, name)
-            and ui.remove_project_metadata(ws_dir, name) then
+        if workspace.orphan_project(ws_dir, name)
+            and workspace.remove_project_metadata(ws_dir, name) then
           log.debug("removed orphan jdtls project shell: " .. name)
         else
           kept[#kept + 1] = name
@@ -549,13 +646,13 @@ function M.configure(opts)
       _blockers_warned[root_path] = true
       local where = {}
       for _, name in ipairs(blockers) do
-        where[#where + 1] = ui.project_location(ws_dir, name) or name
+        where[#where + 1] = workspace.project_location(ws_dir, name) or name
       end
       local msg = ("%d externally-visible project(s) exist in the jdtls workspace — "
         .. "they keep the invisible project for this root from ever being created "
         .. "(jumps land in a fake project):\n" .. table.concat(where, "\n"))
         :format(#blockers)
-      if ui.gradle_download_evidence(ws_dir) then
+      if workspace.gradle_download_evidence(ws_dir) then
         msg = msg .. "\njdt.ls is still building / downloading Gradle for them. Run "
           .. ":AospCleanWorkspace to rebuild the jdtls workspace (exclusions are ready, "
           .. "so they will not be re-imported)."
@@ -563,12 +660,12 @@ function M.configure(opts)
       log.user(msg, { id = "blockers:" .. root_path, timeout = 20000 })
     end
 
-    -- 14. jdtls 实例自检。三个形态共用**一次** /proc 扫描 (ui.jdtls_inventory):
+    -- 14. jdtls 实例自检。三个形态共用**一次** /proc 扫描 (instances.jdtls_inventory):
     --     a) **回收孤儿**。上一个 nvim 崩了 / 被 kill -9 / 终端被关, 它拉起的 jdtls
     --        会被 init 收养, 一直占着 -data —— 于是之后**每个**新会话都撞上"两个
     --        jdtls 抢一份索引"。孤儿没有任何会话拥有它, 是纯垃圾: 与第 13(a) 步的
     --        空壳自清同构 ("不可逆" 改 "可自愈"), 只是对象从磁盘文件换成进程。
-    --        安全闸两条 (都在 ui.reap_orphan_jdtls 里): 必须真的是孤儿 (ppid 链走到
+    --        安全闸两条 (都在 instances.reap_orphan_jdtls 里): 必须真的是孤儿 (ppid 链走到
     --        init 都没有 nvim), 且 -data 必须落在本插件缓存根之下 —— 别的编辑器也
     --        用 jdtls, 只认"孤儿"就杀等于越界。
     --        跑在 client 启动**之前**, 赶在两个 JVM 打架之前清场; 杀掉后等它落完
@@ -579,9 +676,9 @@ function M.configure(opts)
     --        正在用的 server。早先有一版会把它报成"走失 JVM"并劝人删目录, 对用户
     --        纯属噪音 (还把人自己的 VSCode 报了进去) —— 已整个拿掉。
     --     自动做掉的事不单独通知 (见 DEVELOPMENT §2.10): 报告文本由
-    --     ui.instances_message 生成, 无话可说时返回 nil。
-    local inv = ui.jdtls_inventory()
-    local reaped = ui.reap_orphan_jdtls(inv,
+    --     instances.instances_message 生成, 无话可说时返回 nil。
+    local inv = instances.jdtls_inventory()
+    local reaped = instances.reap_orphan_jdtls(inv,
       { enabled = java_cfg.kill_orphan_jdtls ~= false })
     if #reaped > 0 then
       log.debug("reaped orphan jdtls (SIGTERM): " .. table.concat(reaped, ", "))
@@ -592,9 +689,9 @@ function M.configure(opts)
       -- —— 抢锁这件事已经被躲开了。改说清本窗口的**功能边界**, 免得用户以为插件坏了。
       msg = "another nvim holds this workspace, aosp-nav features are limited here"
     else
-      msg = ui.instances_message({
+      msg = instances.instances_message({
         ws_dir = ws_dir,
-        holders = ui.foreign_jdtls(ws_dir, inv),
+        holders = instances.foreign_jdtls(ws_dir, inv),
         reaped = reaped,
       })
     end

@@ -25,10 +25,58 @@ setup(opts)
        │    ├─ java/jars.lua           soong intermediates -> referencedLibraries
        │    ├─ java/import_exclusions  import 排除 (异步 grep 范式来源)
        │    ├─ java/source_roots.lua   项目源码根扫描 (算法见 §5, 缓存见 §6)
-       │    └─ java/source_inject.lua  注入编排: 核心集 + 增量累积 (见 §7)
+       │    ├─ java/source_inject.lua  注入编排: 核心集 + 增量累积 (见 §7)
+       │    ├─ java/source_apply.lua   运行期增量注入 (java.project.addToSourcePath)
+       │    ├─ java/workspace.lua      Eclipse 工作区元数据 (空壳判定 / .projects 手术)
+       │    ├─ java/instances.lua      JVM 实例盘点 / 孤儿回收 / 冲突告警
+       │    ├─ java/session_conflict   双 nvim 抢同一份 -data 时的会话隔离
+       │    └─ java/contract.lua       jdt.ls 内部实现的运行期契约自检
        ├─ kotlin/init.lua              KLS 接线 (classpath 脚本 + 分发表)
-       └─ ui.lua                       :Aosp (信息面板: 状态 / 诊断 / 源码根)
+       └─ ui.lua                       :Aosp / :AospDebug / 状态栏 (纯展示层)
 ```
+
+### 1.0 模块地图 (2026-10-13 重构后)
+
+[#1 重构] 把**核心业务逻辑从展示层拆出** (旧版 `ui.lua` 1386 行, 既是面板渲染又是
+Eclipse 元数据手术台和进程管理器, 而 `java/init.lua`/`session_conflict`/`source_apply`
+反向 require 它 —— 依赖倒置)。旧 `ui.X` 的新家:
+
+| 旧 `ui.X` | 新位置 | 说明 |
+| ---- | ---- | ---- |
+| `_workspace_dir` | `java/workspace.lua` → `workspace_dir` | 运行中 client 的 / 约定兜底的 `-data` |
+| `expected_workspace_dir` | `java/workspace.lua` | "我本该用哪个 -data" (session_conflict 用) |
+| `invisible_project_name` | `java/workspace.lua` | Java hashCode 复算 |
+| `workspace_projects` / `workspace_blockers` | `java/workspace.lua` | 工程名单 / 外部可见工程 |
+| `project_location` / `orphan_project` / `remove_project_metadata` | `java/workspace.lua` | 空壳定位 / 判定 / 删除 |
+| `gradle_download_evidence` / `index_state` | `java/workspace.lua` | 重建判据 / 索引落盘状态 |
+| `jdtls_inventory` / `jdtls_holders` / `foreign_jdtls` | `java/instances.lua` | 一次 /proc 扫描, 三个调用方 |
+| `reap_orphan_jdtls` / `instances_message` | `java/instances.lua` | 孤儿回收 / 冲突报告文本 |
+| `data_dir_of` / `root_dir_of` / `tree_name` / `jdtls_pid` | `java/instances.lua` (`data_dir` / `root_dir` / `tree_name` / `jdtls_pid`) | :AospDebug 的定位辅助 |
+
+`ui.lua` 由此变成**纯展示层**: 只读 state 与各模块结论, 渲染面板; 唯一的写操作仍是
+`:AospCleanWorkspace`。本文档后文提到 `ui.X` 的地方, 除历史记录外一律按上表换算。
+
+同一轮重构还有三个结构性变化:
+
+* **[#3] state / jars 按 AOSP 树分区**。state 的分区键 = aosp_root (与
+  jars/source_inject/contract 同一套); `ui.status()` 按**当前 buffer 所属的树**取,
+  双树会话不再"谁后 configure 谁说了算"; jars 的内存缓存从单槽改成按树的 map。
+* **[#2] root_dir fn 拿到真实文件后重入 configure**。LazyVim 的 `full_cmd` 在
+  attach 期以真实 fname 调用我们的 root_dir fn (早于 config 组装收尾), 包装体比较
+  真实树与上次组装的树, 换树即重入 `configure(opts, { fname, reentry })` —— opts
+  的子表按引用流入 config, 重算的 jars/sourcePaths/exclusions 本次启动就生效。
+  纯 nvim-jdtls (root_dir 是字符串) 没有这个时机, 由 attach 期的
+  `M.check_attach_tree` 告警兜底。
+* **[#4] jdt.ls 契约自检** (`java/contract.lua`): ServiceReady 后核验 invisible
+  project 复算名是否真的出现在 `.projects/` 里, addToSourcePath 的 failed 计数
+  入账 —— jdt.ls 升级导致的静默漂移变成 :Aosp 面板 "jdtls contract" 一行事实。
+* **[v13] §2.17b 归因更正 (反编译 1.61.0)**: `InvisibleProjectImporter.getSourcePaths`
+  对每条注入根只做 distinct + 绝对路径校验 + `IFolder("_/"+rel).exists()` 过滤,
+  **没有数量截断/排序**。"249→24" 的真相是 exists() 查 .metadata 持久资源树的虚拟
+  目录节点, 节点由运行期 addToSourcePath 逐条 create (下发前排序 → "字母序前缀"
+  假象)。推论: restart 不清资源树 → 历史节点之外全被过滤; **:AospCleanWorkspace
+  重建 → 全新导入, 注入根全部有效**。initialize 因此保持**全量 union** 注入, 运行
+  期追加成功的根经 `mark_installed` 回填 pending 账本 (页面 pending 归零)。
 
 两条时间线, 贯穿全部设计:
 
@@ -48,8 +96,13 @@ setup(opts)
 
 | 写入者 | 时机 | 写什么 |
 | ---- | ---- | ---- |
-| `configure()` | 每次 configure | `indexing` (AOSP 树且有 jar) / `no-out` / `failed` / `idle` |
+| `configure()` | 每次 configure | `indexing` (AOSP 树且有 jar) / `no-out` / `idle`。**非 AOSP 文件不写状态** (2026-10-13 起, 见下) |
 | `aosp_nav_jdtls_phase` 钩子 | `LspAttach` 后收到 jdt.ls 的 `language/status` 且 `type == ServiceReady` | `indexing` → `ready` (仅当当前是 `indexing`) |
+
+**非 AOSP 文件不再写 `phase = "failed"`** (2026-10-13 修): 旧版对任何非 AOSP 的
+Java 文件都写 failed, 状态栏于是常驻一条假的 "AOSP(err)" —— 而注释与 README 都
+承诺"非 AOSP 返回空串"。"这不是我管的树"由面板的 `aosp root: <not an AOSP file>`
+行表达; 状态栏对它返回空串。
 
 信号选型 (有实测支撑, 不是猜的): jdt.ls 用 **`language/status`** 通知回报导入/构建
 进度, payload 是 `StatusReport { type, message }`, 其 `type` 取 `ServiceStatus`
@@ -1119,7 +1172,7 @@ referencedLibraries=0) 会变红而没人解释为什么。
 (全程 `SC.set_cache_root` 指向临时目录, 真缓存根里不得留下 `-nvim<pid>` —— 回归
 2026-10-13 "测试在真缓存里留下 `qssi-nvim<pid>`")。
 
-### 2.17 运行中换工作区根 (`workspace/didChangeWorkspaceFolders`) 与每工程字母序截断 (2026-10-12)
+### 2.17 运行中换工作区根 (`workspace/didChangeWorkspaceFolders`) 与注入根的 exists() 过滤 (2026-10-12/13)
 
 两个问题都是 2026-10-12 为把 `java.mode = "project"` 从"重启才能换项目"改成"跟随
 buffer"而做的实测, 用的是**独立 `-data`** (`/tmp/pb-*`, 全程未碰 `~/.cache/nvim/jdtls/`),
@@ -1152,28 +1205,29 @@ cwd = AOSP 根。
 `log.info`): 用户得知道接下来这一分钟为什么卡。且它只在目标项目与当前根**不同**时出手 ——
 同一个项目里来回切文件是纯字符串比较, 零成本, 不加 timer 也不做防抖。
 
-#### (b) jdt.ls 的 `InvisibleProjectImporter` 按**每工程字母序前缀**截断请求的源码根
+#### (b) ~~jdt.ls 的 `InvisibleProjectImporter` 按**每工程字母序前缀**截断请求的源码根~~ (归因更正, 2026-10-13 反编译 1.61.0)
 
-`:Aosp` 面板报 3 条 `Java Model Exception (code 969): … does not exist` 的**真正原因**。
-长期怀疑过的四种解释都被测量否掉了:
+原记录: "`InvisibleProjectImporter` 对每个工程独立地保留所请求源码根的**字母序前
+缀**" (FB 218→18, Connectivity 29→5)。**归因错误** —— 对正在运行的
+`org.eclipse.jdt.ls.core_1.61.0` 做 `javap -p -c` 反编译, `getSourcePaths`
+对每条注入根只做三件事: `distinct` 去重、绝对路径校验 (抛 "must be a relative
+path")、`IFolder("_/"+rel).exists()` 过滤 —— **没有任何数量截断或排序逻辑**。
 
-| 假设 | 否证 |
-| --- | --- |
-| §2.12 的"可见工程阻塞" | 只有 `aosp_3f7ad7da` 一个工程注册, 没有阻塞 |
-| FQN 影子 / 去重 | `framework/src` 与 `framework-t/src` 重叠文件数 = **0** |
-| 文件数阈值 (38/39) | 保留的根里有 2586 / 4638 文件的, 丢弃的里有 **1** 文件的 |
-| 磁盘不存在 | 224 个被丢弃的根**全部存在** |
+真实机制: `exists()` 查的是 **Eclipse 资源树里 `_<相对路径>` 虚拟目录节点** (持久
+在 `.metadata`, 磁盘上不存在对应目录), 而这些节点由**运行期 `addToSourcePath`
+逐条 create** (BuildPathCommand → `ProjectUtils.addSourcePath`, 资源型虚拟
+folder)。auto-apply 下发前对 pending 做过排序, 于是节点累计恰好呈"各工程字母序
+前缀" —— **字母序是下发顺序的假象, 不是 jdt.ls 的规则**。"保留 218 里的前 18 /
+29 里的前 5" 实为多会话 × 每批 5 条的运行期追加历史; "确定性地每会话 3 条" 的 969
+异常是旧节点被新列表移除后 JDT 内存模型的 stale 元素噪音 (当前 classpath 的 src
+条目全部指向存在的目录)。
 
-真正规则: `InvisibleProjectImporter` 对**每个工程独立**地保留所请求源码根的
-**字母序前缀**。实测: `frameworks/base` 保留 218 个里的前 18 (`apex/*` → `cmds/*`),
-`Connectivity` 保留 29 个里的前 5 (`Tethering/*` → `Vcn/*`)。
-`Connectivity/framework/src` 落在它字母序的第 ~12 位, 过了截断点 → 该文件没有
-`PackageFragmentRoot` → `BaseDiagnosticsHandler.collectNonJavaProblems` 里
-`CompilationUnit.getUnderlyingResource()` 抛 969。**确定性地每会话 3 条**, 与索引快慢无关。
-
-推论: **剪 `frameworks/base` 的根救不了 `Connectivity`** —— 两个工程各自截断,
-挪一个不动另一个的截断点。这也解释了为什么"多给源码根"有隐性上限 (`core_source_roots`
-注释里那句"给得越多首次索引越重"之外, 还要加上这条: 超出前缀的根压根不生效)。
+更正后的推论: **:AospCleanWorkspace (删 -data) 后的全新导入里, 注入根**全部**
+有效** (实测 src=280 全进); `:LspRestart`/重开 nvim 不清资源树, 历史节点之外的
+注入根会被 exists() 过滤 —— 所以"给新根提权到 jar 之前"只有 CleanWorkspace 一
+条路, 而"排到 jar 之后但可跳"由运行期 addToSourcePath 承担。原推论"剪 FB 救不
+了 Connectivity"改述为: 剪根改变的是 CleanWorkspace 重建时的注入内容, 对既有
+workspace 无直接效果。
 
 #### (c) 测试坑: `-data` 绝不能带 `--jvm-arg=` 前缀
 
@@ -1201,7 +1255,7 @@ Clean 想要的结果。
 三个判据:
 - **只在当前 buffer 是 `.java` 时重启** (`filetype == "java"`)。别的 filetype 下重放
   `FileType` 没有意义 (jdtls 的 attach 钩子只认 java), 提示语退回"自己开个 java 文件"。
-- **`buftype == ""`**: 反编译 / KLS 虚拟缓冲 (`jdtls://…`、`/tmp/kotlinlangserver…`) 的
+- **`buftype == ""`**: 反编译 / KLS 虚拟缓冲 (`jdt://…`、`/tmp/kotlinlangserver…`) 的
   filetype 也是 `java`, 但重放会引出 §2.13 那台"取不到根的第二台 jdtls" —— 必须挡掉。
 - **删完再重启**: 先 `stop_client`, `vim.defer_fn` 等 ~800ms (有 client 时) 再 `delete`,
   删成功后才重放 —— 顺序反了 jdtls 会在目录被删前又写回去。
@@ -1243,8 +1297,8 @@ Clean 想要的结果。
 workspace, 都要走同样的 invisible project 导入。所以"换 infer 会更快/更轻"是**错的**
 (旧 README 正是这么写的, 已删); 它省掉的只有"维护注入列表"这件事, 而那件事由
 `source_paths_max_projects = 8` 的 LRU 累积 + 核心集兜着, 本就不是开销所在。
-两者唯一可感的差别在**跨模块跳转落点**: `aosp` 落到可编辑 `.java` (受 §2.17b 的字母序
-前缀截断), `infer` 落到反编译 jar —— 也就是说在"能不能跳到源码"这个主诉求上, `infer`
+两者唯一可感的差别在**跨模块跳转落点**: `aosp` 落到可编辑 `.java` (注入根受
+§2.17b 的 exists() 资源树过滤约束, 见该节 2026-10-13 更正), `infer` 落到反编译 jar —— 也就是说在"能不能跳到源码"这个主诉求上, `infer`
 **更弱**而不是更强。
 
 它唯一还剩的真实价值是**没有注入列表这一层**: 不发明 list 就不会有 list 被 jdt.ls 截断

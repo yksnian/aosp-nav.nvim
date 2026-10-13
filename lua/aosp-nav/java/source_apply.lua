@@ -194,16 +194,16 @@ end
 --- @param fname string|nil
 --- @return string|nil ws_dir, table names
 function M.workspace(fname)
-  local ui = require("aosp-nav.ui")
+  local ws = require("aosp-nav.java.workspace")
   local rm = require("aosp-nav.java.root")
   local bufname = (fname and fname ~= "") and fname or vim.api.nvim_buf_get_name(0)
-  local ws_dir = ui._workspace_dir(bufname)
+  local ws_dir = ws.workspace_dir(bufname)
   if not ws_dir then return nil, {} end
   local names, seen = {}, {}
   for _, root in ipairs({ rm.workspace_root(bufname), rm.aosp_root(bufname) }) do
     if root and root ~= "" and not seen[root] then
       seen[root] = true
-      names[#names + 1] = ui.invisible_project_name(root)
+      names[#names + 1] = ws.invisible_project_name(root)
     end
   end
   return ws_dir, names
@@ -270,7 +270,7 @@ local function classify(result)
 end
 
 --- 测试钩子: 让端到端脚本能拿**真实** jdt.ls 返回值断言上面那三条字面量匹配。
---- (repo 既有惯例: ui._workspace_dir)
+--- (repo 既有惯例: workspace.workspace_dir)
 M._classify = classify
 
 --- 逐个调用 java.project.addToSourcePath。
@@ -281,7 +281,10 @@ M._classify = classify
 --- @param rels table 相对路径列表
 --- @param done fun(summary table)
 local function add_serial(client, aosp_root, rels, done)
-  local summary = { added = 0, present = 0, failed = 0, missing = 0, errors = {} }
+  local summary = { added = 0, present = 0, failed = 0, missing = 0, errors = {},
+    -- [v13] 本次**确实写进 workspace** 的相对路径 (added 分支逐条记录) —— 完成后由
+    -- start 回填 source_inject 的 installed 账本, 否则面板的 pending 永远清不了零
+    added_rels = {} }
   local i = 0
 
   local function step()
@@ -315,6 +318,9 @@ local function add_serial(client, aosp_root, rels, done)
           else
             local outcome, msg = classify(result)
             summary[outcome] = summary[outcome] + 1
+            if outcome == "added" then
+              summary.added_rels[#summary.added_rels + 1] = rel
+            end
             if outcome == "failed" and #summary.errors < 3 then
               summary.errors[#summary.errors + 1] = rel .. ": " .. msg
             end
@@ -393,6 +399,14 @@ local function start(client, aosp_root, batch, tag, deferred, fname)
   end
   add_serial(client, aosp_root, batch, function(s)
     _running[key] = nil
+    -- [#4] 契约记账: failed 计数进 :Aosp 的 "jdtls contract" 行 —— 持续失败通常
+    -- 意味着 jdt.ls 改了命令/返回文案 (字面量匹配失灵), 不是用户的配置问题。
+    pcall(require("aosp-nav.java.contract").record_apply, aosp_root, s)
+    -- [v13] 真实写进 workspace 的根回填 installed 账本: pending 的语义是"还没进
+    -- workspace", 不回填的话面板永远挂着 pending>0, 变相劝用户去做无意义的 :Aosp!
+    if #s.added_rels > 0 then
+      pcall(require("aosp-nav.java.source_inject").mark_installed, aosp_root, s.added_rels)
+    end
     if tag == "manual" then
       -- 用户敲的命令: 照实回报 (成功后是 log.info)
       if s.failed > 0 then

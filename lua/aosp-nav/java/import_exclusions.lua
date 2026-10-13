@@ -61,13 +61,14 @@ function M.escape_glob(s)
 end
 
 --- 缓存文件路径: <cache_dir>/import_exclusions-<root 扁平化>.txt
---- key 规则沿用 java/jars.lua 的缓存命名约定
+--- 键规则与 jars/source_roots 一致 ([#8] 单射: 旧 gsub("/", "-") 下 /work/a/b 与
+--- /work/a-b 同键, 两棵树的缓存互相覆盖)
 --- @param root string
 --- @return string
 local function cache_path(root)
   local cfg = get_cfg()
-  local key = root:gsub("/", "-"):gsub("^-", "")
-  return cfg.cache_dir .. "/import_exclusions-" .. key .. ".txt"
+  return cfg.cache_dir .. "/import_exclusions-"
+    .. require("aosp-nav.util.path").cache_key(root) .. ".txt"
 end
 
 --- 扫描结果有效时长 (秒); <= 0 表示永不过期 (仅 :AospImportExclusions 强制重扫)
@@ -76,11 +77,12 @@ local function ttl_seconds()
   return cfg.java and cfg.java.import_exclusions_ttl or 604800
 end
 
---- 读取扫描缓存, 不判新鲜度 (只校验版本)。
+--- 读取扫描缓存, 校验版本**与树根** (不判新鲜度)。
 --- 过期缓存也照常注入 —— 陈旧的排除项仍远好于没有排除; 新鲜度只决定是否
---- 在后台重扫 (M.is_stale), 这样重扫期间也不会出现"排除真空期"
+--- 在后台重扫 (M.is_stale), 这样重扫期间也不会出现"排除真空期"。
+--- [#8] 树根必须匹配: 缓存键旧版不单射, 头部 root 不符说明这份文件是别的树写的。
 --- @param root string
---- @return table|nil patterns 模式列表; nil = 无缓存/版本不符
+--- @return table|nil patterns 模式列表; nil = 无缓存/版本不符/别的树的缓存
 function M.cached(root)
   if not root or root == "" then return nil end
   local p = cache_path(root)
@@ -88,6 +90,7 @@ function M.cached(root)
 
   local lines = vim.fn.readfile(p)
   if lines[1] ~= "# version=" .. CACHE_VERSION then return nil end
+  if lines[2] ~= "# root=" .. root then return nil end
   local out = {}
   for _, line in ipairs(lines) do
     if line ~= "" and line:sub(1, 1) ~= "#" then

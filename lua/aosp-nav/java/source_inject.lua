@@ -283,8 +283,9 @@ end
 local function projects_file(aosp_root)
   local cfg = get_cfg()
   if not cfg.cache_dir or not aosp_root or aosp_root == "" then return nil end
-  local key = aosp_root:gsub("/", "-"):gsub("^-", "")
-  return cfg.cache_dir .. "/source_inject-projects-" .. key .. ".txt"
+  -- 键规则与 jars/source_roots 一致 ([#8] 单射, 两棵不同的树不再同键)
+  return cfg.cache_dir .. "/source_inject-projects-"
+    .. require("aosp-nav.util.path").cache_key(aosp_root) .. ".txt"
 end
 
 --- 写某棵树的累积项目顺序 (一行一个绝对路径, 老的在前)
@@ -349,6 +350,14 @@ function M.inject_sync(cfg, aosp_root, fname)
   -- 指向已删除目录的行。每个 jdtls 启动只写一次这个小文件。
   M.persist(aosp_root)
 
+  -- 注入**全量 union**。§2.17b 更正 (2026-10-13 反编译 1.61.0):
+  -- InvisibleProjectImporter.getSourcePaths 对每条注入根只做 distinct + 绝对路径
+  -- 校验 + IFolder("_/"+rel).exists() 过滤, **没有任何数量截断/排序**。249→24 的
+  -- 真相是: exists() 查的是 .metadata 持久资源树里的虚拟目录节点, 节点由运行期
+  -- addToSourcePath 逐条 create (下发前 table.sort → 呈"字母序前缀"假象)。
+  -- 因此: restart 不清资源树 → 只剩历史节点 (exists 过滤); **CleanWorkspace 删
+  -- -data 重建 → 全新导入, 全部注入根有效** (src=280 实测) —— 注入必须保持全量,
+  -- 任何裁剪都会白白砍掉 CleanWorkspace 的全量收益。
   local list = M.union(cfg, aosp_root)
   if #list == 0 then return nil end
   _installed[aosp_root] = list
@@ -490,6 +499,28 @@ function M.pending_count(aosp_root)
   local ins = _installed[aosp_root] and #_installed[aosp_root] or 0
   return math.max(0, acc - ins)
 end
+
+--- 运行期 addToSourcePath **成功**追加的根记入 installed 账本 ([v13])。
+--- pending 的语义是"已累积但**还没进 workspace**" —— 运行期追加成功后那些根已经
+--- 在 workspace 里了 (只是排在 jar 之后), 账本不记的话面板会永远挂着 pending>0,
+--- 变相劝用户去做已经没有意义的 :Aosp!。不重排、不碰 jdt.ls: _installed 只用于
+--- 算 pending 与面板展示。
+--- @param aosp_root string|nil
+--- @param rels table|nil 本次成功写入的相对路径列表
+function M.mark_installed(aosp_root, rels)
+  if not aosp_root or aosp_root == "" or not rels or #rels == 0 then return end
+  local cur = _installed[aosp_root] or {}
+  local seen = {}
+  for _, r in ipairs(cur) do seen[r] = true end
+  for _, r in ipairs(rels) do
+    if not seen[r] then
+      seen[r] = true
+      cur[#cur + 1] = r
+    end
+  end
+  _installed[aosp_root] = cur
+end
+
 
 --- 清空累积 (供 :AospRescan)。
 --- 传 aosp_root 时**只清那棵树**: 多树下"重扫 A 树"不该顺手忘掉 B 树攒的项目。

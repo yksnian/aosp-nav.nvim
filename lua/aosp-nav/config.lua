@@ -26,6 +26,12 @@ M.defaults = {
   log_level = "warn",
   -- nil = 自动检测 (从打开文件路径向上找含 out 产物的目录)
   android_root = nil,
+  -- [v13] 兄弟子项目优先级: 打开的文件自身祖先里没有 out/ 时, 在最近的顶层根下按
+  -- 此顺序找兄弟项目的 out (厂商目录自身不编译的布局, 见 android_root.lua)。
+  -- 原为 android_root.lua 写死的 { "soc/qcom/qssi", "google/aosp" } —— 别家布局要改
+  -- 插件源码才能用, 故提为配置 (kotlin classpath 脚本的 SIBLINGS 也用这一份)。
+  -- 语义 = 整表替换。
+  sibling_projects = { "soc/qcom/qssi", "google/aosp" },
   -- jar 列表缓存目录 (避免每次打开 java 文件都全盘扫描)
   cache_dir = vim.fn.expand("~/.cache/nvim/aosp_nav"),
   java = {
@@ -99,7 +105,7 @@ M.defaults = {
     -- 之后每个新会话都撞上"两个 jdtls 抢一份索引"(索引被反复删除重建)。
     -- 没有任何会话拥有它, 所以这是纯垃圾; 与空壳工程自清 (java/init.lua 第 13a 步)
     -- 同一个道理: 能自动做掉的事就自动做掉, 不留一条要用户手动 kill 的消息。
-    -- 安全闸在 ui.reap_orphan_jdtls: 只杀"确实是孤儿"**且** -data 在本插件缓存根
+    -- 安全闸在 instances.reap_orphan_jdtls: 只杀"确实是孤儿"**且** -data 在本插件缓存根
     -- 之下的; 别的编辑器也用 jdtls, 缺了任何一条都不动它。设 false 关掉。
     kill_orphan_jdtls = true,
     -- [v10] 单一模式键 (取代旧的 workspace_mode + source_paths_mode 组合):

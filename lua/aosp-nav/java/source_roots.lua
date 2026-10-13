@@ -37,7 +37,10 @@ local log = require("aosp-nav.util.log")
 -- v6: header 第 2 行改成 java.source_root_exclude 的指纹 (# exclude=, 对齐 jar 侧
 --     的 # filters=), stats 行挪到第 3 行并增加 excl=; 缓存失效的判据从"只有版本"
 --     变成"版本 + 排除配置"
-local CACHE_VERSION = "v6"
+-- v7: [#8] header 第 3 行加 # root=<项目目录> 并在读侧校验 —— 缓存键旧版不单射
+--     (/work/a/b 与 /work/a-b 同键), 两棵树的缓存文件会互相覆盖; 布局变了, bump
+--     版本让旧缓存整体作废重扫
+local CACHE_VERSION = "v7"
 
 -- 剪枝阈值。这些是算法的一部分而非使用偏好, 故为模块常量: 唯一的用户裁剪
 -- 入口是 java.source_root_exclude (Lua 模式, 同 exclude_globs 语义, 带精选默认值,
@@ -373,14 +376,15 @@ function M.scan_async(root, cb)
 end
 
 --- 缓存文件路径。**必须**与 jars 的缓存不同名: jars.lua 用的是
---- <cache_dir>/<key>.txt, 同名会互相覆盖。
+--- <cache_dir>/<key>.source-roots.txt; 键规则与 jars/import_exclusions 一致
+--- ([#8] 单射: 旧 gsub("/", "-") 下两个不同项目可同键互相覆盖)
 --- @param root string
 --- @return string|nil
 function M.cache_file(root)
   local cfg = get_cfg()
   if not cfg.cache_dir or not root or root == "" then return nil end
-  local key = root:gsub("/", "-"):gsub("^-", "")
-  return cfg.cache_dir .. "/" .. key .. ".source-roots.txt"
+  return cfg.cache_dir .. "/"
+    .. require("aosp-nav.util.path").cache_key(root) .. ".source-roots.txt"
 end
 
 --- 排除配置指纹 (写进缓存第 2 行): 与 jar 侧的 # filters= 同一个算法,
@@ -404,10 +408,12 @@ function M.load(root)
   end
   -- 排除配置变了 -> 缓存里的根列表已经不成立, 必须重扫 (整行相等才算命中)
   if (lines[2] or "") ~= "# exclude=" .. exclude_hash() then return nil end
+  -- [#8] 树根必须匹配: 键不单射时另一棵树/另一个项目的缓存可能写到同一文件
+  if (lines[3] or "") ~= "# root=" .. root then return nil end
   local stats = { shadow_ratio = SHADOW_RATIO }
   local roots = {}
   for i, l in ipairs(lines) do
-    if i == 3 then
+    if i == 4 then
       -- 逐字段匹配而不是整行一个 pattern: 统计字段会随版本增删 (v2 加过
       -- test=/jre=)。整行匹配时多一个/少一个字段就整体解析失败, 统计全变成
       -- 0 —— 而列表本身是好的, 白白误导人。缺的字段留 nil, 显示层用 `or 0`。
@@ -448,6 +454,8 @@ function M.save(root, roots, stats)
     "# aosp-nav.nvim source-roots " .. CACHE_VERSION,
     -- 排除配置指纹, 与 jar 缓存第 2 行 (# filters=) 同构
     "# exclude=" .. exclude_hash(),
+    -- [#8] 扫描基准 (项目目录) 记进头里, 读侧校验 —— 键不单射时防串台
+    "# root=" .. root,
     ("# stats roots=%d files=%d ancestor=%d nested=%d test=%d jre=%d shadow=%d dup=%d "
       .. "excl=%d ratio=%.2f")
       :format(#roots, stats.files or 0, stats.ancestor_dropped or 0,
