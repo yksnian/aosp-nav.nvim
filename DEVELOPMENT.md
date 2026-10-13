@@ -538,7 +538,7 @@ AOSP 树内) 时, 退到**任一已加载且落在 AOSP 树内的 `.java` 缓冲
 | # | 场景 | 触发点 |
 | - | ---- | ------ |
 | 1 | 工作区里存在**活**的外部可见工程 (空壳已自清, §2.12); 仅在有 Gradle 下载证据时才追加 `:AospCleanWorkspace` 指引 | `java/init.lua:504` |
-| 2 | 有别的 jdtls 进程共用同一个 `-data` 目录 (索引互相覆盖, §8.1; 2026-10-10 起报出**归属**, §2.16)。**孤儿会被自动回收, 不进这条消息**; `-data` 在别处 (别的编辑器起的) 一律不理 | `java/init.lua:542` |
+| 2 | 有别的 jdtls 进程共用同一个 `-data` 目录 (索引互相覆盖, §8.1; 2026-10-10 起报出**归属**, §2.16)。**孤儿会被自动回收, 不进这条消息**; `-data` 在别处 (别的编辑器起的) 一律不理。**2026-10-12 起: 冲突时本会话自动改独立 `-data` 并限制注入, 文案改为说清本窗口的功能边界** (§2.16.1) | `java/init.lua:542` |
 | 3 | 破坏性的 `:AospCleanWorkspace` 确认 | `ui.lua:1232` |
 | 4 | 首次运行需同步扫描残留 Eclipse 目录 (排除项冷缓存, 数秒) | `java/import_exclusions.lua:160` |
 
@@ -1027,6 +1027,97 @@ That is the JVM started for a buffer with no project root (DEVELOPMENT.md §2.13
 > 这条也顺带说明了 `holders` 的契约: 它是 `foreign_jdtls(ws_dir, inv)` 的结果, 只收
 > `data == ws_dir` 的记录 —— 所以"别的程序起的 jdtls 不冒头"这件事在 `configure` 侧
 > 是**结构性**保证的 (它压根进不了 `holders`), 不靠报告函数里的路径判据去挡。
+
+### 2.16.1 两个 nvim 抢同一份索引 → 第二个会话自动换独立 `-data` (2026-10-12)
+
+**用户实测现象**: 工作站上同时开两个 nvim、打开同一棵 AOSP 树。第二个窗口弹出
+"other jdtls JVM(s) on the same index directory" 之后, **第一个窗口的 nvim 卡死**。
+
+**机制**: `-data` 的路径由**工作区根的 basename** 唯一决定 ——
+`ui.expected_workspace_dir(root)` = `stdpath("cache")/jdtls/<basename(root)>/workspace`
+(与 LazyVim `java.lua` 的 `jdtls_workspace_dir` 同口径)。两个 nvim 开同一棵树 → **两个
+`-data` 字符串完全相同** → 两个独立 JVM 指向同一份 `.metadata`, 互相抢 Eclipse 工作区
+独占锁、反复删重建索引 (`Java Index broken` / `Failed to save JDT index`)。受害的是
+**先开的那台** —— 它的索引被后开的删掉又被自己重建, 界面就此卡死。§2.16 那份报告早就
+知道这件事, 但它只是**事后报告**: 等消息弹出时, 第二个 JVM 已经在抢锁了。
+
+**为什么不能"让第二个窗口别起 jdtls"**: 插件够不到那个决策点。LazyVim 的 attach
+无条件调 `require("jdtls").start_or_attach(config)`; nvim-jdtls 在 `root_dir` 为 nil 时
+fallback 到 `.git`/`gradlew`/`mvnw` 再 fallback 到 `getcwd()`, 然后照常 `vim.lsp.start`。
+**没有任何返回值语义是"不要启动"**。
+
+**做法: 换 `-data`, 而不是阻止启动**。两个 JVM 各索引各的, 不再互踩。入口是
+**`opts.project_name`**, 不是 `opts.cmd`:
+
+- LazyVim 的 `full_cmd` 走 `root_dir → project_name(root_dir) → jdtls_workspace_dir(name)`,
+  `-data` 与 `-configuration` **都由这个名字派生**。包装 `project_name` 就同时改了这两条;
+- `project_name` 是一个**函数**、全仓只在 `full_cmd` 里被调一次, 包装它没有别的副作用;
+- **`opts.cmd` 一个字节都不动** —— `util/jvm.lua` 顶部那条"configure 不碰 `opts.cmd`"
+  的不变量得以保持。
+
+`java/session_conflict.lua` 里 `M.isolation_name(base)` = `base .. "-nvim" .. pid`,
+一个会话一个 (`vim.fn.getpid()`), 短且稳定。
+
+**时机拆分 (本改动的核心难点)**: `configure(opts)` 跑在 spec 求值期 (`-data` 此刻还不
+存在); `project_name`/`full_cmd` 跑在 attach 时。两者必须对**同一个冲突判定**达成一致
+—— 所以判定结果在 `session_conflict.check` 里按 `ws_dir` **缓存一次**, 两处共用。
+
+**判据**: 只看"**有主的**别的 jdtls 是否占着同一个 `-data`" (`ui.foreign_jdtls`, §2.16)。
+**孤儿不算** (会被 `reap_orphan_jdtls` 收走); **`-data` 在别处的更不算** (§2.16 明令
+不理 —— 别的程序起的 JVM 不跟我们共用索引)。
+
+**连锁后果 (用户已确认接受)**: 第二个会话换上独立 `-data` 后, **不注入 sourcePaths /
+jars** —— 注入它们是"与第一个窗口抢 classpath 重建"的一部分, 与隔离的目的相悖。于是
+这个窗口只能靠 jdt.ls 自身推断 + jar 跳转, 功能受限。`import.exclusions` **照旧注入**
+(它对隔离会话同样有用: 没有它, 隔离会话自己也会把树里残留的 `.project` 当可见工程导
+进来; 且它与"两个窗口抢索引"无关)。
+
+**代价**: 第二个会话拿到的是一份**全新的 `-data`** → 它要**从零完整导入一次** (AOSP
+全量实测数十分钟 / 数 GB 磁盘)。这不是免费的, 但它把"**第一个窗口卡死**"换成了"**第二
+个窗口自己慢慢导入**", 严重性不可同日而语。会话结束由 `M.cleanup` 把这份隔离索引删掉,
+不在磁盘上累积。
+
+**退出清理的安全闸** (本仓**第二处**删数据目录的地方, 第一处是 `:AospCleanWorkspace`):
+`M.isolation_dir_owned(dir, pid)` 两条闸同时成立才删 —— (1) 路径落在
+`stdpath("cache").."/jdtls"` 之下; (2) 它下面 (或它自己) 那层目录名以
+`-nvim<本进程 pid>` 结尾。共用目录与别人的后缀一律判否, **绝不碰共用的那份**。顺序同
+`clean_workspace`: 先 `vim.lsp.stop_client` 再删, 否则 jdtls 还在写这个目录;
+`VimLeavePre` 路径上不阻塞太久 (`vim.wait` 上限 ~1.5s), 超时就**放弃删除并留
+`log.debug`** —— 宁可留一份垃圾, 也不在退出时卡住 nvim。
+
+> **删的是隔离目录的「根」, 不是它的 `workspace/` (2026-10-13 实测修正)**。第一次实现删
+> 的是 `<base>-nvim<pid>/workspace`, 结果泄漏: jdtls 在建出 `workspace/` 之前就被关掉的
+> 话 (实测最常见 —— 用户开第二个窗口看一眼就关), 磁盘上**只剩 `<base>-nvim<pid>/config/`**,
+> 那个不存在的 `workspace/` 子路径让 `isdirectory` 返回 0, cleanup 直接早退, 整个目录留在
+> 缓存里累积 (用户当场发现三个 `aosp-nvim<pid>/`)。修法: `M.isolation_root(ws_dir)` 把
+> workspace 子路径归约成根, cleanup 删根 —— `workspace/` (-data) 与 `config/`
+> (-configuration) 一并清掉。`isolation_dir_owned` 两种形态都认。
+> **未覆盖的残留**: nvim 被 `kill -9` / WSL 终端直接关掉时 `VimLeavePre` 根本不触发,
+> 与 §2.16 的孤儿 jdtls 同一类问题 (那里靠 `reap_orphan_jdtls` 回收)。目前隔离目录的
+> 这类残留**没有**自动回收 —— 只留 `config/` 几十 KB, 暂不处理; 要清就
+> `rm -rf ~/.cache/nvim/jdtls/*-nvim*` (用户手动)。
+
+**通知 (复用 seat #2, 不新增席位)**: 冲突且**真的换了 `-data`** 时, `java/init.lua` 的
+seat #2 消息 (§2.10 表第 2 行) **换掉文案** —— 不再是"两个 JVM 抢一份索引, 去关掉一个",
+而是说清本窗口的**功能边界**: "另一个 nvim 正在用这棵树的索引; 本窗口改用独立索引
+`<name>`, **sourcePaths / jar 注入在此窗口不生效** (跳转可能落 jar); 索引在本窗口退出时
+删除。"仍走 `log.user` (`id = "instances:" .. ws_dir`, 每棵树一次)。**无冲突时该消息不
+再出现** —— 因为不再有"共用同一 `-data`"这回事, 这正是本改动的目的。
+
+**面板**: `state.set` 增记 `limited` / `isolated_index`, `:Aosp` / `:AospStatus` 在
+`limited` 时多一行 "session isolation" —— 否则上面那两行 (sourcePaths 未注入 /
+referencedLibraries=0) 会变红而没人解释为什么。
+
+**覆盖**: `tests/t_conflict.lua` (37 条) —— `check` 四种情形 (有主冲突 / 无 / 只剩孤儿 /
+`-data` 在别处) / 缓存只扫一次 / `isolation_name` 同 base 换 pid 换名字 / `cleanup` 的
+归属闸 (缓存根之下 + 本进程后缀才认, 隔离根与其 `workspace/` 子目录两形态都认; 共用目录 /
+别人后缀 / 别处 / `/` / nil / 空串 / `<cache_root>-evil` 兄弟目录一律判否) /
+`isolation_root` 归约 (workspace 子路径 → 根) / **端到端**: 造一个"只剩 `config/`"的泄漏
+目录, `cleanup(不存在的 workspace)` 仍删掉整个根 (回归 2026-10-13 那次泄漏), 且对共用
+`qssi/workspace` 无动于衷 / **`configure` 集成回归闸** (无冲突时 `opts.project_name`
+逐引用相同、照旧返回 basename —— 这就是"不影响单 nvim 正常路径"的证据) / **收尾回归闸**
+(全程 `SC.set_cache_root` 指向临时目录, 真缓存根里不得留下 `-nvim<pid>` —— 回归
+2026-10-13 "测试在真缓存里留下 `qssi-nvim<pid>`")。
 
 ### 2.17 运行中换工作区根 (`workspace/didChangeWorkspaceFolders`) 与每工程字母序截断 (2026-10-12)
 
@@ -2035,6 +2126,7 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | 套件 | 断言 | 覆盖 |
 | ---- | ---- | ---- |
 | `t_commands.lua` | 16 | 命令面冻结契约: 恰好 5 个 `:Aosp*` 命令 (含 `:AospDebug`), 且删掉的那 7 个一个都不在; `:Aosp`/`:AospDebug` 都是 bang 命令 |
+| `t_conflict.lua` | 37 | 会话隔离 (§2.16.1): `session_conflict.check` 四种情形 (有**主的**别的 jdtls 占同一 `-data` → 冲突 / 无 → 不冲突 / 只剩孤儿 → 不冲突 / `-data` 在别处 → 不冲突; 全部注入假依赖, 不碰真 `/proc`) 且同一 `ws_dir` 只扫一次 (结果按会话缓存, configure 与 project_name 包装器共用同一判定) / 算不出 `-data` 时不扫 foreign 且不冲突 / `isolation_name` = `base.."-nvim"..pid`, 同 base 换 pid 换名字 (隔离成立的前提)、同会话稳定、空/nil base → nil / `cleanup` 的归属闸 (`isolation_dir_owned`): 缓存根之下 + **本进程** `-nvim<pid>` 后缀才认, 隔离根与其 `workspace/` 子目录两形态都认; 共用 `qssi/workspace`、别人的后缀、别处 `-data`、`/`、nil、空串、`<cache_root>-evil` 兄弟目录一律判否 / `isolation_root` 归约 (workspace 子路径 → 根) / **端到端**: 只剩 `config/` 的泄漏目录被 `cleanup(不存在的 workspace)` 整个删掉 (回归 2026-10-13 泄漏), 共用的 `qssi/workspace` 不动 / **`configure` 集成回归闸**: 无冲突时 `opts.project_name` **逐引用相同**、照旧返回 basename —— "不影响单 nvim 正常路径"的证据 / **收尾回归闸**: 全程把 `SC.set_cache_root` 指向临时目录, 断言真缓存根里没被写进任何 `-nvim<pid>` 目录 (回归 2026-10-13 "测试在真缓存里留下 `qssi-nvim<pid>`"; 真树那块需 `AOSPNAV_LIVE_TEST=1`) |
 | `t_config.lua` | 37 | 本轮重构引入/删除的键: 死键静默丢弃 (不映射、不告警) / `merge` 不改调用方的表 / `source_apply_max_roots` 不再是配置键 / **重复 setup 不得打回默认值** (见 §2.14): 空参 `setup()` 后 `kotlin.jar_mode`·`log_level` 仍是用户值 / 第二次带参 setup 不丢上一次的键 / 新表产出且旧表不被就地改写 / 排除名单 append 语义未回归 / **合并结果不与 `M.defaults` 共享子表**, 就地改它不污染默认值 (标量+列表) |
 | `t_jvm.lua` | 127 | `util/jvm.assess` (此前**完全没有**测试): `-Xmx6G` 判否 / `--jvm-arg=` 前缀剥离 / 重复 `-Xmx` 后者胜 / `UseParallelGC` 识别 / 无值·无键·nil cmd 不崩 / **`xmx_over_host`** (§8.1.2): `-Xmx16G` 在 512G 宿主静默·在 15G 宿主报警且建议**调小** (不得误报 `xmx_small`) / 80% 边界恰好不报·超过才报 / `MemTotal` 读不到时跳过该检查 / `host_mem_total()` 真读 `/proc/meminfo` (正数或 nil, 不崩)。`util/jvm_live` (**活进程遥测**, §8.1.1): PerfCounter 解析 (去引号、值含 `=`、缺键) / uptime 与 `/proc/<pid>/status` (读不到是 nil 而非 0) / heap_info 三种形态 / young·major 按**名字**分类 (G1 的第三个 collector **不得**算 major) / 间隔按 `uptime/invocations` **自算**(不信 `avg*IntervalTime`) / 五条 fixture 的判定 (实测形态 → 三条 info 且零 warn; 6G 死亡螺旋 → 三条 warn; 健康 G1 → 零 finding; **G1 但新生代 <5% → 仍零 finding**, `young_gen_tiny` 只对 ParallelGC 报; 空快照不崩) / `find_jcmd` 三条回退路径 (注入式, 不碰 `/proc`) / jcmd 对死 pid 的失败路径 (退出码不可靠, 空 stdout 必须自己判失败) / `render` 的每一项都不得含换行 (`nvim_buf_set_lines` 会直接抛) |
 | `t_log.lua` | 54 | `util/log.lua`: 四档阈值比较 / `log.user` 绕过阈值 / 会话内 `once` 去重 / `once` 被阈值挡下时**不消费**登记 / 消息前缀 |
@@ -2050,12 +2142,12 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_root_fallback.lua` | 22 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 |
 | `t_workspace.lua` | 31 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 | 
 
-合计 **512** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
-`t_jvm` 127 / `t_root_from_cwd` 13 / `t_source_apply` 25, 共 **499**)。
+合计 **549** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
+`t_jvm` 127 / `t_root_from_cwd` 13 / `t_source_apply` 25 / `t_conflict` 37, 共 **536**)。
 
-> 只有 `t_jvm` (127/127)、`t_root_from_cwd` (20/13) 和 `t_source_apply` (31/25) 三个套件
-> 的条数**随环境而变** (真树/真 jdtls 块整段 SKIP 时不计数), 所以 512/499 是当前环境的
-> 实测值而非不变量; 其余 12 个套件两种跑法条数相同。
+> 只有 `t_jvm` (127/127)、`t_root_from_cwd` (20/13)、`t_source_apply` (31/25) 和
+> `t_conflict` (40/37) 四个套件的条数**随环境而变** (真树块整段 SKIP 时不计数),
+> 所以 549/536 是当前环境的实测值而非不变量; 其余 12 个套件两种跑法条数相同。
 > 特别注意 `t_jvm` 的真机块: 它要**真有 jdtls 在跑**才算数, 只设 `AOSPNAV_LIVE_TEST=1`
 > 是不够的 (本机 2026-10-10 就出现过"采样时在跑、跑测试时已退出"→ 静默少几条;
 > 2026-10-12 记 §2.10.1 那件事之后 jdtls 被 OOM 杀掉没在跑, 真机块整段 SKIP)。

@@ -355,6 +355,10 @@ or remove everything manually:
 rm -rf ~/.cache/nvim/jdtls
 ```
 
+### Two nvim instances open the same tree
+
+The Eclipse workspace path is derived from the AOSP root's directory name alone, so a second nvim on the same tree would normally point at the **same** `-data` — two JVMs then fight over one index (they keep deleting and rebuilding it) and the **first** window freezes. aosp-nav detects this automatically when the second window opens: it gives that window **its own isolated index** (`<name>-nvim<pid>`) and does **not** inject source roots or jars into it. That window still works (jdtls infers roots and falls back to jars), but cross-module jumps may land in jars — a notice says so, and the isolated index is deleted when that window exits. For full functionality, work in the first window, or close it and reopen this one.
+
 ### Clearing the jar cache
 
 After rebuilding AOSP:

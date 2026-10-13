@@ -249,6 +249,19 @@ function M.diagnose()
   lines[#lines + 1] = line("session", ("phase=%s jars=%d origin=%s"):format(
     st.phase, st.jars, tostring(st.cache_origin)), session_ok)
 
+  -- [v12] 会话隔离 (java/session_conflict.lua): 另一个 nvim 已占着本棵树本该用的
+  -- `-data`, 本会话自动换了独立索引, 于是 sourcePaths/jars 都没注入 —— 这是**预期**,
+  -- 不是故障。上面那两行 (sourcePaths 未注入 / referencedLibraries=0) 会因此变红,
+  -- 这行专门解释"为什么", 否则用户只会以为插件坏了。:AospDebug 里也能从带 pid 后缀的
+  -- `-data` 看出同一件事, 但那要用户自己去比对; 这里直接点名。
+  if st.limited then
+    lines[#lines + 1] = line("session isolation",
+      "another nvim holds this tree's index; using an isolated one"
+        .. (st.isolated_index and (" (" .. vim.fn.fnamemodify(st.isolated_index, ":h:t") .. ")") or ""),
+      nil,
+      "sourcePaths / jar injection are OFF here — jumps may land in jars")
+  end
+
   -- jar 缓存新鲜度
   local jr = jar_root()
   if jr then
@@ -389,7 +402,18 @@ function M._workspace_dir(fname)
   local bufname = fname or vim.api.nvim_buf_get_name(0)
   -- 没有 jdtls 在跑时按"本该以哪为根"推断: project 模式是项目目录, 不是 AOSP 根
   local root = rm.project_dir(bufname) or rm.workspace_root(bufname) or rm.aosp_root(bufname)
-  if not root then return nil end
+  return M.expected_workspace_dir(root)
+end
+
+--- 给定 workspace 根, 算出 LazyVim 会为它选的那个 `-data` 目录。
+--- 与 LazyVim java extra 的 jdtls_workspace_dir 约定一致:
+---   stdpath("cache")/jdtls/<basename(root)>/workspace
+--- 从 _workspace_dir 抽出来, 供 java/session_conflict 复用 —— 它要问的是"我本该用哪个
+--- `-data`"(而不是"现在有 client 在用的那个"), 两处必须同一个口径。
+--- @param root string|nil
+--- @return string|nil
+function M.expected_workspace_dir(root)
+  if not root or root == "" then return nil end
   return vim.fn.stdpath("cache") .. "/jdtls/" .. vim.fn.fnamemodify(root, ":t") .. "/workspace"
 end
 

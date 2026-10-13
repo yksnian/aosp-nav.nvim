@@ -174,12 +174,27 @@ function M.configure(opts)
 
   local root_mod = require("aosp-nav.java.root")
   local bufname = probe_file(root_mod)
+  local session_conflict = require("aosp-nav.java.session_conflict")
 
   -- 1. workspace root: "aosp" 模式下 = AOSP 根, 整棵树共用一个索引; "project"
   --    模式下交还给 .git/.project 就近取根 (旧行为)。非 AOSP 时原样交还用户的
   --    root_dir。必须在收集 jar 之前装好 —— 后面所有步骤都以它为准。
   local user_root = opts.root_dir
   opts.root_dir = root_mod.jdtls_root_fn(user_root)
+
+  -- 1b. [v12] 会话隔离: 另一个 nvim 已经占着这棵树本该用的 `-data` 时, 本会话改用一份
+  --     独立索引 (换 project_name -> 派生出不同的 -data/-configuration), 并**限制**本
+  --     会话的注入 (sourcePaths/jars 不注入)。机制与代价见 java/session_conflict.lua。
+  --     limited 同时挡三处注入 (源码根 / jars / init_settings), 见下面各步。
+  local conflict = session_conflict.check(bufname)
+  local limited = conflict.conflict
+  if limited and opts.project_name then
+    local user_pn = opts.project_name
+    opts.project_name = function(rd)
+      local base = user_pn(rd)
+      return base and session_conflict.isolation_name(base) or base
+    end
+  end
   -- aosp_root 与 workspace_root 在默认模式下相同, 但语义不同且都会用到:
   --   aosp_root      = jar 收集 / import.exclusions 的基准, 恒为 AOSP 根
   --   workspace_root = jdtls 索引的根 (project 模式下是项目目录; 该函数在 project
@@ -208,7 +223,10 @@ function M.configure(opts)
   --    后者 mode == "aosp"。这里问的是"要不要注入"。
   local source_inject = nil
   local source_paths = nil
-  if java_cfg.source_paths and #java_cfg.source_paths > 0 then
+  if limited then
+    -- [v12] 会话隔离: 本窗口不注入源码根 (见上面的 session_conflict)。跳转退回 jdt.ls
+    -- 自身推断 + jar —— 功能受限, 但不再与第一个窗口抢 classpath 重建。
+  elseif java_cfg.source_paths and #java_cfg.source_paths > 0 then
     -- jdt.ls 的 invisible project 只接受**工作区相对路径** (绝对路径会让
     -- InvisibleProjectImporter.getSourcePaths 抛异常, 整个工程退化成
     -- jdt.ls-java-project 假工程), 用户写绝对路径这里兜住
@@ -276,7 +294,9 @@ function M.configure(opts)
   -- 7. 构造 AOSP 特化 settings
   -- sourcePaths 只在确有内容时才出现: 注入这个 key 会关闭 jdt.ls 的逐文件
   -- source root 推断 (见 config.lua java.mode 注释)
-  local project_settings = { referencedLibraries = jars }
+  -- [v12] 会话隔离: limited 时**不注入** referencedLibraries (jar 库) —— 本窗口的
+  -- classpath 与第一个窗口解耦, 也不去重建它。sourcePaths 因上面已置 nil 自然缺席。
+  local project_settings = { referencedLibraries = limited and {} or jars }
   if source_paths and #source_paths > 0 then
     project_settings.sourcePaths = source_paths
   end
@@ -339,6 +359,10 @@ function M.configure(opts)
     init_settings = init_settings or { java = {} }
     init_settings.java.project = { sourcePaths = source_paths }
   end
+  -- [v12] 会话隔离只挡 sourcePaths/jars 两样 (都影响 classpath 与索引键); 排除项
+  -- (import_extras, 即 java.import.exclusions) **照旧注入** —— 它对隔离会话同样有用
+  -- (没有它, 隔离会话自己也会把树里残留的 .project 当可见工程导进来), 且与"两个窗口
+  -- 抢同一份索引"无关。sourcePaths 因上面 limited 已置 nil, 这里自然缺席。
   if init_settings then
     opts.jdtls = opts.jdtls or {}
     opts.jdtls.init_options = opts.jdtls.init_options or {}
@@ -429,6 +453,11 @@ function M.configure(opts)
     -- 不再派生 —— 所有读者一律读 cfg.java.mode。
     mode = java_cfg.mode,
     source_projects = source_inject and #source_inject.state().projects or 0,
+    -- [v12] 会话隔离标记 (见 java/session_conflict.lua): true = 另一个 nvim 正占着
+    -- 本棵树本该用的 `-data`, 本会话改用独立索引且**没有**注入 sourcePaths/jars。
+    -- 面板靠它解释"为什么这个窗口跳转落 jar"。
+    limited = limited or false,
+    isolated_index = limited and conflict.ws_dir or nil,
   })
 
   -- 11b. phase 的**第二个写入者**: jdt.ls 报导入+构建结束时翻牌 (实现与理由见
@@ -557,16 +586,45 @@ function M.configure(opts)
     if #reaped > 0 then
       log.debug("reaped orphan jdtls (SIGTERM): " .. table.concat(reaped, ", "))
     end
-    local msg = ui.instances_message({
-      ws_dir = ws_dir,
-      holders = ui.foreign_jdtls(ws_dir, inv),
-      reaped = reaped,
-    })
+    local msg
+    if limited then
+      -- [v12] 本会话已自动换用独立索引 (session_conflict): 不再劝用户"去关掉一个"
+      -- —— 抢锁这件事已经被躲开了。改说清本窗口的**功能边界**, 免得用户以为插件坏了。
+      msg = "another nvim holds this workspace, aosp-nav features are limited here"
+    else
+      msg = ui.instances_message({
+        ws_dir = ws_dir,
+        holders = ui.foreign_jdtls(ws_dir, inv),
+        reaped = reaped,
+      })
+    end
     if msg and not _instances_warned[ws_dir or ""] then
       _instances_warned[ws_dir or ""] = true
       -- must-see 情况 #2: 外部 jdtls 共用同一 -data 目录
       log.user(msg, { id = "instances:" .. (ws_dir or "?"), timeout = 20000 })
     end
+  end
+
+  -- 15. [v12] 会话隔离的退出清理 (见 java/session_conflict.lua)。
+  --     limited 时本会话用的是自己那份 `<base>-nvim<pid>` 的 `-data`, 退出时删掉,
+  --     不在磁盘上累积 (AOSP 全量索引 = 数 GB)。**只删自己那份** —— 归属由
+  --     isolation_dir_owned 的两条闸证明 (缓存根之下 + basename 带本进程后缀);
+  --     共用目录与别人的后缀一律不动。augroup 幂等: 一个会话只挂一次。
+  if limited and conflict.ws_dir then
+    local iso_name = session_conflict.isolation_name(
+      vim.fn.fnamemodify(conflict.ws_dir, ":h:t"), vim.fn.getpid())
+    local grp = vim.api.nvim_create_augroup("aosp_nav_session_isolation_cleanup", { clear = true })
+    vim.api.nvim_create_autocmd("VimLeavePre", {
+      group = grp,
+      once = true,
+      desc = "aosp-nav: remove the isolated jdtls index of this session",
+      callback = function()
+        -- 传隔离**根** (`<cache>/jdtls/<name>`): 里面同时住着 workspace/ 与 config/,
+        -- 只删 workspace 会在 jdtls 没建出 workspace 时 (磁盘上只剩 config/) 漏掉整个目录。
+        local root = vim.fn.stdpath("cache") .. "/jdtls/" .. iso_name
+        pcall(session_conflict.cleanup, root)
+      end,
+    })
   end
 
   return opts

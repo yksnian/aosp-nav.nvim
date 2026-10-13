@@ -28,6 +28,11 @@ local s = {
   -- [v10] 单一模式字段
   mode = nil,                -- java.mode: "aosp" | "infer" | "project"
   source_projects = 0,       -- 已累积的项目数
+  -- [v12] 会话隔离 (java/session_conflict.lua): 另一个 nvim 已占着本棵树本该用的
+  -- `-data` 时, 本会话改用一份独立索引且不注入 sourcePaths/jars。面板据此解释
+  -- "为什么这窗口跳 jar" (sourcePaths 未注入 / referencedLibraries=0 不是故障)。
+  limited = false,           -- true = 本会话用了隔离索引、功能受限
+  isolated_index = nil,      -- 隔离索引的 `-data` 路径 (limited 时才有)
 }
 
 --- 更新状态字段 (只覆盖给定字段)
