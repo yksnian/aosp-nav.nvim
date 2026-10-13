@@ -1282,17 +1282,19 @@ end
 
 --- :AospCleanWorkspace — 删除 jdtls workspace 目录 (等价 VSCode 的
 --- Clean && Reload / java.clean.workspace): import.exclusions 变更后、或残留
---- .project/.classpath 已被导入过时, 必须重建 Eclipse workspace 才生效
---- @param opts table|nil { force = boolean } 跳过确认
+--- .project/.classpath 已被导入过时, 必须重建 Eclipse workspace 才生效。
+--- 删完**自动重启** jdtls (当前是 java 缓冲时): 重放 FileType 让 LazyVim 的
+--- attach_jdtls 再跑一次, 用户不必自己去 :e。
+--- @param opts table|nil { force = boolean 跳过确认; dir/cache_root/restart 测试注入 }
 function M.clean_workspace(opts)
   opts = opts or {}
-  local dir = M._workspace_dir()
+  local dir = opts.dir or M._workspace_dir()
   if not dir or dir == "" then
     log.error("cannot determine the jdtls workspace dir")
     return
   end
   -- 只允许删 "jdtls 缓存根" 之下的路径, 防手滑
-  local cache_root = vim.fn.stdpath("cache") .. "/jdtls"
+  local cache_root = opts.cache_root or (vim.fn.stdpath("cache") .. "/jdtls")
   if dir:sub(1, #cache_root + 1) ~= cache_root .. "/" then
     log.error("refusing to delete " .. dir .. " (outside " .. cache_root .. ")")
     return
@@ -1319,15 +1321,66 @@ function M.clean_workspace(opts)
   for _, c in ipairs(clients) do
     pcall(function() vim.lsp.stop_client(c.id, true) end)
   end
-  vim.defer_fn(function()
-    local ok = vim.fn.delete(dir, "rf") == 0
-    if not ok then
+
+  -- 记下当前是不是 java 缓冲: 是的话删完自动重启 jdtls, 用户不必自己去 :e。
+  -- 不能删之前就重启 (还在写目录), 所以等 delete 落定后再重放 FileType。
+  local buf = vim.api.nvim_get_current_buf()
+  local restartable = vim.bo[buf].filetype == "java" and vim.bo[buf].buftype == ""
+
+  local function after_delete()
+    if vim.fn.delete(dir, "rf") ~= 0 then
       log.error("failed to delete " .. dir)
       return
     end
-    log.info(("jdtls workspace removed (%s). Reopen a .java file (:e) to re-import.")
-      :format(dir), { timeout = 10000 })
-  end, clients[1] and 800 or 0)
+    if restartable and vim.api.nvim_buf_is_valid(buf) then
+      log.info(("jdtls workspace removed (%s) — re-importing."):format(dir),
+        { timeout = 10000 })
+      -- [v13] 重放 FileType 让 LazyVim 的 attach_jdtls 再跑一次 (它无条件
+      -- start_or_attach)。此刻旧 client 已停、目录已删, 于是新 JVM 会从零重建
+      -- workspace —— 正是本命令想要的结果, 不用用户再手动 :e。
+      --
+      -- **必须先把 buf 摆到当前窗口**: nvim-jdtls 的 start_or_attach 读的是
+      -- `nvim_get_current_buf()` (setup.lua:315), **不是** autocmd 的 buffer 参数 ——
+      -- 光传 { buffer = buf } 不够。defer_fn 之间有 800ms, 用户完全可能切走了窗口;
+      -- 那时按当前 buffer 起 jdtls 要么挂错文件, 要么在非 file:// 缓冲上直接 return
+      -- (setup.lua:319) —— 这就是"清完没重启"的成因。临时切过去, 完事切回来。
+      local win = vim.api.nvim_get_current_win()
+      local prev_win, prev_buf = nil, nil
+      if vim.api.nvim_win_get_buf(win) ~= buf then
+        -- 该 buf 可能没在任何窗口显示; 优先找显示它的窗口, 否则就地换上 (记下换回了什么)
+        local target = nil
+        for _, w in ipairs(vim.api.nvim_list_wins()) do
+          if vim.api.nvim_win_get_buf(w) == buf then target = w; break end
+        end
+        if target then
+          prev_win = win
+          vim.api.nvim_set_current_win(target)
+        else
+          prev_win, prev_buf = win, vim.api.nvim_win_get_buf(win)
+          pcall(vim.api.nvim_win_set_buf, win, buf)
+        end
+      end
+      local ok, err = pcall(vim.api.nvim_exec_autocmds, "FileType",
+        { buffer = buf, modeline = false })
+      -- 还原: 先回原窗口, 若刚才是就地换的 buffer 再把它换回来
+      if prev_win and vim.api.nvim_win_is_valid(prev_win) then
+        pcall(vim.api.nvim_set_current_win, prev_win)
+        if prev_buf and vim.api.nvim_buf_is_valid(prev_buf) then
+          pcall(vim.api.nvim_win_set_buf, prev_win, prev_buf)
+        end
+      end
+      if not ok then log.debug("restart after clean failed: " .. tostring(err)) end
+    else
+      log.info(("jdtls workspace removed (%s). Reopen a .java file (:e) to re-import.")
+        :format(dir), { timeout = 10000 })
+    end
+  end
+
+  if opts.defer == false then
+    after_delete()   -- 测试注入: 同步执行, 不排 libuv 定时器
+  else
+    vim.defer_fn(after_delete, clients[1] and 800 or 0)
+  end
 end
 
 return M

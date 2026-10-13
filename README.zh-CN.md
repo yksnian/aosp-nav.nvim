@@ -206,7 +206,7 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 
 ### :AospCleanWorkspace [!]
 
-删除当前 jdtls 的 Eclipse workspace 目录并停掉客户端, 下次打开 java 文件时全量重新导入。
+删除当前 jdtls 的 Eclipse workspace 目录, 停掉客户端, 并**自动重启 jdtls** (当前缓冲是 `.java` 文件时) 让它从零重新导入 —— 不用你自己重开文件。
 
 什么时候需要:
 
@@ -323,7 +323,7 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 2. 同一页的 `source projects` 一行形如 `core=N projects=N installed=N pending=N`。`pending > 0` 表示累积的源码根还没进当前工作区, 见下一条。`project` 模式下这一栏改为 `project :` / `src roots : N root(s) of this project injected`。
 3. `:Aosp` 源码根一栏 —— 如果这个类所属项目不在列表里, 打开该项目下任意一个 `.java` 文件一次, 它的源码根会在后台扫出来并写进缓存。若该项目被 `source_paths_max_projects` 挤掉了, 提高上限或再打开一次它的文件 (`:AospRescan` 清空累积)。
 4. `pending > 0` 时插件会自动应用 (每会话一次, 最多 5 条); 若仍未生效, **重启 nvim** —— 下次启动会一次性注入。`:Aosp!` 能立刻强行注入, 但它每注入一条就重建一次 classpath, 批量大时可能把 JVM 撑到 OOM。
-5. 想让新源码根也排到 jar **之前** → `:AospCleanWorkspace` 后重开。这条路的代价是整库重新索引, 且只重启 LSP 客户端不够 —— jdt.ls 会跳过它已经认识的工程。
+5. 想让新源码根也排到 jar **之前** → `:AospCleanWorkspace` (会自动重新导入)。这条路的代价是整库重新索引, 且只重启 LSP 客户端不够 —— jdt.ls 会跳过它已经认识的工程。
 
 注意**构建生成**的类 (AIDL/proto/aconfig 的 Stub/Proxy, 例如 `INetworkOfferCallback`) 在源码树里根本没有 `.java`, jar 是它们的唯一来源, 落到反编译视图是正确结果。
 

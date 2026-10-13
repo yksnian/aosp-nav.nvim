@@ -125,5 +125,82 @@ H.eq(#ui.foreign_jdtls(tmp), 0, "同理没有'别的' JVM")
 H.eq(#ui.jdtls_holders(nil), 0, "workspace_dir=nil -> 空")
 H.eq(#ui.foreign_jdtls(""), 0, "workspace_dir='' -> 空")
 
+-- ---------------------------------------------------------------------------
+-- 7. :AospCleanWorkspace 删完**自动重启** jdtls (2026-10-13)
+--    原来只停不启, 提示用户自己去 :e; 现在当前是 java 缓冲时重放 FileType,
+--    LazyVim 的 attach_jdtls 会再跑一次 start_or_attach 把 JVM 拉起来。
+--    注入 dir/cache_root/defer 走临时目录, 全程不碰真缓存、不真起 jdtls。
+-- ---------------------------------------------------------------------------
+local cache = vim.fn.tempname() .. "/jdtls"
+local wsdir = cache .. "/qssi/workspace"
+mkdir(wsdir)
+
+-- 7a. 安全的注入路径: 缓存根之外的 dir 被拒 (防手滑闸仍生效)
+local outside = vim.fn.tempname() .. "/evil/workspace"
+mkdir(outside)
+ui.clean_workspace({ force = true, dir = outside, cache_root = cache, defer = false })
+H.eq(vim.fn.isdirectory(outside), 1, "clean_workspace: 缓存根之外的目录不删")
+
+-- 7b. 非 java 缓冲: 只删不重启 (重放 FileType 无意义), 且目录真的删掉
+vim.cmd("enew")
+vim.bo.filetype = "lua"
+local fired_nonjava = 0
+local grp = vim.api.nvim_create_augroup("aosp_nav_test_restart", { clear = true })
+vim.api.nvim_create_autocmd("FileType", { group = grp, pattern = "java",
+  callback = function() fired_nonjava = fired_nonjava + 1 end })
+mkdir(wsdir)   -- 7a 没删它, 这里重造一份确保存在
+ui.clean_workspace({ force = true, dir = wsdir, cache_root = cache, defer = false })
+H.eq(vim.fn.isdirectory(wsdir), 0, "clean_workspace: 目录已删 (非 java 缓冲)")
+H.eq(fired_nonjava, 0, "clean_workspace: 非 java 缓冲不重放 FileType")
+
+-- 7c. java 缓冲: 删完重放 FileType -> 自动重启钩子被触发
+mkdir(wsdir)
+local java_buf = vim.api.nvim_create_buf(true, false)
+vim.api.nvim_buf_set_name(java_buf, tmp .. "/Foo.java")
+vim.api.nvim_set_current_buf(java_buf)
+vim.bo[java_buf].filetype = "java"   -- 设 filetype 会立即触发一次 FileType
+local fired_java = 0
+vim.api.nvim_create_autocmd("FileType", { group = grp, pattern = "java",
+  callback = function() fired_java = fired_java + 1 end })
+local before = fired_java
+ui.clean_workspace({ force = true, dir = wsdir, cache_root = cache, defer = false })
+H.eq(vim.fn.isdirectory(wsdir), 0, "clean_workspace: 目录已删 (java 缓冲)")
+H.eq(fired_java, before + 1, "clean_workspace: java 缓冲删完重放一次 FileType (自动重启)")
+
+-- 7c-bis. 跑命令时停在 java 缓冲, 但 after_delete 执行时窗口已切走 (800ms 之间)。
+-- nvim-jdtls 的 start_or_attach 读的是 nvim_get_current_buf(), 所以重放前必须
+-- 临时把 java 缓冲摆到当前窗口 —— 否则会挂错文件 / 在非 file:// 缓冲上直接 return,
+-- 表现就是"清完没重启"。这里用 defer=false 同步跑, 但把当前缓冲换成另一个,
+-- 断言 FileType 回调看到的 current_buf 仍是 java, 且跑完当前缓冲被还原。
+local other = vim.api.nvim_create_buf(true, false)
+vim.api.nvim_buf_set_name(other, tmp .. "/notes.txt")
+vim.bo[other].filetype = "markdown"
+mkdir(wsdir)
+vim.api.nvim_set_current_buf(java_buf)          -- 命令在这一刻跑, 当前是 java
+local seen_buf = nil
+local grp2 = vim.api.nvim_create_augroup("aosp_nav_test_restart2", { clear = true })
+vim.api.nvim_create_autocmd("FileType", { group = grp2, pattern = "java",
+  callback = function() seen_buf = vim.api.nvim_get_current_buf() end })
+-- 模拟"命令调用后、after_delete 前"窗口切走: 直接换当前缓冲再调 (defer=false 会同步
+-- 跑 after_delete, 但它读的 buf 是调用时捕获的 java_buf, 不受当前缓冲影响)
+vim.api.nvim_set_current_buf(other)
+ui.clean_workspace({ force = true, dir = wsdir, cache_root = cache, defer = false })
+H.eq(vim.fn.isdirectory(wsdir), 0, "clean_workspace: 目录已删 (窗口已切走)")
+H.eq(vim.api.nvim_get_current_buf(), other, "clean_workspace: 当前缓冲跑完被还原")
+vim.api.nvim_del_augroup_by_id(grp2)
+
+-- 7d. buftype ~= "" (反编译/虚拟缓冲) 不重启: 那种缓冲不该拉 JVM (§2.13)
+mkdir(wsdir)
+local virt = vim.api.nvim_create_buf(false, true)   -- scratch
+vim.bo[virt].filetype = "java"
+vim.bo[virt].buftype = "nofile"
+vim.api.nvim_set_current_buf(virt)
+local before_v = fired_java
+ui.clean_workspace({ force = true, dir = wsdir, cache_root = cache, defer = false })
+H.eq(vim.fn.isdirectory(wsdir), 0, "clean_workspace: 目录已删 (虚拟 java 缓冲)")
+H.eq(fired_java, before_v, "clean_workspace: buftype~='' 的 java 缓冲不重启")
+
+vim.api.nvim_del_augroup_by_id(grp)
 vim.fn.delete(tmp, "rf")
+vim.fn.delete(cache, "rf")
 H.finish("t_workspace")

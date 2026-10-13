@@ -680,7 +680,7 @@ argv 里带着这个 `-data`** (`util/proc.argv` 逐参数匹配, 不是子串�
 `(orphan shell: removed automatically on next start)`, 只有 `n_live > 0` 时才在 hint 里
 写 `:AospCleanWorkspace`。
 
-覆盖: `tests/t_workspace.lua` (31 条) —— 用临时目录造一个假工作区, 断言空壳判定的正反
+覆盖: `tests/t_workspace.lua` (40 条) —— 用临时目录造一个假工作区, 断言空壳判定的正反
 例 (含"名字只作为树里某条路径的片段出现仍算空壳"这个 `grep -x` 整行语义)、删除的越界
 防护、Gradle 证据的三种日志变体、以及持有者探测。
 
@@ -1185,6 +1185,47 @@ cwd = AOSP 根。
 另外: 用纯 Python 手搓 JSON-RPC reader 时, `select` 就绪后 `read(1)` 可能返回 `b""`
 (EOF) —— 必须判空返回, 否则后续 `h.split(...)[1]` 抛 `IndexError`, 把"服务器已退出"
 伪装成一个无关的解析崩溃。
+
+### 2.18 `:AospCleanWorkspace` 删完自动重启 jdtls (2026-10-13)
+
+**症状 (用户反馈)**: 敲完 `:AospCleanWorkspace`, 界面停在"没有 LSP"的状态, 用户得自己
+去 `:e` 一个 `.java` 文件才恢复。旧实现只做两件事 —— 停客户端、删目录 —— 然后 `log.info`
+一句 "Reopen a .java file (:e) to re-import."。**命令名叫 Clean, 用户预期它把活干完**,
+把"重开文件"这一步甩回给用户是没必要的。
+
+**修法**: 删完目录后**重放 `FileType`** (`vim.api.nvim_exec_autocmds("FileType",
+{buffer = buf, modeline = false})`) —— LazyVim 的 `attach_jdtls` 挂在 `FileType java` 上
+且**无条件** `start_or_attach` (§2.16.1 的同一处), 于是新 JVM 会从零重建 workspace。这正是
+Clean 想要的结果。
+
+三个判据:
+- **只在当前 buffer 是 `.java` 时重启** (`filetype == "java"`)。别的 filetype 下重放
+  `FileType` 没有意义 (jdtls 的 attach 钩子只认 java), 提示语退回"自己开个 java 文件"。
+- **`buftype == ""`**: 反编译 / KLS 虚拟缓冲 (`jdtls://…`、`/tmp/kotlinlangserver…`) 的
+  filetype 也是 `java`, 但重放会引出 §2.13 那台"取不到根的第二台 jdtls" —— 必须挡掉。
+- **删完再重启**: 先 `stop_client`, `vim.defer_fn` 等 ~800ms (有 client 时) 再 `delete`,
+  删成功后才重放 —— 顺序反了 jdtls 会在目录被删前又写回去。
+
+**第四个判据 (2026-10-13 补, 用户反馈"清完还是没重启")**: `after_delete` 里必须先**把
+`buf` 摆到当前窗口**, 再重放 `FileType`。原因是 nvim-jdtls 的 `start_or_attach` 读的是
+`api.nvim_get_current_buf()` (`setup.lua:315`), **不是** autocmd 的 `buffer` 参数; 而且它在
+非 `file://` 缓冲上**直接 return** (`setup.lua:319`)。800ms 的 defer 窗口里用户完全可能切走
+窗口, 于是重放形同虚设 —— 这正是"清完没重启"的成因, 与 `stop_client` 本身无关。
+
+做法: 重放前若当前窗口显示的不是 `buf`, 先找有没有别的窗口显示它 (有就切过去), 没有就把当前
+窗口**换上** `buf`; 重放后还原窗口与缓冲。测试里对应 7c-bis (当前缓冲是另一个的时候跑命令,
+断言目录仍被删、当前缓冲被还原)。
+
+**顺带: exit 143 提示是预期噪声**。`stop_client` 发 SIGTERM, 退出码 143 = 128+15, Neovim
+的 `on_exit` 处理器 (`runtime/lua/vim/lsp/client.lua:1453`) 对任何非零退出码都发一条 WARN
+"Client jdtls quit with exit code 143"。这是**我们主动停的**, 不是崩溃, caller 侧无抑制手段。
+看到它即说明重启路径走到了。
+
+**测试**: 该函数原本没有测试。为了让它在 headless 下可测, `M.clean_workspace` 增三个
+**测试注入键** (`opts.dir` / `opts.cache_root` / `opts.defer=false` 走同步不排定时器),
+生产路径不传则行为不变。覆盖在 `tests/t_workspace.lua` (§10.1): 缓存根之外的 dir 被拒 /
+非 java 缓冲只删不重启 / java 缓冲删完重放一次 `FileType` / **命令后窗口切走, 当前缓冲跑完
+仍被还原** / `buftype~=''` 的 java 缓冲不重启。全程临时目录, 不碰真缓存、不真起 jdtls。
 
 ---
 
@@ -2140,14 +2181,14 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_source_roots.lua` | 27 | `java/source_roots` 两个入口的**模式闸门** (§5.1): `find` 只在 `mode="aosp"` 给结果、`find_for_project` 只在 `mode="project"` 给结果, 另一个一律 nil / 两者共用同一份扫描 (假项目里同样 2 条根) / 结果**全是相对项目目录**的路径, 无绝对路径 (§2.7 的硬要求) / **空项目在两处都返回 nil 而不是空表** (§2.3: 空 `sourcePaths` 会整体关闭 jdt.ls 推断, 比不注入还糟) / `nil`·`""` 入参退化不抛错 / 二次调用命中缓存结果一致。**`root.project_dir` 一节** (§3 的地雷回归): 两个不同项目给出不同根 / **绝不等于 AOSP 根** (旧 bug 的正面回归) / 树内无项目标记 → nil 不猜 / `workspace_root` 在 project 模式仍返回 nil (旧契约) / 非 project 模式退让 / 项目源码根是**项目相对**而非树相对。全部临时目录造假项目, 零 LSP |
 | `t_source_apply.lua` | 27 | `java/source_apply.lua`: `abs_of` 归一 / `installed` 解析 `.classpath` (去重、带 `excluding`、剥 `_/` 前缀、读不到返回 nil 而非空集) / 真机 `pending` 与磁盘 src 交集为 0 且有序 / 累积根"要么已装要么待装, 绝不丢弃" / 已装与待装不相交 / 非 core 模式拒绝 / `classify` 三类真实返回值 / 无 client 时 `auto()` 惰性 / `source_apply_auto=false` → `off` / `report()` 每**棵树**只提示一次 (分区键 = workspace 根; §2.15) / **报告文案契约 (2026-10-12)**: 不再出现 `:Aosp!`, 必说"本次退回 jar"与"下次启动自动生效", 且**默认阈值 (warn) 下不可见** (§2.10.1) |
 | `t_root_fallback.lua` | 22 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 |
-| `t_workspace.lua` | 31 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 | 
+| `t_workspace.lua` | 40 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 / **`clean_workspace` 删完自动重启** (§2.18): 缓存根之外的 dir 被拒 / 非 java 缓冲只删不重启 / java 缓冲删完重放一次 `FileType` (自动重启) / **命令后窗口切走: 目录仍被删且当前缓冲跑完被还原** (`start_or_attach` 读的是 `nvim_get_current_buf()`, 不摆好窗口就重放不出来 = "清完没重启") / `buftype~=''` 的 java 缓冲不重启 (挡 §2.13 的第二台 jdtls) —— 注入 `dir`/`cache_root`/`defer=false`, 临时目录, 零 LSP | 
 
-合计 **549** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
-`t_jvm` 127 / `t_root_from_cwd` 13 / `t_source_apply` 25 / `t_conflict` 37, 共 **536**)。
+合计 **561** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
+`t_jvm` 127 / `t_root_from_cwd` 13 / `t_source_apply` 25 / `t_conflict` 37, 共 **545**)。
 
 > 只有 `t_jvm` (127/127)、`t_root_from_cwd` (20/13)、`t_source_apply` (31/25) 和
 > `t_conflict` (40/37) 四个套件的条数**随环境而变** (真树块整段 SKIP 时不计数),
-> 所以 549/536 是当前环境的实测值而非不变量; 其余 12 个套件两种跑法条数相同。
+> 所以 561/545 是当前环境的实测值而非不变量; 其余 12 个套件两种跑法条数相同。
 > 特别注意 `t_jvm` 的真机块: 它要**真有 jdtls 在跑**才算数, 只设 `AOSPNAV_LIVE_TEST=1`
 > 是不够的 (本机 2026-10-10 就出现过"采样时在跑、跑测试时已退出"→ 静默少几条;
 > 2026-10-12 记 §2.10.1 那件事之后 jdtls 被 OOM 杀掉没在跑, 真机块整段 SKIP)。
