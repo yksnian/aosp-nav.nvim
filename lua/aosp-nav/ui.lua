@@ -199,7 +199,7 @@ end
 
 --- 收集全部诊断项
 --- @return table lines
-function M.diagnose()
+function M.diagnose(basis, src_file)
   local cfg = get_cfg()
   local mode = mode_of(cfg)
   -- [#3] 面板按 panel_basis 取树 (当前 buffer 不在树里时回退 client / active) ——
@@ -211,12 +211,20 @@ function M.diagnose()
 
   table.insert(lines, line("plugin", "aosp-nav.nvim " .. plugin_version(), true))
 
-  -- jdtls client
+  -- jdtls client ([v18.8] 每项目一台: **当前 buffer 挂着的优先**, 不再取 [1] ——
+  -- 否则面板在多台并存时串台显示别的项目的 root/sourcePaths/-data)
   local clients = vim.lsp.get_clients({ name = "jdtls" })
   if #clients == 0 then
     lines[#lines + 1] = line("jdtls", "not attached", false, "open a .java file in the AOSP tree")
   else
+    local cur_name = vim.api.nvim_buf_get_name(0)
     local c = clients[1]
+    for _, cc in ipairs(clients) do
+      if cc.attached_buffers and cur_name ~= "" and cc.attached_buffers[vim.fn.bufnr(cur_name)] then
+        c = cc
+        break
+      end
+    end
     local rd = c.root_dir
     if not rd or rd == "" then rd = c.config and c.config.root_dir end
     lines[#lines + 1] = line("jdtls",
@@ -267,7 +275,15 @@ function M.diagnose()
   local aosp_r = root_mod.aosp_root(basis)
   -- project 模式的真实工作区根是项目目录, 而 workspace_root() 在该模式返回 nil ——
   -- 必须用 project_dir() 取, 写 `or aosp_r` 兜底会把这里显示成 AOSP 根 (假信息)。
-  local project_r = root_mod.project_dir(basis)
+  -- [v18.2] 判定基准用**当前 buffer 文件**: basis 是 panel_basis 给的树根目录,
+  -- project_dir(树根) 恒 nil (树根本身不算项目), workspace root 会假显示成 AOSP 根、
+  -- ws follow 恒 "following this project" (pending 判不出)。
+  -- [v18.5] src_file = 面板打开前的调用方文件 (由 panel() 传入); 直接取
+  -- buf_get_name(0) 拿到的是面板缓冲名。
+  local cur_file = src_file or vim.api.nvim_buf_get_name(0)
+  if cur_file == "" or not vim.fn.filereadable(cur_file) then cur_file = nil end
+  local pj_basis = (mode == "project" and cur_file) or basis
+  local project_r = root_mod.project_dir(pj_basis)
   local wr = project_r or root_mod.workspace_root(basis) or aosp_r
   lines[#lines + 1] = line("aosp root", aosp_r or "<not an AOSP file>", aosp_r ~= nil,
     action_if(aosp_r ~= nil, "aosp-nav only manages roots inside an AOSP tree"))
@@ -276,11 +292,31 @@ function M.diagnose()
   -- project 模式下工作区根跟着 buffer 走, 所以"**运行中那台**现在指着谁"是一等信息
   -- (它决定这次跨模块跳转会落到源码还是 jar)。路径本身已经在上面一行了, 这里只说
   -- 状态与差异; 别的模式下工作区根恒为 AOSP 根, 没有信息量, 不显示。
+  -- [v18.13] ws follow / source roots 两行只在 aosp/infer 模式下显示: project 模式
+  -- 没有累积注入语义 —— ws follow 恒 "following this project" (零信息量), source
+  -- roots 的 installed/pending 是 aosp 的账本, project 下恒 0 反而误导 (下面 src roots
+  -- 段才是 project 模式的真值)。仅保留一种异常态: 内存闸把 buffer 压到别的项目的
+  -- 台上时, 明说 "jumps land on jars"。
   if mode == "project" then
     local follow = require("aosp-nav.java.workspace_follow")
     local live = follow.client()
-    local live_root = live and (live.root_dir or (live.config and live.config.root_dir)) or nil
-    local target = follow.target(basis)
+    local live_root = follow.current_root(live)
+    local target = follow.target(pj_basis)
+    local function clean(p) return p and (vim.fn.fnamemodify(p, ":p"):gsub("/+$", "")) end
+    local riding = clean(target) and clean(live_root) and clean(target) ~= clean(live_root)
+    if riding then
+      lines[#lines + 1] = line("ws follow",
+        ("riding on %s's instance (memory gate)"):format(vim.fn.fnamemodify(live_root, ":t")),
+        false,
+        "this buffer has no jdtls of its own; jumps land on jars")
+    elseif not live then
+      lines[#lines + 1] = line("ws follow", "no running jdtls", true)
+    end
+  else
+    local follow = require("aosp-nav.java.workspace_follow")
+    local live = follow.client()
+    local live_root = follow.current_root(live)
+    local target = follow.target(pj_basis)
     local function clean(p) return p and (vim.fn.fnamemodify(p, ":p"):gsub("/+$", "")) end
     local pending = clean(target) and clean(live_root) and clean(target) ~= clean(live_root)
     lines[#lines + 1] = line("ws follow",
@@ -288,21 +324,31 @@ function M.diagnose()
         or (live_root and "following this project" or "no running jdtls"),
       true,
       pending and "cross-project jumps will land on jars until the re-import finishes" or nil)
-  end
 
-  -- 源码根: 以磁盘 .classpath 为准 (jdt.ls 实际拥有什么); 读不到时退回内存账本。
-  local counts = source_root_counts(basis)
-  lines[#lines + 1] = line("source roots",
-    ("installed=%d pending=%d (%s view)"):format(counts.installed, counts.pending, counts.view),
-    counts.pending == 0,
-    counts.pending > 0 and ":AospCleanWorkspace to apply them all in one pass (src-first)" or nil)
+    -- 源码根: 以磁盘 .classpath 为准 (jdt.ls 实际拥有什么); 读不到时退回内存账本。
+    local counts = source_root_counts(basis)
+    lines[#lines + 1] = line("source roots",
+      ("installed=%d pending=%d (%s view)"):format(counts.installed, counts.pending, counts.view),
+      counts.pending == 0,
+      counts.pending > 0 and ":AospCleanWorkspace to apply them all in one pass (src-first)" or nil)
+  end
 
   -- session state。indexing 是进行中, 不是失败 —— 给 nil (中性), 别标红吓人;
   -- 其余 phase 照旧: 只有 ready 算通过。
   local session_ok
   if st.phase ~= "indexing" then session_ok = (st.phase == "ready") end
+  -- [v18.12] phase=ready 只说明 **client 已初始化**, 不反映 server 的工程导入:
+  -- 每项目一台下切新模块, 新台热启动也要 10-30s 恢复 workspace + 重挂 1126 个
+  -- jar —— 期间 gd 的 definition 返回残缺/越界位置 (snacks "Invalid cursor line"
+  -- 堆栈的来源)。progress.pending 非空 = server 有未完成的进度序列 (workDoneProgress),
+  -- 据实显示 importing, 防止 "ready 却跳不动" 的误导。
+  local phase_text = st.phase
+  if st.phase == "ready" then
+    local pend = c and c.progress and c.progress.pending
+    if pend and next(pend) then phase_text = "ready* (importing...)" end
+  end
   lines[#lines + 1] = line("session", ("phase=%s jars=%d origin=%s"):format(
-    st.phase, st.jars, tostring(st.cache_origin)), session_ok)
+    phase_text, st.jars, tostring(st.cache_origin)), session_ok)
 
   -- [v12] 会话隔离 (java/session_conflict.lua): 另一个 nvim 已占着本棵树本该用的
   -- `-data`, 本会话自动换了独立索引, 于是 sourcePaths/jars 都没注入 —— 这是**预期**,
@@ -324,11 +370,14 @@ function M.diagnose()
     local stale = jm.cache_stale(jr)
     lines[#lines + 1] = line("jar cache", stale and "stale (AOSP rebuilt)" or "fresh", not stale,
       stale and ":AospRescan" or nil)
-    -- Eclipse 元数据 blockers
+    -- import.exclusions 的残留工程计数 (Eclipse .metadata 里登记过排除、后来又被
+    -- 导入的目录)。对 invisible project 是无害噪音 —— 只在 aosp 模式给清理建议
+    -- (整树重建一次清干净); project 模式下每台只管自己模块, 清理既不必要也不划算。
     local cached = require("aosp-nav.java.import_exclusions").cached(jr)
     local n_b = cached and #cached or 0
-    lines[#lines + 1] = line("eclipse blockers", tostring(n_b), true,
-      n_b > 0 and ":AospCleanWorkspace (if these dirs were already imported)" or nil)
+    lines[#lines + 1] = line("exclusion leftovers", tostring(n_b), true,
+      n_b > 0 and mode ~= "project"
+        and ":AospCleanWorkspace clears them in one pass" or nil)
     -- jdtls workspace 目录
     local wd = workspace.workspace_dir()
     local wd_ok = wd ~= nil and vim.fn.isdirectory(wd) == 1
@@ -400,7 +449,7 @@ function M.diagnose()
   -- Kotlin
   local k = cfg.kotlin
   lines[#lines + 1] = line("kotlin",
-    "enabled=" .. tostring(k.enabled) .. " mode=" .. tostring(k.jar_mode), k.enabled)
+    "enabled=" .. tostring(k.enabled) .. " jar_mode=" .. tostring(k.jar_mode), k.enabled)
   if k.enabled then
     local kc = require("aosp-nav.kotlin.classpath")
     local owner, kpath = kc.probe()
@@ -761,10 +810,16 @@ local function source_roots_section(fname)
 
   local out = { "== source roots ==" }
   out[#out + 1] = ("mode        : %s"):format(mode)
-  out[#out + 1] = ("counts view : %s"):format(counts.view == "disk"
-    and "on-disk .classpath (what jdtls actually has)"
-    or "in-memory bookkeeping (no jdtls workspace to read)")
-  out[#out + 1] = ("installed   : %d root(s) in the running workspace"):format(counts.installed)
+  -- [v18.13] counts view / installed 两行只在 aosp/infer (累积注入语义) 下输出:
+  -- project 模式 installed/pending 恒 0 (内存账本不记 project 注入), "no jdtls
+  -- workspace to read" 把磁盘视图失败显示成常态 —— 都误导; project 的真值是下面
+  -- 的 project / src roots 两行 (直接问运行中的那台)。
+  if mode ~= "project" then
+    out[#out + 1] = ("counts view : %s"):format(counts.view == "disk"
+      and "on-disk .classpath (what jdtls actually has)"
+      or "in-memory bookkeeping (no jdtls workspace to read)")
+    out[#out + 1] = ("installed   : %d root(s) in the running workspace"):format(counts.installed)
+  end
   if mode == "project" then
     -- project 模式注入的是**本项目自己的**根, 没有核心集、也不跨项目累积 ——
     -- 那三行 (preset core / accumulated / pending) 在这个模式下恒为 0, 摆在面板上
@@ -811,6 +866,9 @@ end
 
 --- :Aosp — 打开**一个**信息面板 (旧 status + diagnostics + source-roots 三合一)
 function M.panel()
+  -- [v18.5] 先抓调用方文件名: 面板缓冲建好之后 nvim_buf_get_name(0) 就是
+  -- aosp-nav://panel, diagnose 里的"当前文件"判定会全部失灵 (v18.2 的坑在这复活)。
+  local src_file = vim.api.nvim_buf_get_name(0)
   local out = {
     "aosp-nav",
     "generated: " .. os.date("%Y-%m-%d %H:%M:%S"),
@@ -819,7 +877,7 @@ function M.panel()
   -- 不单列 status 块: 它的每个字段 (phase/root/jars/mode/clients) 在
   -- diagnostics 里都有, 单列只会让面板变长一倍。M.status() 仍是给 statusline 的公开 API。
   out[#out + 1] = ""
-  vim.list_extend(out, diagnostics_body(M.diagnose()))
+  vim.list_extend(out, diagnostics_body(M.diagnose(nil, src_file)))
 
   out[#out + 1] = ""
   vim.list_extend(out, source_roots_section(nil))
@@ -868,9 +926,16 @@ function M.clean_workspace(opts)
     return
   end
   if not opts.force then
+    -- [v18.12] 文案随 v18.8 (每项目一台) + v18.10 (归属圈定) 更新。重导代价按模式分:
+    -- project = 单模块 ~1min; aosp = 整树重建 (实测 ~3.5min)。~~"tens of minutes"~~
+    -- 是 aosp 整树时代的粗略说法。
+    local jmode = ((require("aosp-nav").config or {}).java or {}).mode
+    local cost = (jmode == "project")
+      and "~1 min (this module only)"
+      or "slow (~3.5 min, full tree)"
     local choice = vim.fn.confirm(
       "Delete jdtls workspace?\n" .. dir
-      .. "\n\nEclipse will re-import all projects on next start (slow, tens of minutes).",
+      .. "\n\nRe-import on next use: " .. cost .. ".",
       "&Yes\n&No", 2)
     if choice ~= 1 then return end
   else
@@ -880,60 +945,87 @@ function M.clean_workspace(opts)
     log.user("removing the jdtls workspace: " .. dir)
   end
 
-  -- 先停客户端再删, 否则 jdtls 还在写这个目录
+  -- [v18.10] **只停与被删 -data 相关的 client** (每项目一台下各管各的 -data, 其他
+  -- 项目的 jdtls 不动), 重放也只补偿它们的 buffer —— 全局 stop+重放是误伤链。
+  local norm = function(p)
+    return p and (vim.fn.fnamemodify(p, ":p"):gsub("/+$", "")) or nil
+  end
+  local tdir = norm(dir)
+  -- replay = **-data 归属为 dir 的 java buffer**: 按 buffer 的项目目录/树根推算
+  -- expected_workspace_dir 与 dir 比对 (静态判定, 不依赖 client —— clean 时它们
+  -- 可能已被用户手动关掉)。stop 圈定则按 client.config.cmd 的 -data。
+  local ws_mod = require("aosp-nav.java.workspace")
+  local rm_mod = require("aosp-nav.java.root")
+  local navcfg = require("aosp-nav").config or {}
+  local mode = (navcfg.java or {}).mode
+  local replay = {}
+  for _, b in ipairs(vim.fn.getbufinfo({ bufloaded = 1 })) do
+    local f = vim.api.nvim_buf_get_name(b.bufnr)
+    if vim.bo[b.bufnr].filetype == "java" and vim.bo[b.bufnr].buftype == "" and f ~= "" then
+      -- 归属判定与 root_dir fn 的 project 分支同链 (树外文件无边界上溯找 .git)
+      local rd = (mode == "project")
+        and require("aosp-nav.java.projects").find_project_root(f, rm_mod.aosp_root(f))
+        or rm_mod.workspace_root(f)
+      local exp = rd and norm(ws_mod.expected_workspace_dir(rd, vim.fn.fnamemodify(cache_root, ":h"))) or nil
+      if exp and exp == tdir then replay[#replay + 1] = b.bufnr end
+    end
+  end
+  table.sort(replay)
   local clients = vim.lsp.get_clients({ name = "jdtls" })
   for _, c in ipairs(clients) do
-    pcall(function() vim.lsp.stop_client(c.id, true) end)
+    local cmd = type(c.config) == "table" and c.config.cmd or nil
+    local cdata = nil
+    if type(cmd) == "table" then
+      for i, a in ipairs(cmd) do
+        if a == "-data" and cmd[i + 1] then cdata = cmd[i + 1] break end
+      end
+    end
+    if cdata and norm(cdata) == tdir then
+      pcall(function() vim.lsp.stop_client(c.id, true) end)
+    end
   end
-
-  -- 记下当前是不是 java 缓冲: 是的话删完自动重启 jdtls, 用户不必自己去 :e。
-  -- 不能删之前就重启 (还在写目录), 所以等 delete 落定后再重放 FileType。
-  local buf = vim.api.nvim_get_current_buf()
-  local restartable = vim.bo[buf].filetype == "java" and vim.bo[buf].buftype == ""
 
   local function after_delete()
     if vim.fn.delete(dir, "rf") ~= 0 then
       log.error("failed to delete " .. dir)
       return
     end
-    if restartable and vim.api.nvim_buf_is_valid(buf) then
-      log.info(("jdtls workspace removed (%s) — re-importing."):format(dir),
-        { timeout = 10000 })
-      -- [v13] 重放 FileType 让 LazyVim 的 attach_jdtls 再跑一次 (它无条件
-      -- start_or_attach)。此刻旧 client 已停、目录已删, 于是新 JVM 会从零重建
-      -- workspace —— 正是本命令想要的结果, 不用用户再手动 :e。
-      --
-      -- **必须先把 buf 摆到当前窗口**: nvim-jdtls 的 start_or_attach 读的是
-      -- `nvim_get_current_buf()` (setup.lua:315), **不是** autocmd 的 buffer 参数 ——
-      -- 光传 { buffer = buf } 不够。defer_fn 之间有 800ms, 用户完全可能切走了窗口;
-      -- 那时按当前 buffer 起 jdtls 要么挂错文件, 要么在非 file:// 缓冲上直接 return
-      -- (setup.lua:319) —— 这就是"清完没重启"的成因。临时切过去, 完事切回来。
+    if #replay > 0 then
+      log.info(("jdtls workspace removed (%s) — re-importing %d java buffer(s).")
+        :format(dir, #replay), { timeout = 10000 })
+      -- [v18.9] 逐个 java 缓冲重放 FileType —— **必须先把 buf 摆到当前窗口**:
+      -- nvim-jdtls 的 start_or_attach 读 `nvim_get_current_buf()` (setup.lua:315),
+      -- 不是 autocmd 的 buffer 参数; 且重放间有间隔, 用户可能切走窗口。
+      -- 每台 JVM 重导各自的 -data (单模块索引)。
       local win = vim.api.nvim_get_current_win()
-      local prev_win, prev_buf = nil, nil
-      if vim.api.nvim_win_get_buf(win) ~= buf then
-        -- 该 buf 可能没在任何窗口显示; 优先找显示它的窗口, 否则就地换上 (记下换回了什么)
-        local target = nil
-        for _, w in ipairs(vim.api.nvim_list_wins()) do
-          if vim.api.nvim_win_get_buf(w) == buf then target = w; break end
+      local restore = nil
+      for _, buf in ipairs(replay) do
+        if not vim.api.nvim_buf_is_valid(buf) then goto continue end
+        if vim.api.nvim_win_get_buf(win) ~= buf then
+          local target = nil
+          for _, w in ipairs(vim.api.nvim_list_wins()) do
+            if vim.api.nvim_win_get_buf(w) == buf then target = w; break end
+          end
+          if target then
+            restore = restore or { win, vim.api.nvim_win_get_buf(win) }
+            vim.api.nvim_set_current_win(target)
+          else
+            restore = restore or { win, vim.api.nvim_win_get_buf(win) }
+            pcall(vim.api.nvim_win_set_buf, win, buf)
+          end
         end
-        if target then
-          prev_win = win
-          vim.api.nvim_set_current_win(target)
-        else
-          prev_win, prev_buf = win, vim.api.nvim_win_get_buf(win)
-          pcall(vim.api.nvim_win_set_buf, win, buf)
+        local ok, err = pcall(vim.api.nvim_exec_autocmds, "FileType",
+          { buffer = buf, modeline = false })
+        if not ok then log.debug("restart after clean failed: " .. tostring(err)) end
+        ::continue::
+      end
+      -- 还原窗口
+      if restore and vim.api.nvim_win_is_valid(restore[1]) then
+        pcall(vim.api.nvim_set_current_win, restore[1])
+        if restore[2] and vim.api.nvim_buf_is_valid(restore[2]) then
+          pcall(vim.api.nvim_win_set_buf, restore[1], restore[2])
         end
       end
-      local ok, err = pcall(vim.api.nvim_exec_autocmds, "FileType",
-        { buffer = buf, modeline = false })
-      -- 还原: 先回原窗口, 若刚才是就地换的 buffer 再把它换回来
-      if prev_win and vim.api.nvim_win_is_valid(prev_win) then
-        pcall(vim.api.nvim_set_current_win, prev_win)
-        if prev_buf and vim.api.nvim_buf_is_valid(prev_buf) then
-          pcall(vim.api.nvim_win_set_buf, prev_win, prev_buf)
-        end
-      end
-      if not ok then log.debug("restart after clean failed: " .. tostring(err)) end
     else
       log.info(("jdtls workspace removed (%s). Reopen a .java file (:e) to re-import.")
         :format(dir), { timeout = 10000 })

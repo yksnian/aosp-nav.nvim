@@ -90,7 +90,7 @@ require("aosp-nav").setup({
   log_level = "warn",  -- "debug" | "info" | "warn" | "error" | "off"
   java = {
     jar_fallback_dir = "~/.usr/android_jars",
-    mode = "aosp",  -- "aosp" | "project"; 见 "导航模式"
+    mode = "project",  -- "project" (默认) | "aosp" | "infer" (不推荐); 见 "导航模式"
     core_source_roots = {
       "frameworks/base/core/java",
       "frameworks/base/services/core/java",
@@ -130,14 +130,19 @@ return {
 
 | `java.mode` | 工作区根 | 源码根 | 效果 | 换项目 |
 | ----------- | -------- | ------ | ---- | ------ |
-| `aosp` (默认) | AOSP 根 | 注入 (预置核心集 + 项目累积) | 跨模块跳转到真实 `.java` | 无需换 |
-| `project` | **当前文件所属项目**的目录 | 注入 (**仅该项目自己**的源码根) | 只索引这一个模块; 模块内跳转落真实 `.java`, 模块外一律打开 jar | 自动, 整份重导入 (~1 分钟) |
+| `project` (默认) | **当前文件所属项目**的目录 | 注入 (**仅该项目自己**的源码根) | 只索引这一个模块; 模块内跳转落真实 `.java`, 模块外一律打开 jar | **每项目一台** jdtls |
+| `aosp` | AOSP 根 | 注入 (预设核心集 + 访问过的项目累积) | 跨模块跳转落真实 `.java` | 无需切换 |
+| `infer` (不推荐) | AOSP 根 | 不注入 —— 由 jdt.ls 在文件首次打开时自己猜源码根 | 插件完全不插手, 但 AOSP 的目录结构经常让它猜错, 跳转还是落到 jar | 无需切换 |
 
 两种模式都要索引一整块 workspace 并把结果持久化, 区别只在**索引范围**: `aosp` 是整棵树, `project` 是一个模块 (换来更小的首次导入)。按你更在意"跨模块跳转"还是"开得快"来选。
 
 `project` 也注入源码根 —— 但只注入**你所在的这个项目的**, 这样该项目里没打开过的类也会落到真实源码而不是 jar; `aosp` 注入的是共享核心集加上你访问过的每个项目。
 
-`project` 模式换项目时插件会自动把**正在运行的** jdtls 切过去 (LSP `workspace/didChangeWorkspaceFolders`, 无需重启 nvim), 代价是这一次切换要**整份重导入**, 实测约 1 分钟 —— 切换时会有一条明确提示。同一个项目里来回切文件不触发任何导入。
+`project` 模式下每个项目各跑一台 jdtls: 切到别的项目就为新项目再起一台 (旧的那台闲置了会自动关掉), 各自维护自己模块的索引。让一台 jdtls 在运行中切换工作区是行不通的 —— 它不会为新目录建索引工程, 所以只能每个项目一台。每个项目第一次导入要一分钟左右, 之后走缓存几秒就能用 (导入期间面板会显示 `importing...`)。在同一个项目里切换文件没有任何开销。
+
+**什么时候值得用 `aosp`**: 整天在模块之间来回跳、到处都要跳到真实源码, 且付得起一次重度导入。代价也在这里 —— 首次导入覆盖整棵树 (大树上一次往往要十几分钟); 所有东西挤在一台 JVM 里, 堆要给大 (8G 以上); 运行期发现新模块的根时, 每条都会重建一次整条 classpath (自动、去抖), 然后还要一轮重排才能排到 jar 前面 (同样自动, 十来秒, 内存消耗大 —— 宿主内存紧张时会自动跳过等下次启动)。这些都不用手动操作, 但这正是默认用 `project` 的原因: 大多数人日常就在一两个模块里, 每项目一台的体验明显更好。
+
+`infer` 保留下来, 只是给"什么都想让 jdt.ls 自己来"的场景, 或者用来对比插件托管和裸跑的差别 —— 在真正的 AOSP 树上, 它一般比不过前两种模式。
 
 旧的 `java.workspace_mode` / `java.source_paths_mode` 已删除 —— 请使用 `java.mode`。
 
@@ -189,6 +194,8 @@ return {
 ### :Aosp!
 
 把已累积的源码根重新注入**正在运行**的 jdtls —— 自动注入被上限截断、或一直没等到就绪窗口时的兜底。
+
+只有 `java.mode = "aosp"` 下它才有事可做 —— 只有这个模式会随浏览积累源码根 (其他模式下面板干脆不显示这条命令)。`project` 模式的根在导入时就注入完了, 没有可强推的累积。
 
 自动注入每会话做一次, 单次最多 5 条; 想关掉设 `java.source_apply_auto = false`。`:Aosp!` 越过上限, 立即注入当前全部累积。
 
@@ -257,7 +264,7 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 | java.exclude_merge | append | 排除类列表 (exclude_jars/paths/globs/import_exclusions) 的合并语义: append=用户项追加到默认值后 (推荐); replace=整体替换默认值 |
 | java.make_jar_priority            | {classes.jar, classes-header.jar, javalib.jar}               | Make 构建系统 jar 优先级                                     |
 | java.make_blacklist               | {android_stubs_current_intermediates}                        | Make 构建排除目录                                            |
-| java.mode | aosp | `aosp` = 工作区根为 AOSP 根**且**注入 sourcePaths (默认); `project` = 工作区根为**当前文件所属项目**的目录, sourcePaths 为**该项目自己**的源码根, 换项目时自动把运行中的 jdtls 切过去 (整份重导入, 约 1 分钟) |
+| java.mode | project | `project` (默认) = **每个项目一台 jdtls**: 工作区根为**当前文件所属项目**的目录, sourcePaths 为**该项目自己**的源码根; `aosp` = 工作区根为 AOSP 根**且**注入 sourcePaths (整树共享一份索引, 跨模块跳转到真实源码) |
 | java.source_apply_auto | true | 累积到新源码根时 (以及 jdtls attach 补存量时) 自动增量注入运行中的工作区。每会话最多一次, 且内部单次上限 5 条; 只在 `mode == "aosp"` 且 jdtls 在跑时生效 |
 | java.core_source_roots | {frameworks/base/core/java, frameworks/base/services/core/java} | 预置源码根 (相对 AOSP 根), 从首次导入起就注入。整表替换默认值 (同 `kotlin.curated_modules` 语义); 磁盘上不存在的条目自动跳过。给得越多首次索引越重 |
 | java.source_paths_max_projects | 8 | 累积的 `.git` 项目数上限 (LRU 淘汰, `0` = 不限)。上限与累积集合都会跨会话保留 |
@@ -342,7 +349,7 @@ AIDL/proto/aconfig 类 (Stub/Proxy) 由构建系统生成到 `out/`, **源码树
 
 ### jdtls workspace 缓存路径与首次索引耗时
 
-默认模式下工作区根是 AOSP 根, 所以 Eclipse workspace 只有一个: `~/.cache/nvim/jdtls/<AOSP 根目录名>/workspace` (如 `~/.cache/nvim/jdtls/aosp/workspace`)。`mode = "project"` 时每个模块各有一个这样的目录。首次索引很耗 CPU, 耗时取决于树的大小与注入的源码根数量; 索引会持久化, 之后重开为增量加载。**索引期间请勿关闭/重启 jdtls**。`mode = "project"` 下切换项目会重导入并重建索引, 这是预期行为 (提示里说的"约 1 分钟"), 不是故障。
+`mode = "project"` (默认) 下每个模块各有一个 jdtls workspace: `~/.cache/nvim/jdtls/<项目目录名>/workspace` —— 同模块的 buffer 共享一台, 打开其他模块自动另起一台 (新台启动前会自动回收无 buffer 的闲置实例)。`mode = "aosp"` 时工作区根是 AOSP 根, 整棵树只有一个 workspace (如 `~/.cache/nvim/jdtls/aosp/workspace`)。首次索引很耗 CPU, 耗时取决于树的大小与注入的源码根数量; 索引会持久化, 之后重开为增量加载。**索引期间请勿关闭/重启 jdtls**。`mode = "project"` 下切换项目会重导入并重建索引, 这是预期行为 (提示里说的"约 1 分钟"), 不是故障。
 
 配置改动不生效、跳转异常时, 重建 workspace:
 

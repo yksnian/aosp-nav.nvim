@@ -196,12 +196,18 @@ function M.render(branches)
   local j = cfg.java
 
   -- 收集排除规则
+  -- [v18.11] **空 exclude_jars (或全部模式转换失败) 时 EXCLUDE_JAR_RE 必须留空**:
+  -- 空 alternation (" "|)$ 锚定行尾恒匹配, 脚本 ok() 对所有 jar return 1,
+  -- curated 模式产出 0 个 jar (Kotlin 跳转静默全空)。
   local ere_parts = {}
   for _, pat in ipairs(j.exclude_jars) do
     local ere = lua_pattern_to_ere(pat)
     if ere then table.insert(ere_parts, ere) end
   end
-  local exclude_re = shq("(" .. table.concat(ere_parts, "|") .. ")$")
+  local exclude_re = ""
+  if #ere_parts > 0 then
+    exclude_re = shq("(" .. table.concat(ere_parts, "|") .. ")$")
+  end
 
   local vsc = shq(vscode_backup_path())
   if not vsc then return nil, "config dir contains single quote" end
@@ -350,7 +356,10 @@ declare -A seen_mod
 
 ok() {
   local n=${1##*/}
-  echo "$n" | grep -qE "$EXCLUDE_JAR_RE" && return 1
+  # [v18.11] EXCLUDE_JAR_RE 可为空 (exclude_jars 空) —— 空 grep 模式恒匹配, 必须跳过
+  if [ -n "$EXCLUDE_JAR_RE" ]; then
+    echo "$n" | grep -qE "$EXCLUDE_JAR_RE" && return 1
+  fi
   local kw
   for kw in "${EXCLUDE_KW[@]}"; do
     case "$1" in *"$kw"*) return 1 ;; esac

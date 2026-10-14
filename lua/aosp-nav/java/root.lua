@@ -19,10 +19,11 @@
 -- "aosp" 下一致、在 "infer" 下相反。所以本模块只回答第一个问题:
 --   workspace 根是 AOSP 根  <=>  mode ~= "project"
 --
--- 为什么默认是 aosp: AOSP 是 repo checkout, 每个工程目录自带 .git, 于是
--- frameworks/base、packages/apps/Settings、packages/modules/Connectivity 各成
--- 一个 jdtls workspace (实测 ~/.cache/nvim/jdtls/ 下同时存在 6 个), 每次开新
--- 模块的文件都换 workspace, 跨模块跳转只能落到反编译 jar。
+-- 为什么默认是 project ([v18]): aosp 的运行期增量注入 (addToSourcePath 逐条 +
+-- 重排) 每条付一次全量 classpath 重建, 内存峰值实测把 -Xmx8G 顶到宿主 global OOM;
+-- project 单模块冷导入一次到位、无运行期注入。历史上默认 aosp 的理由 (每工程一个
+-- workspace 换来换去) 已由 workspace_follow 的 didChangeWorkspaceFolders 解决:
+-- 单 JVM 随 buffer 换项目, 不再另起实例。
 --
 -- 非 AOSP 工程: 本模块返回 nil, 插件不接管 root_dir, 原样交还用户配置。
 --
@@ -59,7 +60,7 @@ end
 function M.aosp_root(fname)
   -- 热重载/清 package.loaded 后新模块实例的 config 可能为 nil (setup 未跑) ——
   -- nil 时跳过 android_root 覆盖, 走自动检测, 不崩。
-  local cfg = require("aosp-nav").config
+  local cfg = require("aosp-nav").config or {}
   -- 起点归一 (见 util/path.lua): nil/"" -> cwd, 目录 -> 自身, 文件 -> 其目录。
   -- 从 AOSP 根目录直接打开时 fname 是目录, 也必须能起探测 (旧的手写
   -- `fname ~= ""` 守卫只挡住空串, 挡不住"目录当文件"的情形)。
@@ -86,8 +87,8 @@ end
 --- @param fname string|nil 文件路径或目录路径
 --- @return string|nil root; nil = 插件不接管
 function M.workspace_root(fname)
-  local cfg = require("aosp-nav").config
-  if cfg.java.mode == "project" then return nil end
+  local cfg = require("aosp-nav").config or {}
+  if (cfg.java or {}).mode == "project" then return nil end
   return M.aosp_root(fname)
 end
 
@@ -101,8 +102,8 @@ end
 --- @param fname string|nil 文件路径或目录路径
 --- @return string|nil project 规整后的绝对路径; nil = 不在树内 / 没有项目标记
 function M.project_dir(fname)
-  local cfg = require("aosp-nav").config
-  if cfg.java.mode ~= "project" then return nil end
+  local cfg = require("aosp-nav").config or {}
+  if (cfg.java or {}).mode ~= "project" then return nil end
   fname = (fname and fname ~= "") and fname or vim.api.nvim_buf_get_name(0)
   local aosp = M.aosp_root(fname)
   if not aosp then return nil end
@@ -172,24 +173,86 @@ end
 --- 两条路都答不上来时走 M.reuse_root 兜底 (反编译视图不能另起一台 jdtls)。
 --- 用户配置无需改动即可生效, 也不会影响非 AOSP 工程
 --- @param user_root string|function|nil 用户原本的 opts.root_dir
+--- client 的有效 root_dir: 先按字段取, 拿到 function (configure 的重入包装残留,
+--- nvim 的 start 求值后不回填字符串) 时用 fname 求值。与 workspace_follow.root_of
+--- 同款处理。
+--- @param c table
+--- @param fname string|nil 求值 function 时的基准文件
+--- @return string|nil
+function M.client_root(c, fname)
+  if not c then return nil end
+  local rd = c.root_dir or (c.config and c.config.root_dir) or nil
+  if type(rd) == "function" then
+    local ok, v = pcall(rd, fname or vim.api.nvim_buf_get_name(0))
+    rd = (ok and type(v) == "string") and v or nil
+  end
+  return rd
+end
+
+-- [v18.8] 新台内存闸阈值: 可用 <4GB 时不起新台 (退回已有台)。可注入供测试。
+M.PROJECT_NEW_MIN_AVAIL_KB = 4 * 1024 * 1024
+M._mem_avail_kb = function()
+  for _, l in ipairs(vim.fn.readfile("/proc/meminfo")) do
+    local kb = l:match("^MemAvailable:%s+(%d+)")
+    if kb then return tonumber(kb) end
+  end
+  return nil
+end
+
 --- @return function fn function(fname) -> string|nil
 function M.jdtls_root_fn(user_root)
   return function(fname)
     local cfg = require("aosp-nav").config
     if cfg.java.mode == "project" then
-      -- 已经在跑的那台: 复用它的根 (workspace_follow 会随 buffer 把它挪到目标项目)。
-      local live = M.reuse_root()
-      if live then return live end
-      -- 第一台: 按项目目录取根; 取不到 (树外/无项目标记) 才交还用户语义。
-      local p = require("aosp-nav.java.projects").find_project_root(fname, M.aosp_root(fname))
-      if p then return p end
+      -- [v18.8] **每项目一台 jdtls** (vscode 同款): root_dir = 该文件所属项目目录。
+      -- 同项目的文件 root_dir 相同 -> nvim 层自动复用同台; 不同项目 -> 各起各的,
+      -- 各自 -data 单模块索引。旧方案 (reuse_root 优先 + didChangeWorkspaceFolders
+      -- 换根) 已证伪: folder swap 后 jdt.ls 不为 added folder 建 invisible project
+      -- (~/aospnav-probe17 三联实验), gd 无处落。
+      local p = require("aosp-nav.java.projects").find_project_root(
+        fname, M.aosp_root(fname))
+      if p then
+        local log = require("aosp-nav.util.log")
+        -- 1. 已有同台 (有效 root == p): 复用。
+        for _, c in ipairs(vim.lsp.get_clients({ name = "jdtls" })) do
+          if M.client_root(c, fname) == p then return p end
+        end
+        -- 2. 新台前回收无附着 buffer 的闲置实例 (防 JVM 随浏览积累)。
+        local idle = 0
+        for _, c in ipairs(vim.lsp.get_clients({ name = "jdtls" })) do
+          local bufs = c.attached_buffers or {}
+          if next(bufs) == nil then
+            idle = idle + 1
+            pcall(vim.lsp.stop_client, c.id, true)
+          end
+        end
+        if idle > 0 then
+          log.info(("stopped %d idle jdtls instance(s) before starting one for %s")
+            :format(idle, vim.fn.fnamemodify(p, ":t")))
+        end
+        -- 3. 宿主内存闸: 可用内存不足时退回已有台 (宁可本 buffer 跳 jar, 不让宿主
+        --    global OOM —— 2026-10-14 15:44 实测过教训)。
+        local avail = M._mem_avail_kb and M._mem_avail_kb() or nil
+        local live = M.reuse_root()
+        if avail and avail < M.PROJECT_NEW_MIN_AVAIL_KB and live then
+          log.info(("new jdtls for %s skipped: %.1f GB memory available (need >= 4.0); "
+            .. "this buffer rides on the existing instance, cross-module jumps "
+            .. "land in jars"):format(vim.fn.fnamemodify(p, ":t"), avail / 1048576),
+            { once = true, id = "memgate:" .. p })
+          return live
+        end
+        return p
+      end
+      -- 取不到项目目录 (树外/无项目标记) 才交还用户语义; 仍无解时 reuse_root
+      -- 兜底 —— 反编译视图 (jdt:// / kls 临时文件) 没有自己的根, 绝不能让 LazyVim
+      -- 拿 cwd 另起一台 (本文件头记的 6-workspace 事故)。
       if type(user_root) == "function" then
         local ok, v = pcall(user_root, fname)
         if ok and v then return v end
       elseif type(user_root) == "string" and user_root ~= "" then
         return user_root
       end
-      return nil
+      return M.reuse_root()
     end
 
     local r = M.workspace_root(fname)

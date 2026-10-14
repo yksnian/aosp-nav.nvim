@@ -9,6 +9,7 @@ local H = dofile(here .. "/helper.lua")
 local ui = require("aosp-nav.java.workspace")
 local instances = require("aosp-nav.java.instances")
 local clean_workspace = require("aosp-nav.ui").clean_workspace
+require("aosp-nav").setup({ java = { mode = "project" } }) -- [v18.9] replay 判定需要 mode
 
 -- ---------------------------------------------------------------------------
 -- 造一个假工作区。结构取真的那份 (2026-10-10 实测):
@@ -158,8 +159,11 @@ H.eq(fired_nonjava, 0, "clean_workspace: 非 java 缓冲不重放 FileType")
 
 -- 7c. java 缓冲: 删完重放 FileType -> 自动重启钩子被触发
 mkdir(wsdir)
+-- [v18.10] Foo.java 归属 qssi 项目 (.git 就近 -> project_dir basename=qssi ->
+-- expected_workspace_dir == wsdir), clean 才会重放它
+vim.fn.mkdir(tmp .. "/qssi/.git", "p")
 local java_buf = vim.api.nvim_create_buf(true, false)
-vim.api.nvim_buf_set_name(java_buf, tmp .. "/Foo.java")
+vim.api.nvim_buf_set_name(java_buf, tmp .. "/qssi/Foo.java")
 vim.api.nvim_set_current_buf(java_buf)
 vim.bo[java_buf].filetype = "java"   -- 设 filetype 会立即触发一次 FileType
 local fired_java = 0
@@ -201,7 +205,9 @@ vim.api.nvim_set_current_buf(virt)
 local before_v = fired_java
 clean_workspace({ force = true, dir = wsdir, cache_root = cache, defer = false })
 H.eq(vim.fn.isdirectory(wsdir), 0, "clean_workspace: 目录已删 (虚拟 java 缓冲)")
-H.eq(fired_java, before_v, "clean_workspace: buftype~='' 的 java 缓冲不重启")
+-- [v18.10] replay 按 **-data 归属** 圈定: virt 无名缓冲无归属 -> 不重放;
+-- Foo.java (qssi 项目) 的 expected_workspace_dir == wsdir -> 重放。
+H.eq(fired_java, before_v + 1, "clean_workspace: 归属 wsdir 的 java 缓冲重放一次")
 
 vim.api.nvim_del_augroup_by_id(grp)
 vim.fn.delete(tmp, "rf")

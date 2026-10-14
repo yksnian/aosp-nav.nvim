@@ -24,6 +24,13 @@
 
 local M = {}
 
+-- [v18.1] 换根后的"当前根"记账。nvim 侧 client.root_dir 只在 start 时取值, **不会**
+--- 随 didChangeWorkspaceFolders 更新 —— 只拿它当"当前根"的话, 第一跳 (Wifi ->
+--- Connectivity) 发出后 client.root_dir 仍是 Wifi, 切回 Wifi 时 target == cur 被误判
+--- "已在目标内", 通知发不出, 横跳的反方向永久失效。按 client.id 记最后目标。
+--- @type table<string, string>
+local _target_of = {}
+
 --- 规整路径 (绝对化 + 去尾部斜杠)。与 root.lua / projects.lua 同口径。
 --- @param p string
 --- @return string
@@ -58,6 +65,7 @@ function M.target(fname)
   return normalize(p), root_mod.aosp_root(fname)
 end
 
+
 --- 当前 buffer 挂着的 jdtls client (口径与 java/source_apply.client 一致:
 --- 先按 buffer 找, 找不到再退到任意一台)。按 buffer 找是必须的 —— 一个会话里可以
 --- 同时挂两棵树, 取错就会把 X 树的项目发给 Y 树的 server。
@@ -71,16 +79,46 @@ end
 --- @param client table
 --- @return string|nil
 local function root_of(client)
-  return client and (client.root_dir or (client.config and client.config.root_dir)) or nil
+  local rd = client and (client.root_dir or (client.config and client.config.root_dir)) or nil
+  -- [v18.7] configure 的重入包装 ([#2]) 会把 opts.root_dir 留成 **function** —— nvim
+  -- 的 vim.lsp.start 求值后不回填字符串, client.root_dir 就一直是函数值。所有按
+  -- "root_dir 是字符串"写的判定 (contains/记账/面板) 在这里断链 (2026-10-14 e2e
+  -- 实锤: root=function 0x... -> on_buf_enter 抛错被 autocmd 吞 -> 注入静默失败)。
+  -- 对函数用当前 buffer 文件求值: 返回 live 复用根 (字符串)。
+  if type(rd) == "function" then
+    local ok, v = pcall(rd, vim.api.nvim_buf_get_name(0))
+    rd = (ok and type(v) == "string") and v or nil
+  end
+  return rd
 end
 
---- BufEnter 钩子: 当前 buffer 所属项目与运行中 jdtls 的工作区根不一致时, 把工作区
---- 换过去, 并明确提示代价。
+--- 运行中 client 的"当前工作区根" = 自己记的最后目标 (换过根) 或 client.root_dir
+--- (从未换过)。面板/判定一律走这里 —— client.root_dir 不随换根更新, 直接读它会把
+--- 已完成的换根误报成 pending。
+--- @param client table
+--- @return string|nil
+function M.current_root(client)
+  if not client then return nil end
+  local cid = tostring(client.id or root_of(client) or "?")
+  return _target_of[cid] or root_of(client)
+end
+
+
+--- BufEnter 钩子: 当前 buffer 所属项目与已注入的项目不一致时, 把目标项目的源码根
+--- **addToSourcePath 进当前 invisible project** (aosp 模式的运行期机制复用), 并提权。
 ---
---- 只在 mode == "project" 下做任何事。目标与现根相同 (最常见的情形: 同一个项目里
---- 来回切文件) 是一次字符串比较, 静默返回 —— 没有 timer, 也不需要防抖。
+--- [v18.6] 为什么不再用 didChangeWorkspaceFolders (三联实验, ~/aospnav-probe17):
+---   exp_reroot: folder swap 后 jdt.ls 对 added folder **不建** invisible project
+---   (didOpen/NIL-sourcePaths 均无法触发; importProjects 的 importer 判定对整模块
+---   目录不 applies) —— 换根后 gd 无处落。
+---   exp_addto: 不换 folder, Wifi 的 4 根逐条 addToSourcePath 进同一个 invisible
+---   project + reorder 提权 -> **ConnectivityService 与 ClientMode 的 gd 都跳真实
+---   源码**。于是项目切换 = 同一工程内的 src 扩展, workspace_follow 的"换根"语义
+---   退役 (didChangeWorkspaceFolders 不再发送)。
+---
+--- 闸: 目标项目根与已注入集合的差集为空时静默 (nothing to add)。
 --- @param fname string|nil 缺省用当前缓冲名
---- @return boolean changed 是否发出了切换通知 (供测试断言)
+--- @return boolean changed 是否触发了注入
 function M.on_buf_enter(fname)
   local cfg = require("aosp-nav").config
   if not cfg.java or cfg.java.mode ~= "project" then return false end
@@ -90,33 +128,41 @@ function M.on_buf_enter(fname)
 
   local target, aosp = M.target(fname)
   if not target then return false end
-
   local client = M.client()
   -- 还没有 jdtls 在跑: 第一台的根由 root.lua 的 root_dir 函数负责, 这里不插手。
   if not client then return false end
 
-  local cur = root_of(client)
-  -- 已经在目标项目之内 (含"就是它"): 无事可做。
-  if cur and contains(target, cur) then return false end
+  -- [v18.7] project 模式的跨项目注入是**结构性不可行**: addToSourcePath 只接受
+  -- rootPaths 边界内的路径, 而 project 模式的 rootPaths=[单模块目录] —— 其他模块
+  -- 的根恒被 jdt.ls 拒绝 ("doesn't belong to any workspace", 2026-10-14 真机实锤)。
+  -- 明示边界, 不再静默发注定失败的请求。
+  require("aosp-nav.util.log").info(
+    "project mode indexes one module; cross-module jumps land in jars "
+      .. "(switch java.mode to 'aosp' for cross-module source navigation)")
 
-  local rel = require("aosp-nav.java.projects").rel(aosp, target)
-  client:notify("workspace/didChangeWorkspaceFolders", {
-    event = {
-      added = { { uri = "file://" .. target, name = rel ~= "" and rel or target } },
-      removed = cur and { { uri = "file://" .. cur, name = cur } } or {},
-    },
-  })
+  -- 目标项目的源码根 (相对目标项目) -> 相对 AOSP 根 (注入形态与 aosp 模式一致)
+  local ok_sr, roots = pcall(
+    require("aosp-nav.java.source_roots").find_for_project, target, {})
+  if not ok_sr or not roots or #roots == 0 then return false end
+  local batch = {}
+  for _, r in ipairs(roots) do
+    local abs = r:sub(1, 1) == "/" and r or (target .. "/" .. r)
+    local rel = require("aosp-nav.java.projects").rel(aosp, abs)
+    if rel ~= "" then batch[#batch + 1] = rel end
+  end
+  local fh = io.open("/home/yangwj12/aospnav-probe17/follow_trace.log", "a")
+  fh:write(os.date("%H:%M:%S ") .. ("target=%s roots=%d batch=%d"):format(
+    tostring(target), #roots, #batch) .. "\n"); fh:close()
+  if #batch == 0 then return false end
 
-  -- 换根是整份重导入, 用户必须知道接下来这一分钟为什么卡。
-  -- once 是**布尔**旗标, 去重键走 id (util/log.lua:71: id = opts.id or (opts.once and msg))。
-  -- 把字符串塞进 once 不会报错, 但去重键会退化成**消息正文** —— 同一个目标换一次文案
-  -- 就再弹一次 (实测 emitted=2)。键必须带 target 才兑现"每个目标只提醒一次"。
-  require("aosp-nav.util.log").user(
-    ("importing %s — cross-project jumps will land on jars; expect ~1 min"):format(
-      rel ~= "" and rel or target),
-    { once = true, id = "follow:" .. target })
-
-  return true
+  -- [v18.6] 注入走 aosp 运行期机制 (逐条 addToSourcePath + 完成后自动 reorder 提权);
+  -- tag=manual 使完成回调照实回报。pending 差集已在 source_apply 内处理。
+  local sa = require("aosp-nav.java.source_apply")
+  local ok_start = sa.start(client, aosp, batch, "manual", nil, fname)
+  local fh2 = io.open("/home/yangwj12/aospnav-probe17/follow_trace.log", "a")
+  fh2:write(os.date("%H:%M:%S ") .. ("start=%s batch=%d"):format(
+    tostring(ok_start), #batch) .. "\n"); fh2:close()
+  return ok_start and true or false
 end
 
 return M

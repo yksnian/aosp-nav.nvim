@@ -206,7 +206,12 @@ function M.workspace(fname)
   local ws_dir = ws.workspace_dir(bufname)
   if not ws_dir then return nil, {} end
   local names, seen = {}, {}
-  for _, root in ipairs({ rm.workspace_root(bufname), rm.aosp_root(bufname) }) do
+  -- [v18.2] project 模式下 workspace_root() 返回 nil, 而 -data 里的 invisible project
+  -- 是**按项目目录**命名的 (Wifi_xxx) —— 不把 project_dir 的名字加进候选, 磁盘
+  -- .classpath 永远读不到, 面板退化为 memory view、needs_reorder 恒 false。
+  for _, root in ipairs({
+    rm.project_dir(bufname), rm.workspace_root(bufname), rm.aosp_root(bufname),
+  }) do
     if root and root ~= "" and not seen[root] then
       seen[root] = true
       names[#names + 1] = ws.invisible_project_name(root)
@@ -225,8 +230,10 @@ function M.pending(fname)
   local j = cfg().java
   -- 运行期**累积**注入只在 mode == "aosp" 时开启。infer 一律不注入;
   -- project 注入的是**本项目自己的**根, 在导入时一次性下发, 不走这条累积路径。
-  if j.mode ~= "aosp" then
-    return nil, "java.mode must be \"aosp\" (current: "
+  -- [v18.6] project 模式同样走运行期增量 (workspace_follow 切项目时注入新项目根):
+  -- 两个模式的注入机制自此合一 (addToSourcePath + reorder), infer 仍不注入。
+  if j.mode ~= "aosp" and j.mode ~= "project" then
+    return nil, "java.mode must be \"aosp\" or \"project\" (current: "
       .. tostring(j.mode) .. ")", "mode"
   end
   local rm = require("aosp-nav.java.root")
@@ -520,7 +527,8 @@ end
 -- (2026-10-14 15:44 实测: anon-rss 8.2G 撞 -Xmx8G, 宿主同时挂着 -Xmx16G 的 VSCode
 -- jdtls, global OOM 把 nvim 的 jdtls SIGKILL)。可用内存不足时放弃本轮 —— 启动期的
 -- updateClasspath 冷态重写 (updateBinaries 重组) 本就会完成同样的提权, 承诺成立。
-local REORDER_MIN_AVAIL_KB = 4 * 1024 * 1024 -- 4GB
+local REORDER_MIN_AVAIL_KB = 6 * 1024 * 1024 -- 6GB (16G 宿主的一半; 被闸掉的提权由
+-- 下次启动的冷态重写兜底, 无损失。宿主内存升级后可放宽)
 
 --- 发重排通知。幂等性由调用方的 needs_reorder 前置检查保证; 通知本身可重复发
 --- (diff 消失后 $3 不再触发)。
@@ -531,7 +539,7 @@ local REORDER_MIN_AVAIL_KB = 4 * 1024 * 1024 -- 4GB
 function M.reorder(client, aosp_root, fname)
   local avail = host_mem_available_kb()
   if avail and avail < REORDER_MIN_AVAIL_KB then
-    log.info(("reorder skipped: %.1f GB memory available (need >= 4.0); "
+    log.info(("reorder skipped: %.1f GB memory available (need >= 6.0); "
       .. "the next jdtls start reorders it for free"):format(avail / 1048576))
     return false
   end
@@ -575,6 +583,9 @@ local function maybe_reorder(client, aosp_root, fname)
   end, 15000)
 end
 
+M.start = start -- [v18.6] 导出编排体: workspace_follow 的项目切换注入走同一链路
+                -- (逐条 addToSourcePath 建节点, 完成回调自动 reorder 提权)
+
 --- 增量注入入口 (手动, :Aosp!)。逐条 addToSourcePath 建节点, 完成后自动重排提权。
 --- @param opts table|nil { force = boolean }
 function M.apply(opts)
@@ -596,17 +607,27 @@ function M.apply(opts)
   end
   if not client then
     log.warn("no running jdtls client; start one and retry")
-    return
+    return false, "no-client"
   end
   if _running[client_key(client)] then
     log.info("an incremental apply is already running")
-    return
+    return false, "running"
   end
 
-  local pending, err = M.pending(fname)
+  -- [v18.13] 返回值供 apply_project_auto 判定成败 (失败不记账, 见其 defer 回调)。
+  -- 自动路径 (current_project) 的失败降为 once 提示: 撞上 "invisible project 未就绪"
+  -- (.classpath 尚未落盘, 新 -data 首导入中) 是**瞬态**, 下次 BufEnter 自然重试;
+  -- 每次都 warn 只会刷屏 (2026-10-15 工作站实测)。手动 :Aosp! 保持 warn (用户在等反馈)。
+  local pending, err, code = M.pending(fname)
   if not pending then
-    log.warn("cannot apply source roots incrementally: " .. err)
-    return
+    if opts.current_project then
+      log.warn("cannot apply source roots incrementally: " .. err
+        .. " (will retry on the next buffer switch)",
+        { once = true, id = "auto-pending:" .. tostring(code) })
+    else
+      log.warn("cannot apply source roots incrementally: " .. err)
+    end
+    return false, code
   end
   if #pending == 0 then
     -- [v17.1] 无 pending 根但磁盘 classpath 仍是 "src 追加在末尾" 形态 (上轮注入后
@@ -616,11 +637,13 @@ function M.apply(opts)
       local ar = require("aosp-nav.java.root").aosp_root(fname)
       if ar and client and M.reorder(client, ar, fname) then
         log.info("no pending roots; sent a reorder notification to promote appended roots")
-        return
+        return true
       end
     end
-    log.info("source roots already up to date (nothing to add)")
-    return
+    if not opts.current_project then
+      log.info("source roots already up to date (nothing to add)")
+    end
+    return true
   end
   -- 手动非 force: 保留旧的"超限即拒绝"形状 (绝不静默灌一大排 classpath 变更,
   -- 每条 addToSourcePath 都是一次 classpath 重建)。force (:Aosp!) 绕过。
@@ -634,13 +657,13 @@ function M.apply(opts)
       .. "pass on the next start); re-run as :Aosp! only if you need them now — it "
       .. "rebuilds the whole classpath per root and can exhaust the JVM heap.")
       :format(#pending, MAX_BATCH), { timeout = 12000 })
-    return
+    return false, "over-limit"
   end
 
   local aosp_root = require("aosp-nav.java.root").aosp_root(fname)
   if not aosp_root then
     log.warn("not inside an AOSP tree")
-    return
+    return false, "not-aosp"
   end
 
   -- [v17] 逐条 addToSourcePath (建节点 + 追加到 raw 末尾); 完成回调里若磁盘
@@ -650,13 +673,14 @@ function M.apply(opts)
   -- 通知后 8s 重算 / 13s 重排), 只是它**注不了新根** (资源树 exists() 过滤) 且
   -- sourcePaths 重算产物固定 src 在后。正确用法 = 逐条建根 + refLibs diff 重排。
   start(client, aosp_root, pending, "manual", nil, fname)
+  return true
 end
 
 -- ---------------------------------------------------------------------------
 --- [v16b] 按项目自动补根: BufEnter 到一个有 pending 根的模块时, 去抖 20s 后
 --- 只补**该模块**的根 (逐条 addToSourcePath, 模块根数少时代价可控)。闸门:
 ---   1. java.auto_project_apply ~= false (默认开);
----   2. 每会话每模块一次 (_project_applied);
+---   2. 每会话每模块**一次成功** (_project_applied; 失败回滚, 下次 BufEnter 重试);
 ---   3. 同模块连续 BufEnter 合并 (_proj_armed 去抖);
 ---   4. 执行体是 M.apply({force, current_project}) —— 复用全部既有闸 (_running 等)。
 --- 设计动机: "在哪个模块干活就当场补哪个模块", 不让用户敲命令, 也不做全量重建。
@@ -681,8 +705,11 @@ function M.apply_project_auto(fname)
   vim.defer_fn(function()
     _proj_armed[pre] = nil
     if _project_applied[key][pre] then return end
-    _project_applied[key][pre] = true
-    M.apply({ force = true, current_project = true, fname = fname })
+    -- [v18.13] 成功才记账: apply 失败 (最常见 = invisible project 未就绪, .classpath
+    -- 尚未落盘) 时回滚, 下次 BufEnter 重试 —— 旧实现先记账再执行, 一次瞬态失败就让
+    -- 该模块本会话永不再自动补根 (工作站实测: 通知出现一次后静默失效)。
+    local ok = M.apply({ force = true, current_project = true, fname = fname })
+    if not ok then _project_applied[key][pre] = nil end
   end, 20000)
 end
 

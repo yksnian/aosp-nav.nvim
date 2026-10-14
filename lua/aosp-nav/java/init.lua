@@ -237,12 +237,25 @@ function M.configure(opts, ctx)
     local user_root = opts.root_dir
     local base_fn = root_mod.jdtls_root_fn(user_root)
     local last_aosp = root_mod.aosp_root(bufname)
+    -- [v18.9] project 模式的重入键是 **project_dir**: 同一棵树内切项目 (Wifi ->
+    -- Connectivity) 时 aosp_root 不变, 但 sourcePaths 偏好必须跟着项目走 —— 否则
+    -- 重启/重放后新台的 initialize 还带着上一个项目的根, gd 全废 (2026-10-14
+    -- CleanWorkspace 后实测)。aosp 模式维持 aosp_root 键。
+    local last_project = root_mod.project_dir(bufname)
     local busy = false
     opts.root_dir = function(fname)
       local r = base_fn(fname)
       local a = r and root_mod.aosp_root(r) or nil
-      if a and a ~= last_aosp and not busy then
-        last_aosp = a
+      local pj = r and root_mod.project_dir(r) or nil
+      local changed
+      if cfg and cfg.java and cfg.java.mode == "project" then
+        changed = pj ~= nil and pj ~= last_project
+      else
+        changed = a ~= nil and a ~= last_aosp
+      end
+      if changed and not busy then
+        last_aosp = a or last_aosp
+        last_project = pj or last_project
         busy = true
         pcall(M.configure, opts, { fname = fname, reentry = true })
         busy = false
@@ -375,7 +388,13 @@ function M.configure(opts, ctx)
   -- source root 推断 (见 config.lua java.mode 注释)
   -- [v12] 会话隔离: limited 时**不注入** referencedLibraries (jar 库) —— 本窗口的
   -- classpath 与第一个窗口解耦, 也不去重建它。sourcePaths 因上面已置 nil 自然缺席。
-  local project_settings = { referencedLibraries = limited and {} or jars }
+  -- [v18] jars 为空 (树外项目) 时**不注入** referencedLibraries —— 显式空集会关掉
+  -- jdt.ls 的默认 lib/**/*.jar 引用, 树外项目将没有任何依赖 jar; 键缺席 = 默认行为。
+  -- 树内项目 (AOSP) 挂全树 jar: 模块依赖遍布树内, 单模块收集不现实 (见 jars.lua)。
+  local project_settings = {}
+  if not limited and jars and #jars > 0 then
+    project_settings.referencedLibraries = jars
+  end
   if source_paths and #source_paths > 0 then
     project_settings.sourcePaths = source_paths
   end
@@ -406,7 +425,9 @@ function M.configure(opts, ctx)
   -- 因此主注入 opts.jdtls.init_options.settings (LazyVim 环境),
   -- 辅注入 opts.init_options.settings (直接使用 nvim-jdtls 的环境)
   local import_extras = {}
-  if java_cfg.disable_gradle_import then
+  -- [v18] 只对 AOSP 项目禁 (is_android): 树外 gradle/maven 工程靠 importer 建
+  -- classpath, 禁了它们就什么都没有; exclusions 的 is_android 门槛在此对齐。
+  if java_cfg.disable_gradle_import and is_android then
     import_extras.gradle = { enabled = false }
     import_extras.maven = { enabled = false }
   end
@@ -512,17 +533,9 @@ function M.configure(opts, ctx)
   --     root_dir 函数只决定**第一台**的根 (它在 vim.lsp.start 时取一次值就固定),
   --     所以换项目只能靠发 workspace/didChangeWorkspaceFolders —— 这里就是那个入口。
   --     实测代价 (DEVELOPMENT §2.17): 换一次 = 整份重导入, 约 1 分钟。
-  --     只在 project 模式注册: 别的模式下这个钩子是纯开销。
-  if is_android and java_cfg.mode == "project" then
-    local grp = vim.api.nvim_create_augroup("aosp_nav_workspace_follow", { clear = true })
-    vim.api.nvim_create_autocmd("BufEnter", {
-      group = grp,
-      desc = "aosp-nav: re-root the running jdtls to the project of the current buffer",
-      callback = function()
-        require("aosp-nav.java.workspace_follow").on_buf_enter()
-      end,
-    })
-  end
+  --     [v18.8] 钩子退役: "每项目一台"方案下 root_dir 直接返回项目目录, nvim 层
+  --     自动复用/新起, 不再需要 didChangeWorkspaceFolders 换根
+  --     (workspace_follow.on_buf_enter 保留但不再挂载)。
 
   -- 10. 后台刷新残留 Eclipse 元数据排除 (不阻塞 jdtls 启动; 静默, 见函数注释)
   if is_android then
@@ -631,7 +644,9 @@ function M.configure(opts, ctx)
   --          那说明它在反复 sync 已注册的 Gradle 工程, 而
   --          java.import.gradle.enabled = false 只挡新导入, 唯一出路是重建。
   --     [v10] 判据用 "根是 AOSP 根" <=> mode ~= "project" (aosp 与 infer 都成立)。
-  if is_android and java_cfg.mode ~= "project" and root_path then
+  --     [v18] mode 门槛移除: project 模式同样创建 invisible project、换项目重导入
+  --     更频繁也更容易留下孤儿 jdtls, 空壳自清与孤儿回收的收益与 mode 无关。
+  if is_android and root_path then
     -- [#1 重构] 工作区元数据在 java/workspace.lua, JVM 实例盘点在 java/instances.lua;
     -- 这段自愈/自检逻辑是核心路径, 不再依赖展示层 (ui.lua)。
     local workspace = require("aosp-nav.java.workspace")

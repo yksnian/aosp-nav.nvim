@@ -11,7 +11,7 @@ local D = config.defaults
 -- ---------------------------------------------------------------------------
 -- d. 新键的默认值
 -- ---------------------------------------------------------------------------
-H.eq(D.java.mode, "aosp", "java.mode 默认 'aosp'")
+H.eq(D.java.mode, "project", "java.mode 默认 'project' ([v18.8] 每项目一台)")
 H.eq(D.log_level, "warn", "log_level 默认 'warn'")
 H.eq(D.java.source_apply_auto, true, "java.source_apply_auto 保持默认 true")
 -- [v10] 单批上限是 source_apply.lua 的模块常量 MAX_AUTO_ROOTS, **不是**配置键
@@ -33,7 +33,7 @@ local cfg = config.merge({ java = { mode = "bogus" } })
 local ok
 H.capture_notify(function() ok = config.validate(cfg) end)
 H.check(ok == true, "未知 java.mode: validate 返回 true (got " .. tostring(ok) .. ")")
-H.eq(cfg.java.mode, "aosp", "未知 java.mode 降级为 'aosp'")
+H.eq(cfg.java.mode, "project", "未知 java.mode 降级为 'project'")
 
 -- ---------------------------------------------------------------------------
 -- [v10] 旧键**静默丢弃**: 不映射到 java.mode, 也不提示。
@@ -43,11 +43,11 @@ local legacy = config.merge({ java = { workspace_mode = "project" } })
 local ok2
 H.capture_notify(function() ok2 = config.validate(legacy) end)
 H.check(ok2 == true, "旧 workspace_mode 配置: validate 返回 true (不打断 setup)")
-H.eq(legacy.java.mode, "aosp", "workspace_mode 被丢弃, java.mode 仍是默认值")
+H.eq(legacy.java.mode, "project", "workspace_mode 被丢弃, java.mode 仍是默认值")
 H.check(legacy.java.workspace_mode == nil, "workspace_mode 不出现在合并结果里")
 
 local legacy2 = config.merge({ java = { source_paths_mode = "infer" } })
-H.eq(legacy2.java.mode, "aosp", "source_paths_mode 被丢弃, 不影响 java.mode")
+H.eq(legacy2.java.mode, "project", "source_paths_mode 被丢弃, 不影响 java.mode")
 H.check(legacy2.java.source_paths_mode == nil, "source_paths_mode 不出现在合并结果里")
 
 -- 旧键不得干扰用户显式给的新值

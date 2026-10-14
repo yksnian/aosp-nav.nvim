@@ -120,9 +120,9 @@ else
 end
 
 -- 注入关闭时必须拒绝 (那条路的 sourcePaths 由导入期注入负责)。
--- source_apply 只读 java.mode (source_paths_mode 已被静默丢弃, 读它没有意义)。
+-- source_apply 只读 java.mode。 [v18.6] project 也走运行期注入了; 仍拒绝的只剩 infer。
 local saved_mode = nav.config.java.mode
-nav.config.java.mode = "project"
+nav.config.java.mode = "infer"
 local p2, e2 = sa.pending("/tmp/x.java")
 check(p2 == nil and type(e2) == "string" and e2:find("mode", 1, true) ~= nil,
   "pending refuses when injection is off (reason names the mode field)")

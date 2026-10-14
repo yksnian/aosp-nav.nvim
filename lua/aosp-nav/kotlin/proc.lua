@@ -172,15 +172,13 @@ function M.mark_session_active()
   -- Linux 下祖先链无需标记
 end
 
---- LspDetach(kotlin) 时调用: 本会话已无 KLS 客户端时**停掉巡检 timer** ——
---- 旧实现是空函数 (timer 常驻, 每 10 分钟空扫一次); 之后重新 attach 时
---- M.setup() 会把它再建起来。有 KLS 挂着 (多 .kt buffer 先后 detach) 则保留。
+--- LspDetach(kotlin) 时调用。
+--- [v18.11] **不再销毁巡检 timer** —— 旧实现停掉 + close + 置 nil, 依赖"重新 attach
+--- 时 M.setup() 再建", 但 setup 只在 configure (spec 求值) 时调用一次: :LspRestart
+--- 或最后一个 .kt buffer detach 后再开新的, 巡检整会话静默失效 (孤儿 KLS 永不清)。
+--- timer 改为常驻: 空扫成本为零 (有 KLS client 才扫描), 每 10 分钟一次可忽略。
 function M.on_detach()
-  if M._timer and #vim.lsp.get_clients({ name = "kotlin_language_server" }) == 0 then
-    M._timer:stop()
-    M._timer:close()
-    M._timer = nil
-  end
+  -- 保留 timer (见上); 无需任何动作
 end
 
 return M

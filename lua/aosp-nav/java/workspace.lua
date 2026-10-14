@@ -18,7 +18,18 @@ local M = {}
 --- @param fname string|nil 兜底推断工作区根的基准文件 (默认当前缓冲)
 --- @return string|nil
 function M.workspace_dir(fname)
+  -- [v18.8] 每项目一台: **当前 buffer 挂着的 client 优先** —— 遍历 [1] 会拿到别的
+  -- 项目的 -data (面板/视图串台)。
+  local cur = vim.api.nvim_buf_get_name(0)
+  local ordered = {}
   for _, c in ipairs(vim.lsp.get_clients({ name = "jdtls" })) do
+    if c.attached_buffers and cur ~= "" and c.attached_buffers[vim.fn.bufnr(cur)] then
+      table.insert(ordered, 1, c) -- 挂着当前 buffer 的排最前
+    else
+      ordered[#ordered + 1] = c
+    end
+  end
+  for _, c in ipairs(ordered) do
     local cmd = type(c.config) == "table" and c.config.cmd or nil
     if type(cmd) == "table" then
       for i, a in ipairs(cmd) do
@@ -41,10 +52,14 @@ end
 --- 供 session_conflict 复用 —— 它要问的是"我本该用哪个 `-data`"(而不是"现在有
 --- client 在用的那个"), 两处必须同一个口径。
 --- @param root string|nil
+--- @param root string|nil 项目/树根
+--- @param cache_base string|nil 缓存基准 (默认 vim.fn.stdpath("cache"); 测试/自定义
+---   cache_dir 时由调用方传入, 使归属判定与 clean_workspace 的 dir 同源)
 --- @return string|nil
-function M.expected_workspace_dir(root)
+function M.expected_workspace_dir(root, cache_base)
   if not root or root == "" then return nil end
-  return vim.fn.stdpath("cache") .. "/jdtls/" .. vim.fn.fnamemodify(root, ":t") .. "/workspace"
+  local base = (cache_base and cache_base ~= "") and cache_base or vim.fn.stdpath("cache")
+  return base .. "/jdtls/" .. vim.fn.fnamemodify(root, ":t") .. "/workspace"
 end
 
 --- jdt.ls 给 invisible project 起的名字:

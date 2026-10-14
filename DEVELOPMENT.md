@@ -1409,7 +1409,7 @@ root.project_dir(fname)  -- project 模式: 项目目录 (规整过的绝对路�
 用户改错一个字符串, 插件静默全灭。现在改为 **warn 一次 + 就近归一, 绝不中断**:
 
 ```
-未知 java.mode 值                        ──warn──▶  "aosp"
+未知 java.mode 值                        ──warn──▶  "project" ([v18.8] 每项目一台)
 java.source_paths_max_projects 非正整数  ──warn──▶  8
 ```
 

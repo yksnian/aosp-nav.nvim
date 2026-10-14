@@ -97,6 +97,9 @@ local user_root = function(fname)
   return vim.fs.root(dir, { ".project", ".git" })
 end
 local rf = root_mod.jdtls_root_fn(user_root)
+-- [v18] 默认已是 project; 本节的期望 (树外工程听用户的 root_dir / 反编译视图复用
+-- AOSP 根) 是 **aosp 模式**的语义, 显式设回 aosp 才能继续当回归测试。
+nav.config.java.mode = "aosp"
 
 H.eq(rf(JDT_URI), AOSP, "aosp 模式: jdt:// -> AOSP 根 (Neovim 才会复用而不是新起 JVM)")
 H.eq(rf(KLS_JAVA), AOSP, "aosp 模式: kls 的 /tmp/…java -> 也是 AOSP 根 (本次复测的回归点)")
@@ -117,6 +120,20 @@ H.eq(rf3(KLS_JAVA), AOSP, "用户 root_dir 返回 nil -> 复用现有 client")
 -- 用户函数抛错时不该炸, 同样落到兜底
 local boom = function() error("boom") end
 H.eq(root_mod.jdtls_root_fn(boom)(KLS_JAVA), AOSP, "用户 root_dir 抛错 -> 仍能复用")
+
+-- [v18.8] 回到新默认 (project): **每项目一台** —— 树内文件返回其所属项目目录
+-- (即便已有别的项目在跑; 用户 root_dir 让位), 由 root_dir fn 里的闲置回收与内存闸
+-- 控制 JVM 数量。树外无标记的文件仍走 live 复用兜底。
+nav.config.java.mode = "project"
+-- [v18.12] 内存闸读真实 /proc/meminfo: 宿主可用 <4GB 时 (测试机常态) 闸转 live 复用,
+-- 断言翻转。注入 nil (放行) —— root.lua 明示 _mem_avail_kb 可注入供测试。
+local real_mem = root_mod._mem_avail_kb
+root_mod._mem_avail_kb = function() return nil end
+H.eq(rf(proj_java), proj, "project 模式: 树内文件 -> 其所属项目目录 (每项目一台)")
+H.eq(rf2(proj_java), proj, "project 模式: 树内文件 p 命中 -> 项目目录优先 (每项目一台)")
+H.eq(rf2(JDT_URI), "/home/u/pinned", "project 模式: jdt:// 无项目归属 -> 用户 root_dir 有解 -> 听用户")
+H.eq(rf(JDT_URI), AOSP, "project 模式: jdt:// (nil_user) -> live 复用兜底")
+root_mod._mem_avail_kb = real_mem
 
 -- ---------------------------------------------------------------------------
 -- 4. 多台 client: 优先"上一个 buffer 挂着的那个"(跳转出发方), 否则用最新的
@@ -149,8 +166,6 @@ clients = { fake(AOSP) }
 local rf4 = root_mod.jdtls_root_fn(nil)
 H.eq(rf4(JDT_URI), AOSP, "project 模式: jdt:// 也复用现有 client")
 H.eq(rf4(KLS_JAVA), AOSP, "project 模式: kls 的 /tmp/…java 也复用")
-nav.config.java.mode = "aosp"
-
 vim.lsp.get_clients = real_get_clients
 vim.fn.delete(tmp, "rf")
 H.finish("t_root_fallback")

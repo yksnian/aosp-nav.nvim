@@ -109,14 +109,18 @@ M.defaults = {
     -- 之下的; 别的编辑器也用 jdtls, 缺了任何一条都不动它。设 false 关掉。
     kill_orphan_jdtls = true,
     -- [v10] 单一模式键 (取代旧的 workspace_mode + source_paths_mode 组合):
-    --   "aosp" (默认) = 工作区根是 AOSP 根 **且** 注入 sourcePaths (预置核心集
-    --     + 按打开项目累积)。跨模块跳转落到可编辑的真实 .java。
-    --   "project" = 工作区根是**当前 buffer 所属项目** (.git/.project 就近) 的
-    --     目录, 只索引这一个模块 (首次导入快); sourcePaths 注入的是**该项目自己的**
-    --     源码根 (不是核心集 —— 否则本项目里没打开过的类也会跳 jar)。
-    --     [v11] 换项目时自动把**运行中**的 jdtls 换过去
-    --     (workspace/didChangeWorkspaceFolders, 见 java/workspace_follow.lua),
-    --     不必重启 nvim —— 代价是每次切换整份重导入, 实测约 1 分钟。
+    --   "project" (默认, [v18.8]) = 工作区根是**当前 buffer 所属项目** (.git/.project
+    --     就近) 的目录, 只索引这一个模块 (首次导入快, 单模块量级内存)。**每个项目
+    --     一台 jdtls** (vscode 同款): 同项目的文件复用同台, 打开其他项目的文件时
+    --     自动另起一台 (各自 -data, 各自索引); 跨模块跳转落 jar —— jdt.ls 的
+    --     addToSourcePath 只认 rootPaths 边界内的路径 (三联实验
+    --     ~/aospnav-probe17, 2026-10-14), 单模块 root 无法扩展其他模块, 这是
+    --     设计使然而非缺陷。新台起前自动回收无附着 buffer 的闲置实例, 且有
+    --     宿主内存闸 (可用 <4GB 时退回已有台, 防全局 OOM)。
+    --   "aosp" = 工作区根是 AOSP 根 **且** 注入 sourcePaths (预置核心集 + 按打开
+    --     项目累积)。跨模块跳转落到可编辑的真实 .java (rootPaths=[AOSP 根], 全树
+    --     都在 addToSourcePath 边界内) —— 整树索引的内存代价由 reorder 内存闸兜底。
+    --     想要单 JVM 共享全树索引时显式选它。
     --   "infer" = **不对外宣传的基线模式** (v11 降级, 见 DEVELOPMENT.md §3):
     --     工作区根是 AOSP 根, 但不注入, 让 jdt.ls 逐文件推断源码根。
     --     它与 aosp 的**索引范围完全相同** (都是整棵树), 所以并不更快;
@@ -129,7 +133,7 @@ M.defaults = {
     -- 两个**不同**问题, 别合并成一个谓词:
     --   根是 AOSP 根  <=>  mode ~= "project"   (aosp 与 infer 都成立)
     --   开启注入      <=>  mode == "aosp"      (只有 aosp 成立)
-    mode = "aosp",
+    mode = "project",
     -- [v9] 累积到的源码根**自动**增量注入运行中的 jdtls 工作区
     -- (java.project.addToSourcePath, 见 java/source_apply.lua)。
     -- 关掉就退回旧行为: 只累积 + 提示, 手动 :Aosp!。
@@ -316,18 +320,18 @@ function M.validate(cfg)
   end
 
   -- [v10] java.mode 归一 (同上策略: 只降级提示, 绝不 return false)。
-  -- 不认识的 mode 回落 "aosp", 并通过 log.warn 只提示一次 —— 不是每次启动弹窗。
+  -- 不认识的 mode 回落默认值 ("project"), 并通过 log.warn 只提示一次 —— 不是每次启动弹窗。
   if cfg.java then
     local m = cfg.java.mode
     if m == nil then
-      cfg.java.mode = "aosp"
+      cfg.java.mode = "project"
     elseif not JAVA_MODES[m] then
       -- 提示里**只列 README 记的那两个值**: infer 是内部基线, 不引导用户去配它
       -- (它仍在 JAVA_MODES 里合法通过校验, 只是不作为"可选项"被宣传)。
-      log.warn(("java.mode = %q is not a valid value, falling back to 'aosp' "
-        .. "(one of: 'aosp' | 'project')")
+      log.warn(("java.mode = %q is not a valid value, falling back to 'project' "
+        .. "(one of: 'project' | 'aosp')")
         :format(tostring(m)), { once = true, id = "java_mode:" .. tostring(m) })
-      cfg.java.mode = "aosp"
+      cfg.java.mode = "project"
     end
 
     -- [v8] source_paths_max_projects 须为非负数字 (旧 normalize_modes 的行为, 保留)
