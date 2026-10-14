@@ -191,6 +191,10 @@ M.defaults = {
     make_jar_priority = { "classes.jar", "classes-header.jar", "javalib.jar" },
     -- Make 构建排除的 intermediates 目录名
     make_blacklist = { "android_stubs_current_intermediates" },
+    -- [v16b] BufEnter 到一个有 pending 源码根的模块时, 去抖 20s 后自动只补该模块
+    -- (逐条 addToSourcePath, 模块根数少时代价可控)。关掉则等下次启动经
+    -- initialize 一次性生效, 或手动 :Aosp! 全量注入 (代价大, 不推荐)。
+    auto_project_apply = true,
     -- [v8] DEPRECATED / 已失效: 浅层 source root 扫描 (旧 java/source_paths.lua)
     -- 已删除, 本键不再有任何效果 (设置时提示一次)。
     -- 要注入源码根请用上面的 core_source_roots / source_paths。

@@ -295,7 +295,7 @@ function M.diagnose()
   lines[#lines + 1] = line("source roots",
     ("installed=%d pending=%d (%s view)"):format(counts.installed, counts.pending, counts.view),
     counts.pending == 0,
-    counts.pending > 0 and ":Aosp! to apply them now (or wait for the automatic batch)" or nil)
+    counts.pending > 0 and ":AospCleanWorkspace to apply them all in one pass (src-first)" or nil)
 
   -- session state。indexing 是进行中, 不是失败 —— 给 nil (中性), 别标红吓人;
   -- 其余 phase 照旧: 只有 ready 算通过。
@@ -599,7 +599,10 @@ function M.rescan(import_root)
   end
 
   -- (2) jar 缓存重扫
-  local root = jar_root()
+  -- 复用 (1) 解析好的 iroot —— 无参 jar_root() 只认当前 buffer, 在 :Aosp 面板
+  -- buffer 上运行 :AospRescan 会误报 "no AOSP root detected" (且 exclusions/jars
+  -- 两段可能扫到不同的树)。
+  local root = jar_root(iroot)
   if not root then
     log.error("no AOSP root detected for current buffer")
     if exc_n then

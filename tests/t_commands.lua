@@ -1,7 +1,8 @@
--- t_commands.lua: 命令面 10 -> 4 的冻结契约, 后加 :AospDebug 变 5 (2026-10-10)。
+-- t_commands.lua: 命令面冻结契约, 后加 :AospDebug 变 5 (2026-10-10); [v16] 曾加
+-- :AospModule 变 6, 后移除 (模块级注入由 auto_project_apply 自动路径承担)。
 -- 保留: :Aosp / :AospDebug / :AospRescan / :AospCleanWorkspace / :AospCollectJars
 -- 删除: :AospStatus :AospDiagnostics :AospSourceRoots :AospApplySourceRoots
---       :AospImportExclusions :AospKlsClasspath :AospKillOrphanKls
+--       :AospImportExclusions :AospKlsClasspath :AospKillOrphanKls :AospModule
 -- :AospDebug 是唯一一次例外, 理由写在 plugin/aosp-nav.lua 头部 (活进程维度,
 -- 不能折进 :Aosp 的 bang)。
 local here = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h")
@@ -18,6 +19,7 @@ local DELETED = {
   "AospImportExclusions",
   "AospKlsClasspath",
   "AospKillOrphanKls",
+  "AospModule",
 }
 
 -- 触发命令注册。plugin/ 目录在 -u NONE 下不会自动 source; 若某些环境已经加载过,

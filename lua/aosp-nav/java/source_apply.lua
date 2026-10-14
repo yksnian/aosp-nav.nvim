@@ -71,6 +71,8 @@ local MAX_BATCH = 50
 -- URI, 50 条 = 50 次 classpath 变更, 每次都触发一轮 build/索引调度。自动路径
 -- 必须便宜: 单批 <=5, 其余的留到下个会话 (累积文件已持久化) 或用户手动 :Aosp!。
 local MAX_AUTO_ROOTS = 5
+local _project_applied = {} -- [v16b] [client_key][模块 rel] = true (每会话每模块一次)
+local _proj_armed = {}      -- [v16b] [模块 rel] = true (去抖)
 
 -- [v10] 就绪门控的轮询节奏与总预算。导入实测 ~3.5 分钟, 所以总预算要覆盖它;
 -- 服务器永久忙/死掉则在这个 deadline 后放弃并出声 (must-see, 见 M.report)。
@@ -428,13 +430,65 @@ local function start(client, aosp_root, batch, tag, deferred, fname)
   return true
 end
 
---- 增量注入入口 (手动, :Aosp!)。force = 允许超过 MAX_BATCH 的批量。
+--- [v14] :Aosp! 的一次性批量通道 (探针验证 2026-10-14, /tmp/aospnav_probe):
+--- `workspace/didChangeConfiguration` 修改 settings.java.invisibleProjectSourcePaths
+--- → jdt.ls 的 InvisibleProjectPreferenceChangeListener 对 invisible project 做
+--- **一次全量重算** (resolveClassPathEntries(src 全列表, ...) → setRawClasspath),
+--- 新根直接进 classpath 且 src 排在 jar 之前 —— 一条通知替代逐条 addToSourcePath
+--- (每条一次重建 × N)。实测: initialize 只带 s1..s5, 通知带新建的 s6 → _/s6 进
+--- classpath, 无需 CleanWorkspace。settings 必须**整体**下发 (POJO 反序列化),
+--- 因此合并 client.config.settings 与 init_options.settings 两个来源。
+--- @param client table jdtls client
+--- @param aosp_root string
+--- @param all_roots table|nil 显式根列表; nil = 全量 union
+--- @return boolean 是否已发出通知
+function M.apply_batch(client, aosp_root, all_roots)
+  local si = require("aosp-nav.java.source_inject")
+  local rels = all_roots
+    or si.union(require("aosp-nav").java, aosp_root) -- 主模块 .java = ensure-setup + 合并后配置
+  if not rels or #rels == 0 then
+    log.info("source roots already up to date (nothing to add)")
+    return false
+  end
+  local cfg = client.config or {}
+  local settings = vim.tbl_deep_extend("force",
+    vim.deepcopy(cfg.settings or {}),
+    vim.deepcopy(cfg.init_options and cfg.init_options.settings or {}))
+  settings.java = settings.java or {}
+  settings.java.project = settings.java.project or {}
+  settings.java.project.sourcePaths = rels
+  -- 探针验证的键 (Preferences POJO 字段名直映, jdt.ls 1.61.0)
+  settings.java.invisibleProjectSourcePaths = rels
+  -- Client:notify 是冒号方法 —— 点调用会把 method 错传进 self。
+  client:notify("workspace/didChangeConfiguration", { settings = settings })
+  -- listener 重算是异步 job; 账本按预期结果回填, 面板 disk view 会给出真值。
+  vim.defer_fn(function()
+    si.mark_installed(aosp_root, rels)
+  end, 3000)
+  log.user(("didChangeConfiguration: %d source root(s) sent for one-pass rebuild")
+    :format(#rels))
+  return true
+end
+
+--- 增量注入入口 (手动, :Aosp!)。force = 走 v14 批量通道 (一条通知一次重算)。
 --- @param opts table|nil { force = boolean }
 function M.apply(opts)
   opts = opts or {}
   local fname = (opts.fname and opts.fname ~= "") and opts.fname
     or vim.api.nvim_buf_get_name(0)
   local client = M.client(fname)
+  -- [v15] 面板/非树 buffer 上跑 :Aosp! 的早退修复: 树解析失败时回退到
+  -- jdtls client 的根 (单 jdtls 会话下安全), 与 ui.panel_basis 同思路 ——
+  -- 用户习惯在 :Aosp 面板 buffer 上直接敲 :Aosp!。
+  if not client then
+    local cands = vim.lsp.get_clients({ name = "jdtls" })
+    client = cands[1]
+    if client then
+      local r = client.root_dir
+      if not r or r == "" then r = client.config and client.config.root_dir end
+      if type(r) == "string" and r ~= "" then fname = r end
+    end
+  end
   if not client then
     log.warn("no running jdtls client; start one and retry")
     return
@@ -474,10 +528,50 @@ function M.apply(opts)
     return
   end
 
+  -- [v14→v15 终局] didChangeConfiguration 批量通道**不可用**: 真机日志实锤
+  -- (2026-10-14 12:22) —— classpath 条目存在 ≠ 可用, JDT 要求 .metadata 资源树
+  -- 有对应虚拟目录节点, 缺失即 969 "does not exist" (单次 validate 10.8s)。listener
+  -- 重算时 getSourcePaths 的 exists() 把资源树无节点的根全部过滤 (196 条只进 5);
+  -- 探针全进是因为全新 workspace 的首导入链路会为偏好根建节点。能建节点的只有
+  -- addToSourcePath (逐条重建) 与 CleanWorkspace 全新导入 (一次全量 src-first)。
+  -- apply_batch 保留供后续研究; force 回退逐条路径。
   start(client, aosp_root, pending, "manual", nil, fname)
 end
 
 -- ---------------------------------------------------------------------------
+--- [v16b] 按项目自动补根: BufEnter 到一个有 pending 根的模块时, 去抖 20s 后
+--- 只补**该模块**的根 (逐条 addToSourcePath, 模块根数少时代价可控)。闸门:
+---   1. java.auto_project_apply ~= false (默认开);
+---   2. 每会话每模块一次 (_project_applied);
+---   3. 同模块连续 BufEnter 合并 (_proj_armed 去抖);
+---   4. 执行体是 M.apply({force, current_project}) —— 复用全部既有闸 (_running 等)。
+--- 设计动机: "在哪个模块干活就当场补哪个模块", 不让用户敲命令, 也不做全量重建。
+--- @param fname string|nil 当前 buffer 文件
+function M.apply_project_auto(fname)
+  local java = require("aosp-nav").java
+  if not java or java.auto_project_apply == false then return end
+  if not fname or fname == "" then return end
+  local client = M.client(fname)
+  if not client then return end -- 非 jdtls buffer, 静默
+  local proj = vim.fs.root(fname, ".git")
+  if not proj then return end
+  local aosp = require("aosp-nav.java.root").aosp_root(fname)
+  if not aosp then return end
+  local pre = proj:sub(#aosp + 2)
+  if pre == "" then return end
+  local key = client_key(client)
+  _project_applied[key] = _project_applied[key] or {}
+  if _project_applied[key][pre] then return end
+  if _proj_armed[pre] then return end
+  _proj_armed[pre] = true
+  vim.defer_fn(function()
+    _proj_armed[pre] = nil
+    if _project_applied[key][pre] then return end
+    _project_applied[key][pre] = true
+    M.apply({ force = true, current_project = true, fname = fname })
+  end, 20000)
+end
+
 -- 自动路径: 累积到新根 / jdtls attach 时, 不等用户敲命令就增量注入。
 -- 三道闸 (都必须成立才动手):
 --   1. 就绪: client 已初始化且没有未完成的 $/progress (见 ready());

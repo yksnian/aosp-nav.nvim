@@ -57,13 +57,15 @@ end
 --- @param fname string|nil 文件路径或目录路径 (nil/空 = 用 cwd)
 --- @return string|nil root 规整后的绝对路径; nil = 非 AOSP
 function M.aosp_root(fname)
+  -- 热重载/清 package.loaded 后新模块实例的 config 可能为 nil (setup 未跑) ——
+  -- nil 时跳过 android_root 覆盖, 走自动检测, 不崩。
   local cfg = require("aosp-nav").config
   -- 起点归一 (见 util/path.lua): nil/"" -> cwd, 目录 -> 自身, 文件 -> 其目录。
   -- 从 AOSP 根目录直接打开时 fname 是目录, 也必须能起探测 (旧的手写
   -- `fname ~= ""` 守卫只挡住空串, 挡不住"目录当文件"的情形)。
   local path = require("aosp-nav.util.path").start_dir(fname)
 
-  local override = cfg.android_root
+  local override = cfg and cfg.android_root
   if override and override ~= "" then
     local o = normalize(override)
     -- 只在该覆盖目录确实包含当前文件时生效, 免得用户配了 AOSP 根之后

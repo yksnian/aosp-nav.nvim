@@ -1,12 +1,11 @@
 -- plugin/aosp-nav.lua: 命令注册 (lazy.nvim 自动加载 plugin/ 目录)
 --
--- 命令面有意收敛为五个 (旧版 10 个的合体):
+-- 命令面有意收敛 (旧版 10 个的合体):
 --   :Aosp                 信息面板 (status + diagnostics + source-roots 三合一)
 --   :AospDebug            活进程面板 (正在跑的 jdtls 的堆 / GC / 线程)
 --   :AospRescan           jar 缓存重扫 + import.exclusions 刷新
 --   :AospCleanWorkspace   删 jdtls (Eclipse) 工作区目录 (破坏性, 带确认)
 --   :AospCollectJars      收集 AOSP jars 供 jdtls 兜底
--- 计数由 nvim_create_user_command 的出现次数保证 (恰好 5)。
 --
 -- 为什么 :AospDebug 值得破例当第五个 (记录一下这条不变量是怎么松的):
 --   原 R2 定的调子是"不新增命令 —— 变体折进 :Aosp 的 bang"。那条现在仍然成立,

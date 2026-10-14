@@ -77,6 +77,23 @@ Eclipse 元数据手术台和进程管理器, 而 `java/init.lua`/`session_confl
   假象)。推论: restart 不清资源树 → 历史节点之外全被过滤; **:AospCleanWorkspace
   重建 → 全新导入, 注入根全部有效**。initialize 因此保持**全量 union** 注入, 运行
   期追加成功的根经 `mark_installed` 回填 pending 账本 (页面 pending 归零)。
+* **[v14] `:Aosp!` 改走 didChangeConfiguration 批量通道** (`source_apply.apply_batch`,
+  探针验证 2026-10-14): 反编译 `InvisibleProjectPreferenceChangeListener` + 隔离
+  `-data` 探针实测 —— `workspace/didChangeConfiguration` 修改
+  `settings.java.invisibleProjectSourcePaths` 会触发 invisible project 的**一次全量
+  重算** (resolveClassPathEntries(src 全列表) → setRawClasspath), 新根直接进
+  classpath 且 src 排 jar 之前, 对"磁盘存在、资源树无节点"的根**不做 exists 过滤**
+  (与 initialize 链行为不同)。一条通知替代逐条 addToSourcePath (每条一次重建 × N,
+  且排 jar 后)。settings 必须**整体**下发 (POJO 反序列化, 部分字段会置空), 故合并
+  client.config.settings 与 init_options.settings。探针: `/tmp/aospnav_probe/`
+  (probe3.lua), initialize 只带 s1..s5 → 通知带启动后新建的 s6 → `_`/s6 进
+  classpath。**真机终局判定 (12:22 mtime 证据)**: 通知发出 (client:notify 已调),
+  但 classpath 在 :Aosp! 时刻**零写入** (mtime 停在会话启动时刻) —— listener 重算
+  在真机上**未触发** (探针触发、真机不触发, 断点在 jdt.ls 的 Preferences.update →
+  listener fire 语义, 插件不可干预)。注意: 曾经的 "+5/196→5" 归因是错的 —— +5 与
+  MAX_AUTO_ROOTS 重合属巧合, 实为会话启动导入的产物。**通道只对探针型小/新
+  workspace 有效; :AospCleanWorkspace 是全量落地的唯一可靠通道**。apply_batch
+  代码保留备查, `:Aosp!` 回退逐条路径。
 
 两条时间线, 贯穿全部设计:
 

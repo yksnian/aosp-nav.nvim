@@ -471,6 +471,18 @@ function M.configure(opts, ctx)
     -- (累积那一刻的自动注入在 source_inject.apply 里; 关掉用 source_apply_auto)
     if java_cfg.source_apply_auto ~= false then
       local grp = vim.api.nvim_create_augroup("aosp_nav_source_apply", { clear = true })
+      vim.api.nvim_create_autocmd({ "BufEnter", "BufReadPost" }, {
+        group = grp,
+        pattern = "*.java",
+        callback = function(a)
+          local f = vim.api.nvim_buf_get_name(a.buf)
+          if f ~= "" then
+            vim.schedule(function()
+              require("aosp-nav.java.source_apply").apply_project_auto(f)
+            end)
+          end
+        end,
+      })
       vim.api.nvim_create_autocmd("LspAttach", {
         group = grp,
         callback = function(args)
