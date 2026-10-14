@@ -77,23 +77,33 @@ Eclipse 元数据手术台和进程管理器, 而 `java/init.lua`/`session_confl
   假象)。推论: restart 不清资源树 → 历史节点之外全被过滤; **:AospCleanWorkspace
   重建 → 全新导入, 注入根全部有效**。initialize 因此保持**全量 union** 注入, 运行
   期追加成功的根经 `mark_installed` 回填 pending 账本 (页面 pending 归零)。
-* **[v14] `:Aosp!` 改走 didChangeConfiguration 批量通道** (`source_apply.apply_batch`,
-  探针验证 2026-10-14): 反编译 `InvisibleProjectPreferenceChangeListener` + 隔离
-  `-data` 探针实测 —— `workspace/didChangeConfiguration` 修改
-  `settings.java.invisibleProjectSourcePaths` 会触发 invisible project 的**一次全量
-  重算** (resolveClassPathEntries(src 全列表) → setRawClasspath), 新根直接进
-  classpath 且 src 排 jar 之前, 对"磁盘存在、资源树无节点"的根**不做 exists 过滤**
-  (与 initialize 链行为不同)。一条通知替代逐条 addToSourcePath (每条一次重建 × N,
-  且排 jar 后)。settings 必须**整体**下发 (POJO 反序列化, 部分字段会置空), 故合并
-  client.config.settings 与 init_options.settings。探针: `/tmp/aospnav_probe/`
-  (probe3.lua), initialize 只带 s1..s5 → 通知带启动后新建的 s6 → `_`/s6 进
-  classpath。**真机终局判定 (12:22 mtime 证据)**: 通知发出 (client:notify 已调),
-  但 classpath 在 :Aosp! 时刻**零写入** (mtime 停在会话启动时刻) —— listener 重算
-  在真机上**未触发** (探针触发、真机不触发, 断点在 jdt.ls 的 Preferences.update →
-  listener fire 语义, 插件不可干预)。注意: 曾经的 "+5/196→5" 归因是错的 —— +5 与
-  MAX_AUTO_ROOTS 重合属巧合, 实为会话启动导入的产物。**通道只对探针型小/新
-  workspace 有效; :AospCleanWorkspace 是全量落地的唯一可靠通道**。apply_batch
-  代码保留备查, `:Aosp!` 回退逐条路径。
+* **[v14→v15→v17] didChangeConfiguration 通道的完整裁决** (2026-10-14, 三轮探针):
+  * [v14] 曾把 `:Aosp!` 接到 `sourcePaths` 批量通知; [v15] 以"真机零写入"回退。
+    **两个归因都不准** (探针17 字节码级复核, `~/aospnav-probe17/`):
+    * fire 链没有门控 —— `PreferenceManager.update` 无条件遍历 listener; "真机零写入"
+      的合理解释是当时通知早于工程导入完成 (`getJavaProjects()` 为空, 循环 0 次)。
+    * 该通道**注不了新源码根**: `InvisibleProjectPreferenceChangeListener` 重算时
+      `getSourcePaths` 的 `IFolder("_/"+rel).exists()` 把资源树无节点的根滤掉
+      (探针17 给 sourcePaths 加 `frameworks/base/media/java`, 重算后 src 段仍是
+      原 254 条, removed/added diff 均为空) —— 与 969 stale 同一道闸。
+    * sourcePaths 重算的组装 (`ProjectUtils.resolveClassPathEntries`) 固定产出
+      **非 source 原样保留 + source 追加到末尾** —— 即便触发成功也是 src 挪到
+      jar 后 ([v14] 探针"src 排 jar 之前"的记录是首导入瞬间的误读)。
+  * **[v17] 正确用法 = "referencedLibraries diff 重排通知"** (`source_apply.reorder`):
+    `StandardProjectsManager$3.preferencesChange` 只对 **referencedLibraries** 的
+    diff 反应 → `UpdateClasspathJob.updateClasspath()` (queue+1s) →
+    `doUpdateClasspath` → `collectBinaries(include/exclude)` + `updateBinaries` →
+    `setRawClasspath(非 lib 条目原序 + lib 一律排后)` ⇒ **src 全部提回 jar 前**,
+    顺带注入 jar 缓存的新增条目 (探针17 真机实测: 通知 +8s 重算、+13s 重排,
+    lib 1126→1276, src-first 恢复)。payload 只带 `java.project.referencedLibraries`
+    (include = jars 全量 + 一个**不存在的 no-op jar** —— `include` 是 Set, 重复项
+    不造成 diff, 不存在路径在 collectBinaries 里被 `Files.isRegularFile` 跳过),
+    **不带** `project.sourcePaths` 键 (updateFrom 逐键 setter, 键缺席 → POJO 保持
+    旧值 → sourcePaths diff 为假 → 不触发 2) 的多余重算)。settings 仍须整体下发。
+  * **最终工作流**: 补新根 = 逐条 `addToSourcePath` (建节点, auto/`:Aosp!`);
+    提权+jar 增量 = 完成后自动一条 reorder 通知 (`maybe_reorder`, 幂等:
+    磁盘 classpath `src-first` 时不发); `:AospCleanWorkspace` 只剩清 969 stale /
+    全新导入的整理场景。
 
 两条时间线, 贯穿全部设计:
 

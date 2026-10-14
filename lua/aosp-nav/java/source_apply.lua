@@ -79,6 +79,10 @@ local _proj_armed = {}      -- [v16b] [模块 rel] = true (去抖)
 local POLL_MS = 5000
 local AUTO_DEADLINE_MS = 300000
 
+-- [v17] 注入完成后等多久再做提权重排检查: 最后一条 addToSourcePath 的 setRawClasspath
+-- 要先落盘 (重建是异步的), 太早会读到旧顺序而漏发。
+local REORDER_DELAY_MS = 8000
+
 --- 获取当前配置
 local function cfg()
   return require("aosp-nav").config
@@ -408,6 +412,11 @@ local function start(client, aosp_root, batch, tag, deferred, fname)
     -- workspace", 不回填的话面板永远挂着 pending>0, 变相劝用户去做无意义的 :Aosp!
     if #s.added_rels > 0 then
       pcall(require("aosp-nav.java.source_inject").mark_installed, aosp_root, s.added_rels)
+      -- [v17] 逐条 addToSourcePath 的根追加在 raw 末尾 (jar 后)。等最后一条落盘后
+      -- 检查磁盘 classpath 顺序, 仍是 "src 在后" 就发一条重排通知提权 (见 reorder)。
+      vim.defer_fn(function()
+        pcall(maybe_reorder, client, aosp_root, fname)
+      end, REORDER_DELAY_MS)
     end
     if tag == "manual" then
       -- 用户敲的命令: 照实回报 (成功后是 log.info)
@@ -430,47 +439,143 @@ local function start(client, aosp_root, batch, tag, deferred, fname)
   return true
 end
 
---- [v14] :Aosp! 的一次性批量通道 (探针验证 2026-10-14, /tmp/aospnav_probe):
---- `workspace/didChangeConfiguration` 修改 settings.java.invisibleProjectSourcePaths
---- → jdt.ls 的 InvisibleProjectPreferenceChangeListener 对 invisible project 做
---- **一次全量重算** (resolveClassPathEntries(src 全列表, ...) → setRawClasspath),
---- 新根直接进 classpath 且 src 排在 jar 之前 —— 一条通知替代逐条 addToSourcePath
---- (每条一次重建 × N)。实测: initialize 只带 s1..s5, 通知带新建的 s6 → _/s6 进
---- classpath, 无需 CleanWorkspace。settings 必须**整体**下发 (POJO 反序列化),
---- 因此合并 client.config.settings 与 init_options.settings 两个来源。
+--- [v17] 重排通知: 一条 workspace/didChangeConfiguration 把 classpath 从
+--- "src 追加在 jar 后"整理回 "src 在 jar 前"。
+---
+--- 机制 (jdt.ls 1.61.0 字节码 + 真机 -data 探针 2026-10-14, ~/aospnav-probe17):
+---   didChangeConfiguration -> PreferenceManager.update -> 按注册序 fire 两个
+---   IPreferencesChangeListener:
+---     1) StandardProjectsManager$3 —— 只对 **referencedLibraries** 的 diff 有反应:
+---        UpdateClasspathJob.updateClasspath() (queue + 1s schedule) ->
+---        doUpdateClasspath -> collectBinaries(include/exclude) + updateBinaries ->
+---        setRawClasspath(**非 lib 条目原序** + lib 一律排后) => src 全部提回 jar 前,
+---        顺带把 jar 缓存的新增条目一并注入 (探针实测 lib 1126 -> 1276)。
+---     2) InvisibleProjectPreferenceChangeListener —— 只对 **sourcePaths** 的 diff
+---        有反应, 重算产物固定 [con, lib, src] (ProjectUtils.resolveClassPathEntries:
+---        非 source 原样保留 + source 追加到末尾), 要靠 1) 的 Job 来救。
+---   所以 payload **只带 referencedLibraries 差异, 不带 project.sourcePaths 键**:
+---   updateFrom 是 clone+逐键 setter, 键缺席则 POJO 字段保持旧值 -> 2) 的 diff 为假,
+---   不触发那趟多余的重算, 重排一步到位 (无中间恶化态)。
+---
+--- 边界 (探针实锤): 这条通道**注不了新源码根** —— 2) 的 getSourcePaths 会把资源树
+--- 没有节点的根过滤掉 (969 stale 的同一道闸; 探针给 sourcePaths 加
+--- frameworks/base/media/java, 重算后 src 段仍是原 254 条)。新根依旧走
+--- addToSourcePath 建节点, 本通道只负责"建完之后的提权 + jar 增量"。
+---
+--- settings 必须**整体**下发 (updateFrom 顶层浅替换, 缺键 = 配置丢失), 因此合并
+--- client.config.settings 与 init_options.settings 两个来源, 并显式删掉
+--- sourcePaths 键 (init_options 里可能带着它)。
+local NOP_JAR_SUFFIX = "/out/soong/.aospnav-reflib-nop.jar"
+
+--- 磁盘 .classpath 的 src/lib 相对位置。"src-behind" = 存在追加进来的源码根还没
+--- 提权 (needs_reorder 的依据); 读不到工程文件返回 nil。
+--- @param ws_dir string|nil jdtls -data 目录
+--- @param names table 候选工程名
+--- @return string|nil
+local function classpath_order(ws_dir, names)
+  if not ws_dir or ws_dir == "" then return nil end
+  for _, name in ipairs(names or {}) do
+    local f = ws_dir .. "/" .. name .. "/.classpath"
+    if vim.fn.filereadable(f) == 1 then
+      -- [v17.1] 判据 = **最后一个** src 条目与首个 lib 条目的相对位置, 不能用首个 src:
+      -- addToSourcePath 把新根追加到 raw 末尾 (jar 之后), 首个 src 仍在 lib 前 —— 只看
+      -- 首 src 会把"健康 src 段 + 末尾追加根"误判成 src-first, reorder 永远不触发
+      -- (2026-10-14 Telephony 实锤: root 在 1384 行 / 首 lib 258 行, needs_reorder=false)。
+      local first_lib, last_src
+      for i, line in ipairs(vim.fn.readfile(f)) do
+        if line:find('kind="src"', 1, true) then
+          last_src = i
+        elseif not first_lib and line:find('kind="lib"', 1, true) then
+          first_lib = i
+        end
+      end
+      if first_lib then
+        if not last_src then return "src-first" end -- 只有 lib 没有 src: 无需重排
+        return last_src < first_lib and "src-first" or "src-behind"
+      end
+      return nil
+    end
+  end
+  return nil
+end
+
+--- 该树是否需要重排 (供 :Aosp 面板/调用方询问)。
+--- @param fname string|nil
+--- @return boolean
+function M.needs_reorder(fname)
+  local ws_dir, names = M.workspace(fname)
+  return classpath_order(ws_dir, names) == "src-behind"
+end
+
+--- 宿主可用内存 (KB), 读不到返回 nil。
+local function host_mem_available_kb()
+  for _, l in ipairs(vim.fn.readfile("/proc/meminfo")) do
+    local kb = l:match("^MemAvailable:%s+(%d+)")
+    if kb then return tonumber(kb) end
+  end
+  return nil
+end
+
+-- [v17.2] reorder 的内存闸: 索引热态下的全量重排 + 全工程 revalidate 峰值可达堆顶
+-- (2026-10-14 15:44 实测: anon-rss 8.2G 撞 -Xmx8G, 宿主同时挂着 -Xmx16G 的 VSCode
+-- jdtls, global OOM 把 nvim 的 jdtls SIGKILL)。可用内存不足时放弃本轮 —— 启动期的
+-- updateClasspath 冷态重写 (updateBinaries 重组) 本就会完成同样的提权, 承诺成立。
+local REORDER_MIN_AVAIL_KB = 4 * 1024 * 1024 -- 4GB
+
+--- 发重排通知。幂等性由调用方的 needs_reorder 前置检查保证; 通知本身可重复发
+--- (diff 消失后 $3 不再触发)。
 --- @param client table jdtls client
 --- @param aosp_root string
---- @param all_roots table|nil 显式根列表; nil = 全量 union
---- @return boolean 是否已发出通知
-function M.apply_batch(client, aosp_root, all_roots)
-  local si = require("aosp-nav.java.source_inject")
-  local rels = all_roots
-    or si.union(require("aosp-nav").java, aosp_root) -- 主模块 .java = ensure-setup + 合并后配置
-  if not rels or #rels == 0 then
-    log.info("source roots already up to date (nothing to add)")
+--- @param fname string|nil jars 缓存定位基准
+--- @return boolean 是否已发出
+function M.reorder(client, aosp_root, fname)
+  local avail = host_mem_available_kb()
+  if avail and avail < REORDER_MIN_AVAIL_KB then
+    log.info(("reorder skipped: %.1f GB memory available (need >= 4.0); "
+      .. "the next jdtls start reorders it for free"):format(avail / 1048576))
+    return false
+  end
+  local jars = require("aosp-nav.java.jars").find_android_jars({ fname = fname })
+  if not jars or #jars == 0 then
+    log.debug("reorder skipped: no jars in cache")
     return false
   end
   local cfg = client.config or {}
   local settings = vim.tbl_deep_extend("force",
     vim.deepcopy(cfg.settings or {}),
     vim.deepcopy(cfg.init_options and cfg.init_options.settings or {}))
+  local inc = vim.deepcopy(jars)
+  inc[#inc + 1] = aosp_root .. NOP_JAR_SUFFIX
   settings.java = settings.java or {}
   settings.java.project = settings.java.project or {}
-  settings.java.project.sourcePaths = rels
-  -- 探针验证的键 (Preferences POJO 字段名直映, jdt.ls 1.61.0)
-  settings.java.invisibleProjectSourcePaths = rels
+  settings.java.project.referencedLibraries = { include = inc }
+  -- 故意不带 sourcePaths 键 (连 init_options 里带来的也删掉): 见函数头。
+  settings.java.project.sourcePaths = nil
   -- Client:notify 是冒号方法 —— 点调用会把 method 错传进 self。
   client:notify("workspace/didChangeConfiguration", { settings = settings })
-  -- listener 重算是异步 job; 账本按预期结果回填, 面板 disk view 会给出真值。
-  vim.defer_fn(function()
-    si.mark_installed(aosp_root, rels)
-  end, 3000)
-  log.user(("didChangeConfiguration: %d source root(s) sent for one-pass rebuild")
-    :format(#rels))
+  log.debug(("reorder notification sent (%d jars + 1 no-op)"):format(#jars))
   return true
 end
 
---- 增量注入入口 (手动, :Aosp!)。force = 走 v14 批量通道 (一条通知一次重算)。
+--- 逐条注入完成后的提权动作: 磁盘 classpath 仍是 "src 在 jar 后" 才发。
+--- 通知后 defer 复检一次 (Job 有 1s schedule + 重排耗时), 仍失败只留 debug ——
+--- 下次任何一轮 apply 成功都会再试, 用户无需手动干预。
+--- @param client table
+--- @param aosp_root string
+--- @param fname string|nil
+local function maybe_reorder(client, aosp_root, fname)
+  local ws_dir, names = M.workspace(fname)
+  if classpath_order(ws_dir, names) ~= "src-behind" then return end
+  if not M.reorder(client, aosp_root, fname) then return end
+  vim.defer_fn(function()
+    local ws2, names2 = M.workspace(fname)
+    if classpath_order(ws2, names2) == "src-behind" then
+      log.debug("reorder notification did not reorder the classpath yet; will retry on next apply")
+    end
+  end, 15000)
+end
+
+--- 增量注入入口 (手动, :Aosp!)。逐条 addToSourcePath 建节点, 完成后自动重排提权。
 --- @param opts table|nil { force = boolean }
 function M.apply(opts)
   opts = opts or {}
@@ -504,6 +609,16 @@ function M.apply(opts)
     return
   end
   if #pending == 0 then
+    -- [v17.1] 无 pending 根但磁盘 classpath 仍是 "src 追加在末尾" 形态 (上轮注入后
+    -- reorder 因任何原因没跑成) 时, 补发一次重排提权 —— 否则那个形态会一直卡着:
+    -- auto/:Aosp! 都因 pending=0 提前返回, 永远轮不到 maybe_reorder。
+    if M.needs_reorder(fname) then
+      local ar = require("aosp-nav.java.root").aosp_root(fname)
+      if ar and client and M.reorder(client, ar, fname) then
+        log.info("no pending roots; sent a reorder notification to promote appended roots")
+        return
+      end
+    end
     log.info("source roots already up to date (nothing to add)")
     return
   end
@@ -528,13 +643,12 @@ function M.apply(opts)
     return
   end
 
-  -- [v14→v15 终局] didChangeConfiguration 批量通道**不可用**: 真机日志实锤
-  -- (2026-10-14 12:22) —— classpath 条目存在 ≠ 可用, JDT 要求 .metadata 资源树
-  -- 有对应虚拟目录节点, 缺失即 969 "does not exist" (单次 validate 10.8s)。listener
-  -- 重算时 getSourcePaths 的 exists() 把资源树无节点的根全部过滤 (196 条只进 5);
-  -- 探针全进是因为全新 workspace 的首导入链路会为偏好根建节点。能建节点的只有
-  -- addToSourcePath (逐条重建) 与 CleanWorkspace 全新导入 (一次全量 src-first)。
-  -- apply_batch 保留供后续研究; force 回退逐条路径。
+  -- [v17] 逐条 addToSourcePath (建节点 + 追加到 raw 末尾); 完成回调里若磁盘
+  -- classpath 仍是 "src 在 jar 后" 会自动发一条重排通知提权 (见 maybe_reorder)。
+  -- 历史: v14 曾把 force 接到 didChangeConfiguration 的 sourcePaths 批量通道,
+  -- v15 以"真机零写入"为由回退 —— 两个归因都不准: 通道本身能触发 (探针17 实锤
+  -- 通知后 8s 重算 / 13s 重排), 只是它**注不了新根** (资源树 exists() 过滤) 且
+  -- sourcePaths 重算产物固定 src 在后。正确用法 = 逐条建根 + refLibs diff 重排。
   start(client, aosp_root, pending, "manual", nil, fname)
 end
 
