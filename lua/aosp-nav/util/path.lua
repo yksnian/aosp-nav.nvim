@@ -16,10 +16,16 @@ local M = {}
 --- @param fname string|nil 通常是 vim.api.nvim_buf_get_name(0)
 --- @return string 绝对或相对目录路径 (拿不到时退化为 cwd)
 function M.start_dir(fname)
-  if type(fname) ~= "string" or fname == "" then return vim.fn.getcwd() end
-  if vim.fn.isdirectory(fname) == 1 then return fname end
+  if type(fname) ~= "string" or fname == "" then
+    return vim.fn.getcwd()
+  end
+  if vim.fn.isdirectory(fname) == 1 then
+    return fname
+  end
   local d = vim.fs.dirname(fname)
-  if type(d) ~= "string" or d == "" then return vim.fn.getcwd() end
+  if type(d) ~= "string" or d == "" then
+    return vim.fn.getcwd()
+  end
   return d
 end
 

@@ -105,11 +105,17 @@ end
 --- @return string|nil
 local function to_rel(aosp_root, abs)
   -- 根为空 = 答不上来 (异步回调可能落在一次 reset 之后)
-  if not aosp_root or aosp_root == "" then return nil end
+  if not aosp_root or aosp_root == "" then
+    return nil
+  end
   abs = (abs:gsub("/+$", ""))
-  if abs == aosp_root then return "." end
+  if abs == aosp_root then
+    return "."
+  end
   local prefix = aosp_root .. "/"
-  if abs:sub(1, #prefix) ~= prefix then return nil end
+  if abs:sub(1, #prefix) ~= prefix then
+    return nil
+  end
   return abs:sub(#prefix + 1)
 end
 
@@ -129,14 +135,18 @@ end
 --- @return table rel 相对路径列表
 local function core_rel(cfg, aosp_root)
   local out = {}
-  if not aosp_root or aosp_root == "" then return out end
+  if not aosp_root or aosp_root == "" then
+    return out
+  end
   for _, rel in ipairs(cfg.core_source_roots or {}) do
     local abs = rel:sub(1, 1) == "/" and rel or (aosp_root .. "/" .. rel)
     abs = abs:gsub("/+$", "")
     if vim.fn.isdirectory(abs) == 1 then
       local r = to_rel(aosp_root, abs)
       -- 用户配了 AOSP 树外的绝对路径: 对 invisible project 无意义, 丢弃
-      if r then out[#out + 1] = r end
+      if r then
+        out[#out + 1] = r
+      end
     end
   end
   return out
@@ -152,7 +162,9 @@ local function project_rel(aosp_root, project, roots)
   for _, rel in ipairs(roots or {}) do
     local abs = rel:sub(1, 1) == "/" and rel or (project .. "/" .. rel)
     local r = to_rel(aosp_root, abs)
-    if r then out[#out + 1] = r end
+    if r then
+      out[#out + 1] = r
+    end
   end
   return out
 end
@@ -166,13 +178,17 @@ end
 --- @return table rel 相对路径列表
 function M.to_workspace_relative(list, root)
   local out = {}
-  if type(list) ~= "table" then return out end
+  if type(list) ~= "table" then
+    return out
+  end
   for _, v in ipairs(list) do
     if type(v) == "string" and v ~= "" then
       if v:sub(1, 1) == "/" then
         if root and root ~= "" then
           local r = to_rel((root:gsub("/+$", "")), v)
-          if r then out[#out + 1] = r end
+          if r then
+            out[#out + 1] = r
+          end
         end
       else
         out[#out + 1] = (v:gsub("/+$", ""))
@@ -204,7 +220,9 @@ function M.union(cfg, aosp_root)
   -- 核心集在前: 排序不影响 jdt.ls 的解析 (它把 sourcePaths 塞进 HashSet,
   -- 注入顺序被丢弃), 只是让诊断输出稳定可读
   add(core_rel(cfg, aosp_root))
-  if not aosp_root or aosp_root == "" then return out end
+  if not aosp_root or aosp_root == "" then
+    return out
+  end
   for _, p in ipairs(_order[aosp_root] or {}) do
     add(project_rel(aosp_root, p, _projects[p] or {}))
   end
@@ -244,7 +262,9 @@ end
 --- @param aosp_root string
 local function evict(cfg, aosp_root)
   local max = cfg.source_paths_max_projects or 0
-  if max <= 0 then return end
+  if max <= 0 then
+    return
+  end
   local o = order_of(aosp_root)
   while #o > max do
     local old = table.remove(o, 1)
@@ -258,13 +278,19 @@ end
 --- @param project string|nil
 --- @param keep_order boolean|nil true = 按磁盘读回的顺序放置, 不当作"刚用过"
 local function seed_project(cfg, aosp_root, project, keep_order)
-  if not project or _projects[project] then return end
+  if not project or _projects[project] then
+    return
+  end
   -- 只收本树的项目: 跨树条目在这里就被挡掉。旧实现没有这道闸, 于是另一棵树的
   -- 项目被塞进本树的 LRU, 相对路径算不出来 -> 变成"0 根"的空壳占着名额。
-  if not to_rel(aosp_root, project) then return end
+  if not to_rel(aosp_root, project) then
+    return
+  end
   local roots = require("aosp-nav.java.source_roots").load(project)
-  if not roots then return end
-  _projects[project] = roots          -- 原始(项目相对)根, 派生推迟到 union
+  if not roots then
+    return
+  end
+  _projects[project] = roots -- 原始(项目相对)根, 派生推迟到 union
   if keep_order then
     order_of(aosp_root)[#order_of(aosp_root) + 1] = project
   else
@@ -282,21 +308,31 @@ end
 --- @return string|nil
 local function projects_file(aosp_root)
   local cfg = get_cfg()
-  if not cfg.cache_dir or not aosp_root or aosp_root == "" then return nil end
+  if not cfg.cache_dir or not aosp_root or aosp_root == "" then
+    return nil
+  end
   -- 键规则与 jars/source_roots 一致 ([#8] 单射, 两棵不同的树不再同键)
-  return cfg.cache_dir .. "/source_inject-projects-"
-    .. require("aosp-nav.util.path").cache_key(aosp_root) .. ".txt"
+  return cfg.cache_dir
+    .. "/source_inject-projects-"
+    .. require("aosp-nav.util.path").cache_key(aosp_root)
+    .. ".txt"
 end
 
 --- 写某棵树的累积项目顺序 (一行一个绝对路径, 老的在前)
 --- @param aosp_root string
 function M.persist(aosp_root)
   local f = projects_file(aosp_root)
-  if not f then return end
+  if not f then
+    return
+  end
   vim.fn.mkdir(get_cfg().cache_dir, "p")
   local fh = io.open(f, "w")
-  if not fh then return end
-  for _, p in ipairs(_order[aosp_root] or {}) do fh:write(p, "\n") end
+  if not fh then
+    return
+  end
+  for _, p in ipairs(_order[aosp_root] or {}) do
+    fh:write(p, "\n")
+  end
   fh:close()
 end
 
@@ -307,9 +343,13 @@ end
 --- @return table
 local function load_order(aosp_root)
   local f = projects_file(aosp_root)
-  if not f then return {} end
+  if not f then
+    return {}
+  end
   local fh = io.open(f, "r")
-  if not fh then return {} end
+  if not fh then
+    return {}
+  end
   local out = {}
   for line in fh:lines() do
     if line ~= "" and vim.fn.isdirectory(line) == 1 and to_rel(aosp_root, line) then
@@ -329,8 +369,12 @@ end
 --- @return table|nil union 非空时才返回 (空列表绝不能注入)
 function M.inject_sync(cfg, aosp_root, fname)
   -- 注入开启 <=> mode == "aosp" (infer/project 模式不下发 sourcePaths)
-  if cfg.mode ~= "aosp" then return nil end
-  if not aosp_root or aosp_root == "" then return nil end
+  if cfg.mode ~= "aosp" then
+    return nil
+  end
+  if not aosp_root or aosp_root == "" then
+    return nil
+  end
   _last_root = aosp_root
 
   -- 上个会话累积的项目按 LRU 顺序读回来 (只读缓存, 不扫描; 已不存在的目录会被跳过)。
@@ -359,7 +403,9 @@ function M.inject_sync(cfg, aosp_root, fname)
   -- -data 重建 → 全新导入, 全部注入根有效** (src=280 实测) —— 注入必须保持全量,
   -- 任何裁剪都会白白砍掉 CleanWorkspace 的全量收益。
   local list = M.union(cfg, aosp_root)
-  if #list == 0 then return nil end
+  if #list == 0 then
+    return nil
+  end
   _installed[aosp_root] = list
   _accumulated[aosp_root] = list
   return list
@@ -369,8 +415,12 @@ end
 --- @param fname string
 function M.on_file(fname)
   local cfg = get_cfg().java
-  if cfg.mode ~= "aosp" then return end
-  if not fname or fname == "" then return end
+  if cfg.mode ~= "aosp" then
+    return
+  end
+  if not fname or fname == "" then
+    return
+  end
 
   -- 热路径: 按目录记忆 AOSP 根与项目根 (两者都是纯路径推断, 与文件内容无关)
   local dir = vim.fn.fnamemodify(fname, ":h")
@@ -388,7 +438,9 @@ function M.on_file(fname)
 
   local project = probe.project
   local aosp_root = probe.aosp_root
-  if not project or not aosp_root then return end
+  if not project or not aosp_root then
+    return
+  end
   _last_root = aosp_root
 
   if _projects[project] then
@@ -400,12 +452,16 @@ function M.on_file(fname)
   local gen = _generation
   require("aosp-nav.java.source_roots").scan_async(project, function(roots, stats)
     -- reset() 之后的过期结果: 丢弃, 否则会把刚清空的累积又写回去
-    if gen ~= _generation then return end
+    if gen ~= _generation then
+      return
+    end
     -- 扫描失败 (nil): 不记录, 下次 BufEnter 重试
-    if not roots then return end
+    if not roots then
+      return
+    end
     local sr = require("aosp-nav.java.source_roots")
     sr.save(project, roots, stats)
-    _projects[project] = roots            -- 原始(项目相对)根, 派生推迟到 union
+    _projects[project] = roots -- 原始(项目相对)根, 派生推迟到 union
     touch(aosp_root, project)
     evict(get_cfg(), aosp_root)
     -- 落盘: 累积的项目只能靠下次启动生效, 顺序必须持久化
@@ -417,8 +473,12 @@ end
 --- 安装 BufEnter/BufReadPost 钩子 (幂等)
 --- @param cfg table java 段配置
 function M.setup(cfg)
-  if _setup_done then return end
-  if not cfg or cfg.mode ~= "aosp" then return end
+  if _setup_done then
+    return
+  end
+  if not cfg or cfg.mode ~= "aosp" then
+    return
+  end
   _setup_done = true
 
   local group = vim.api.nvim_create_augroup("aosp_nav_source_inject", { clear = true })
@@ -440,9 +500,13 @@ end
 --- @param b table|nil
 --- @return boolean
 local function same_list(a, b)
-  if not a or not b or #a ~= #b then return false end
+  if not a or not b or #a ~= #b then
+    return false
+  end
   for i = 1, #a do
-    if a[i] ~= b[i] then return false end
+    if a[i] ~= b[i] then
+      return false
+    end
   end
   return true
 end
@@ -452,7 +516,9 @@ end
 ---   窗口里用户可能已经切到另一棵树, 读"当前 buffer"会张冠李戴)
 function M.schedule_apply(fname)
   local root = require("aosp-nav.java.root").aosp_root(fname) or ""
-  if _debounce[root] then return end
+  if _debounce[root] then
+    return
+  end
   _debounce[root] = true
   vim.defer_fn(function()
     _debounce[root] = nil
@@ -466,16 +532,24 @@ end
 --- @return number added 本次新增的条目数 (0 = 无变化)
 function M.apply(fname)
   local cfg = get_cfg().java
-  if cfg.mode ~= "aosp" then return 0 end
+  if cfg.mode ~= "aosp" then
+    return 0
+  end
   local rm = require("aosp-nav.java.root")
   fname = (fname and fname ~= "") and fname or vim.api.nvim_buf_get_name(0)
   local aosp_root = rm.aosp_root(fname)
-  if not aosp_root or aosp_root == "" then return 0 end
+  if not aosp_root or aosp_root == "" then
+    return 0
+  end
 
   local list = M.union(cfg, aosp_root)
   -- 空列表绝不能注入: 它会关掉 jdt.ls 的逐文件推断又没有替代
-  if #list == 0 then return 0 end
-  if same_list(_accumulated[aosp_root], list) then return 0 end
+  if #list == 0 then
+    return 0
+  end
+  if same_list(_accumulated[aosp_root], list) then
+    return 0
+  end
 
   local before = _accumulated[aosp_root] and #_accumulated[aosp_root] or 0
   _accumulated[aosp_root] = list
@@ -494,7 +568,9 @@ end
 --- @return number
 function M.pending_count(aosp_root)
   aosp_root = aosp_root or _last_root
-  if not aosp_root then return 0 end
+  if not aosp_root then
+    return 0
+  end
   local acc = _accumulated[aosp_root] and #_accumulated[aosp_root] or 0
   local ins = _installed[aosp_root] and #_installed[aosp_root] or 0
   return math.max(0, acc - ins)
@@ -508,10 +584,14 @@ end
 --- @param aosp_root string|nil
 --- @param rels table|nil 本次成功写入的相对路径列表
 function M.mark_installed(aosp_root, rels)
-  if not aosp_root or aosp_root == "" or not rels or #rels == 0 then return end
+  if not aosp_root or aosp_root == "" or not rels or #rels == 0 then
+    return
+  end
   local cur = _installed[aosp_root] or {}
   local seen = {}
-  for _, r in ipairs(cur) do seen[r] = true end
+  for _, r in ipairs(cur) do
+    seen[r] = true
+  end
   for _, r in ipairs(rels) do
     if not seen[r] then
       seen[r] = true
@@ -520,7 +600,6 @@ function M.mark_installed(aosp_root, rels)
   end
   _installed[aosp_root] = cur
 end
-
 
 --- 清空累积 (供 :AospRescan)。
 --- 传 aosp_root 时**只清那棵树**: 多树下"重扫 A 树"不该顺手忘掉 B 树攒的项目。
@@ -544,7 +623,9 @@ function M.reset(aosp_root)
   _installed[aosp_root] = nil
   _accumulated[aosp_root] = nil
   _probe = {}
-  if _last_root == aosp_root then _last_root = nil end
+  if _last_root == aosp_root then
+    _last_root = nil
+  end
   -- 清空磁盘上的累积顺序: :AospRescan 的语义是"忘掉之前攒的项目"
   M.persist(aosp_root)
 end
@@ -589,12 +670,18 @@ end
 --- @return string|nil abs 命中时的绝对路径
 function M.source_file_for_rel(rel, aosp_root)
   local root = aosp_root or _last_root
-  if not root or root == "" then return nil end
-  if type(rel) ~= "string" or rel == "" then return nil end
+  if not root or root == "" then
+    return nil
+  end
+  if type(rel) ~= "string" or rel == "" then
+    return nil
+  end
   local cfg = get_cfg().java
   for _, r in ipairs(M.union(cfg, root)) do
     local abs = root .. "/" .. r .. "/" .. rel
-    if vim.fn.filereadable(abs) == 1 then return abs end
+    if vim.fn.filereadable(abs) == 1 then
+      return abs
+    end
   end
   return nil
 end

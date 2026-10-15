@@ -6,18 +6,18 @@ local M = {}
 local log = require("aosp-nav.util.log")
 
 -- 缓存格式版本: 过滤算法/缓存布局升级时 bump, 旧缓存自动作废重扫
-local CACHE_VERSION = 6  -- v6: filters 指纹进缓存头 + 目录优先级排序
-                         --      + %-headers 桩家族排除 (默认值在 config.lua)
+local CACHE_VERSION = 6 -- v6: filters 指纹进缓存头 + 目录优先级排序
+--      + %-headers 桩家族排除 (默认值在 config.lua)
 
 -- 模块级缓存状态 [#3 重构]: **按 AOSP 树分区**。双树会话里交替打开两个树的文件
 -- 不再把对方的内存缓存挤掉 (旧版单槽, 每次切树都重读整份文件缓存)。
-local _jars_cache = {}       -- [android_root] = jar 列表 (nil = 该树未计算)
-local _jars_origin = {}      -- [android_root] = "cache" | "soong" | "make" | "fallback"
-local _last_root = nil       -- 最近一次 find_android_jars 解析出的树 (无参调用的兜底)
+local _jars_cache = {} -- [android_root] = jar 列表 (nil = 该树未计算)
+local _jars_origin = {} -- [android_root] = "cache" | "soong" | "make" | "fallback"
+local _last_root = nil -- 最近一次 find_android_jars 解析出的树 (无参调用的兜底)
 
 -- 后台刷新状态 (R1: refresh_async)
-local _refresh_inflight = false  -- 有刷新在跑 (防重入)
-local _refresh_last = nil        -- 最近一次刷新结果, 供 :Aosp 面板/诊断读取
+local _refresh_inflight = false -- 有刷新在跑 (防重入)
+local _refresh_last = nil -- 最近一次刷新结果, 供 :Aosp 面板/诊断读取
 
 --- 获取当前配置 (setup 后有效, __index metatable 保证 setup 已调用)
 local function get_cfg()
@@ -29,7 +29,9 @@ end
 --- @return string|nil
 local function cache_file_for(root)
   local cfg = get_cfg()
-  if not cfg.cache_dir or not root or root == "" then return nil end
+  if not cfg.cache_dir or not root or root == "" then
+    return nil
+  end
   return cfg.cache_dir .. "/" .. require("aosp-nav.util.path").cache_key(root) .. ".txt"
 end
 
@@ -69,8 +71,12 @@ end
 --- 判断目录名是否为设备端 soong 变体, 返回去重优先级 (android_common 首选,
 --- android_common_apexNN 兜底); nil 表示非设备变体 (host linux_*/产品变体等, 排除)
 local function variant_rank(name)
-  if name == "android_common" then return 0 end
-  if name:match("^android_common_apex[%w_]*$") then return 1 end
+  if name == "android_common" then
+    return 0
+  end
+  if name:match("^android_common_apex[%w_]*$") then
+    return 1
+  end
   return nil
 end
 
@@ -101,15 +107,15 @@ end
 -- 穷尽; 排序保证即使漏网桩与真身同 FQN, 真身 (源码构建模块) 永远排在
 -- 预构建/未知目录之前。顺序固化进缓存, 避免每次加载重排
 local DIR_PRIORITY = {
-  { "^frameworks/",       0 },
-  { "^libcore/",          1 },
+  { "^frameworks/", 0 },
+  { "^libcore/", 1 },
   { "^packages/modules/", 1 },
-  { "^art/",              1 },
-  { "^hardware/",         1 },
-  { "^system/",           1 },
-  { "^external/",         2 },
-  { "^tools/",            2 },
-  { "^libnativehelper/",  1 },
+  { "^art/", 1 },
+  { "^hardware/", 1 },
+  { "^system/", 1 },
+  { "^external/", 2 },
+  { "^tools/", 2 },
+  { "^libnativehelper/", 1 },
 }
 local function dir_rank(jar_path)
   local rel = jar_path:match("%.intermediates/(.+)$") or jar_path
@@ -118,7 +124,7 @@ local function dir_rank(jar_path)
       return pr[2]
     end
   end
-  return 3  -- prebuilts/ 与未知目录垫底
+  return 3 -- prebuilts/ 与未知目录垫底
 end
 
 local function sort_by_dir_priority(jars)
@@ -127,7 +133,7 @@ local function sort_by_dir_priority(jars)
     if ra ~= rb then
       return ra < rb
     end
-    return a < b  -- 同级按路径稳定排序 (缓存内容确定化)
+    return a < b -- 同级按路径稳定排序 (缓存内容确定化)
   end)
 end
 
@@ -161,10 +167,12 @@ local function process_soong_matches(base_dir, all_matches, jars, seen_paths)
   end
   local unknown_rank = #java_cfg.soong_tag_priority + 1
 
-  local own = {}  -- [mod] = { [tag] = {rank, path} }
-  local fb = {}   -- [mod] = {rank, path}
+  local own = {} -- [mod] = { [tag] = {rank, path} }
+  local fb = {} -- [mod] = {rank, path}
   for _, path in ipairs(all_matches) do
-    if path == "" then goto continue end
+    if path == "" then
+      goto continue
+    end
     local rel = path:sub(#base_dir + 2)
     local comps = vim.split(rel, "/", { plain = true })
     -- 从右往左找变体分量 (最后分量是 jar 文件)
@@ -176,7 +184,9 @@ local function process_soong_matches(base_dir, all_matches, jars, seen_paths)
       end
     end
     -- 需要变体前至少有模块分量 (vi >= 2, comps[1] 为首个 src 分量)
-    if not vi or vi < 2 then goto continue end
+    if not vi or vi < 2 then
+      goto continue
+    end
 
     -- 变体与 jar 之间的分量构成类型链 (可能多层); jarjar/repackaged-jarjar
     -- 均为改包名重打包产物, 直接排除
@@ -195,15 +205,21 @@ local function process_soong_matches(base_dir, all_matches, jars, seen_paths)
     -- android-non-updatable.stubs.system 等签名桩 (桩 jar 名 = 模块名 + .jar)
     local jar_name = comps[#comps]
     for _, pat in ipairs(java_cfg.exclude_jars) do
-      if jar_name:match(pat) or mod:match(pat) then goto continue end
+      if jar_name:match(pat) or mod:match(pat) then
+        goto continue
+      end
     end
     -- 排除路径关键词 (普通字符串匹配)
     for _, kw in ipairs(java_cfg.exclude_paths) do
-      if path:find(kw, 1, true) then goto continue end
+      if path:find(kw, 1, true) then
+        goto continue
+      end
     end
     -- [v4] Lua 模式排除: 匹配 intermediates 之后的相对路径
     for _, pat in ipairs(java_cfg.exclude_globs or {}) do
-      if rel:match(pat) then goto continue end
+      if rel:match(pat) then
+        goto continue
+      end
     end
 
     local rank = variant_rank(comps[vi]) * 100 + (type_rank[typ] or unknown_rank)
@@ -225,7 +241,7 @@ local function process_soong_matches(base_dir, all_matches, jars, seen_paths)
   end
 
   local found_any = false
-  local selected = {}  -- [mod] = path (v4: 供 pre-jarjar 后处理)
+  local selected = {} -- [mod] = path (v4: 供 pre-jarjar 后处理)
   -- own 桶全量收 (javac + kotlinc 各一份)
   for mod, per in pairs(own) do
     for _, v in pairs(per) do
@@ -252,11 +268,15 @@ end
 --- @return boolean found_any
 --- @return table|nil selected mod_name -> jar_path
 local function scan_soong_intermediates(base_dir, jars, seen_paths)
-  if vim.fn.isdirectory(base_dir) ~= 1 then return false end
+  if vim.fn.isdirectory(base_dir) ~= 1 then
+    return false
+  end
   -- 全量列出 jar (产物类型目录层级不固定, 统一扫出后在 Lua 侧解析;
   -- 全树 ~2600 个路径, 成本可忽略)
   local all_matches = require("aosp-nav.util.fs").scan_files(base_dir, "\\.jar$", { "*.jar" })
-  if not all_matches or #all_matches == 0 then return false end
+  if not all_matches or #all_matches == 0 then
+    return false
+  end
   return process_soong_matches(base_dir, all_matches, jars, seen_paths)
 end
 
@@ -297,7 +317,9 @@ end
 local function scan_intermediates_base(base_dir, jars, seen_paths, seen_intermediates)
   local cfg = get_cfg()
   local java_cfg = cfg.java
-  if vim.fn.isdirectory(base_dir) ~= 1 then return false end
+  if vim.fn.isdirectory(base_dir) ~= 1 then
+    return false
+  end
 
   -- 黑名单集合
   local blacklist = {}
@@ -340,7 +362,8 @@ local function scan_aosp_out(aosp_root, jars, seen_paths, seen_intermediates)
   end
 
   -- product/*/obj/JAVA_LIBRARIES (编两次会有多个 product 目录, glob 全部匹配)
-  local product_bases = vim.fn.glob(aosp_root .. "/out/target/product/*/obj/JAVA_LIBRARIES", true, true)
+  local product_bases =
+    vim.fn.glob(aosp_root .. "/out/target/product/*/obj/JAVA_LIBRARIES", true, true)
   for _, pbase in ipairs(product_bases) do
     if scan_intermediates_base(pbase, jars, seen_paths, seen_intermediates) then
       found_any = true
@@ -399,9 +422,11 @@ function M.find_android_jars(opts)
       --   filters      = 用户排除配置变更 (改 exclude_globs 等, 免手动 rm)
       --   android_root = [#8] 缓存键旧版不单射 (/work/a/b 与 /work/a-b 同键),
       --                  头部树根不符说明这份文件是**别的树**写的, 绝不串台
-      if lines[1] == "# version=" .. CACHE_VERSION
-          and lines[2] == "# filters=" .. fhash
-          and lines[3] == "# android_root=" .. android_root then
+      if
+        lines[1] == "# version=" .. CACHE_VERSION
+        and lines[2] == "# filters=" .. fhash
+        and lines[3] == "# android_root=" .. android_root
+      then
         local stat = vim.uv.fs_stat
         for _, line in ipairs(lines) do
           if line ~= "" and line:sub(1, 1) ~= "#" then
@@ -416,7 +441,7 @@ function M.find_android_jars(opts)
         end
         if #jars > 0 then
           _jars_cache[android_root] = jars
-          _jars_origin[android_root] = "cache"  -- 缓存命中路径也要记来源 (状态/诊断读它)
+          _jars_origin[android_root] = "cache" -- 缓存命中路径也要记来源 (状态/诊断读它)
           log.debug("JAR loaded from cache (" .. #jars .. " jars)")
           return jars, android_root
         end
@@ -539,9 +564,15 @@ end
 --- @param aosp_root string
 --- @return boolean started false = 已有一个刷新在跑, 或参数不可用/不在 AOSP 树内
 function M.refresh_async(aosp_root)
-  if _refresh_inflight then return false end
-  if not aosp_root or aosp_root == "" or vim.fn.isdirectory(aosp_root) ~= 1 then return false end
-  if not require("aosp-nav.android_root").has_jar_source(aosp_root) then return false end
+  if _refresh_inflight then
+    return false
+  end
+  if not aosp_root or aosp_root == "" or vim.fn.isdirectory(aosp_root) ~= 1 then
+    return false
+  end
+  if not require("aosp-nav.android_root").has_jar_source(aosp_root) then
+    return false
+  end
 
   -- 存在的 soong intermediates 目录 (与同步路径的探测顺序一致)
   local soong_base = nil
@@ -556,7 +587,9 @@ function M.refresh_async(aosp_root)
 
   if soong_base then
     local started = require("aosp-nav.util.fs").scan_files_async(
-      soong_base, "\\.jar$", { "*.jar" },
+      soong_base,
+      "\\.jar$",
+      { "*.jar" },
       function(matches, _tool)
         -- 已在主循环 (scan_files_async 内部 vim.schedule)
         local jars, seen_paths, source = {}, {}, nil
@@ -572,7 +605,8 @@ function M.refresh_async(aosp_root)
           jars, source = rescan_make_or_fallback(aosp_root)
         end
         finish_refresh(aosp_root, jars, source)
-      end)
+      end
+    )
     if not started then
       _refresh_inflight = false
       return false
@@ -599,18 +633,26 @@ end
 --- @return boolean
 function M.cache_stale(root)
   local r = root or _last_root
-  if not r or r == "" then return false end
+  if not r or r == "" then
+    return false
+  end
   local f = cache_file_for(r)
-  if not f or vim.fn.filereadable(f) ~= 1 then return false end
+  if not f or vim.fn.filereadable(f) ~= 1 then
+    return false
+  end
   local newest = 0
   for _, marker in ipairs({
     r .. "/out/soong/build.ninja",
     r .. "/out/target/common/obj/JAVA_LIBRARIES",
   }) do
     local t = vim.fn.getftime(marker)
-    if t > newest then newest = t end
+    if t > newest then
+      newest = t
+    end
   end
-  if newest == 0 then return false end
+  if newest == 0 then
+    return false
+  end
   return newest > vim.fn.getftime(f)
 end
 
@@ -632,7 +674,9 @@ function M.reset_cache(root, opts)
     _jars_cache = {}
     _jars_origin = {}
   end
-  if not (opts and opts.delete_file) then return nil end
+  if not (opts and opts.delete_file) then
+    return nil
+  end
   local f = r and cache_file_for(r)
   if f and vim.fn.filereadable(f) == 1 then
     vim.fn.delete(f)

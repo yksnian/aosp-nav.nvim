@@ -13,7 +13,9 @@ H.total = 0
 H.failed = {}
 
 local function fmt(v)
-  if type(v) == "string" then return ("%q"):format(v) end
+  if type(v) == "string" then
+    return ("%q"):format(v)
+  end
   return vim.inspect(v)
 end
 
@@ -31,8 +33,7 @@ end
 
 --- Equality with a readable got/want.
 function H.eq(got, want, msg)
-  return H.check(got == want,
-    ("%s (got %s, want %s)"):format(msg or "eq", fmt(got), fmt(want)))
+  return H.check(got == want, ("%s (got %s, want %s)"):format(msg or "eq", fmt(got), fmt(want)))
 end
 
 --- Run fn with vim.notify temporarily replaced and return every call it made.
@@ -47,14 +48,18 @@ function H.capture_notify(fn)
   end
   local ok, err = pcall(fn)
   vim.notify = real
-  if not ok then error(err, 0) end
+  if not ok then
+    error(err, 0)
+  end
   return notes
 end
 
 --- Number of (plain, non-pattern) occurrences of needle in text.
 function H.count(text, needle)
   local n = 0
-  for _ in text:gmatch(vim.pesc(needle)) do n = n + 1 end
+  for _ in text:gmatch(vim.pesc(needle)) do
+    n = n + 1
+  end
   return n
 end
 
@@ -64,7 +69,9 @@ function H.finish(name)
   io.write(("RESULT %s: %d/%d passed\n"):format(name, passed, H.total))
   if #H.failed > 0 then
     io.write(("FAILURES %s (%d):\n"):format(name, #H.failed))
-    for _, m in ipairs(H.failed) do io.write("  - " .. m .. "\n") end
+    for _, m in ipairs(H.failed) do
+      io.write("  - " .. m .. "\n")
+    end
     os.exit(1)
   end
   os.exit(0)

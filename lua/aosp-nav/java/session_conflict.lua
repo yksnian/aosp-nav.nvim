@@ -25,7 +25,7 @@
 
 local M = {}
 
-local _cache = nil  -- { ws_dir, conflict, foreign } —— 会话级, 只算一次
+local _cache = nil -- { ws_dir, conflict, foreign } —— 会话级, 只算一次
 local _cache_root_override = nil
 
 --- 插件 jdtls 缓存根 (`<stdpath cache>/jdtls`)。安全闸 (isolation_dir_owned) 与
@@ -49,7 +49,9 @@ end
 --- @param pid integer|nil 缺省用本进程
 --- @return string|nil
 function M.isolation_name(base, pid)
-  if not base or base == "" then return nil end
+  if not base or base == "" then
+    return nil
+  end
   pid = pid or vim.fn.getpid()
   return ("%s-nvim%d"):format(base, pid)
 end
@@ -85,8 +87,12 @@ end
 function M.check(fname, deps)
   deps = deps or {}
   local ws_dir = (deps.workspace_dir or M.workspace_dir)(fname)
-  if not ws_dir then return { ws_dir = nil, conflict = false, foreign = {} } end
-  if _cache and _cache.ws_dir == ws_dir and not deps.force then return _cache end
+  if not ws_dir then
+    return { ws_dir = nil, conflict = false, foreign = {} }
+  end
+  if _cache and _cache.ws_dir == ws_dir and not deps.force then
+    return _cache
+  end
 
   local foreign = (deps.foreign or function(d)
     return require("aosp-nav.java.instances").foreign_jdtls(d)
@@ -112,11 +118,15 @@ end
 --- @param pid integer|nil
 --- @return boolean
 function M.isolation_dir_owned(dir, pid)
-  if not dir or dir == "" then return false end
+  if not dir or dir == "" then
+    return false
+  end
   pid = pid or vim.fn.getpid()
   local d = dir:gsub("/+$", "")
   local cache_root = M.cache_root()
-  if d:sub(1, #cache_root + 1) ~= cache_root .. "/" then return false end
+  if d:sub(1, #cache_root + 1) ~= cache_root .. "/" then
+    return false
+  end
   local suffix = "-nvim" .. pid
   -- 第一层目录名带后缀 -> dir 就是隔离目录; 否则看它的父目录名 (dir 是 workspace 形)
   local base = vim.fn.fnamemodify(d, ":t")
@@ -130,10 +140,14 @@ end
 --- @param ws_dir string 本会话实际用的 `-data` (…/<base>-nvim<pid>/workspace)
 --- @return string|nil
 function M.isolation_root(ws_dir)
-  if not ws_dir or ws_dir == "" then return nil end
+  if not ws_dir or ws_dir == "" then
+    return nil
+  end
   local d = ws_dir:gsub("/+$", "")
   -- 传进来的可能是隔离根自己, 也可能是它的 workspace 子目录
-  if vim.fn.fnamemodify(d, ":t") == "workspace" then return vim.fn.fnamemodify(d, ":h") end
+  if vim.fn.fnamemodify(d, ":t") == "workspace" then
+    return vim.fn.fnamemodify(d, ":h")
+  end
   return d
 end
 
@@ -145,8 +159,12 @@ end
 function M.cleanup(ws_dir)
   ws_dir = ws_dir or (_cache and _cache.ws_dir)
   local root = M.isolation_root(ws_dir)
-  if not M.isolation_dir_owned(root) then return end
-  if vim.fn.isdirectory(root) ~= 1 then return end
+  if not M.isolation_dir_owned(root) then
+    return
+  end
+  if vim.fn.isdirectory(root) ~= 1 then
+    return
+  end
 
   local log = require("aosp-nav.util.log")
   local clients = {}
@@ -154,15 +172,16 @@ function M.cleanup(ws_dir)
     local cmd = type(c.config) == "table" and c.config.cmd or nil
     if type(cmd) == "table" then
       for i, a in ipairs(cmd) do
-        if a == "-data" and cmd[i + 1]
-            and cmd[i + 1]:gsub("/+$", ""):sub(1, #root) == root then
+        if a == "-data" and cmd[i + 1] and cmd[i + 1]:gsub("/+$", ""):sub(1, #root) == root then
           clients[#clients + 1] = c.id
         end
       end
     end
   end
   for _, id in ipairs(clients) do
-    pcall(function() vim.lsp.stop_client(id, true) end)
+    pcall(function()
+      vim.lsp.stop_client(id, true)
+    end)
   end
   if #clients > 0 then
     vim.wait(1500, function()

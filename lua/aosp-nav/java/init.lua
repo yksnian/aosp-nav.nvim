@@ -25,10 +25,14 @@ local function schedule_exclusions_refresh(java_cfg, root)
   if not java_cfg.import_exclusions_scan or not java_cfg.import_exclusions_enabled then
     return
   end
-  if not root or root == "" then return end
+  if not root or root == "" then
+    return
+  end
 
   local mod = require("aosp-nav.java.import_exclusions")
-  if not mod.is_stale(root) then return end
+  if not mod.is_stale(root) then
+    return
+  end
 
   mod.scan_async(root, function(patterns)
     mod.save(root, patterns)
@@ -65,7 +69,9 @@ local function probe_file(root_mod)
     local b = bufs[i]
     if vim.api.nvim_buf_is_loaded(b) then
       local n = vim.api.nvim_buf_get_name(b)
-      if n:sub(-5) == ".java" and root_mod.aosp_root(n) then return n end
+      if n:sub(-5) == ".java" and root_mod.aosp_root(n) then
+        return n
+      end
     end
   end
   -- 没有任何 java 缓冲: 用 cwd 作为探测起点 (start_dir("") == cwd)
@@ -84,19 +90,33 @@ end
 --- @return string|nil rel 形如 "com/foo/Bar.java"
 local function jdt_buffer_source_rel(name)
   local rest = name:match("^jdt://contents/(.+)$")
-  if not rest then return nil end
-  rest = rest:gsub("[?#].*$", "")                                   -- 去 query/hash
-  rest = rest:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+  if not rest then
+    return nil
+  end
+  rest = rest:gsub("[?#].*$", "") -- 去 query/hash
+  rest = rest:gsub("%%(%x%x)", function(h)
+    return string.char(tonumber(h, 16))
+  end)
   -- 第一段是 jar 名 (含 .jar), 丢掉它, 剩余即类路径
   local classpath = rest:match("^[^/]*/(.+)$")
-  if not classpath then return nil end
+  if not classpath then
+    return nil
+  end
   classpath = classpath:gsub("%.class$", "")
-  if classpath == "" then return nil end
+  if classpath == "" then
+    return nil
+  end
   local parts = {}
-  for seg in classpath:gmatch("[^/%.]+") do parts[#parts + 1] = seg end
-  if #parts == 0 then return nil end
-  parts[#parts] = parts[#parts]:gsub("%$.*$", "")                   -- 去内部类后缀
-  if parts[#parts] == "" then return nil end
+  for seg in classpath:gmatch("[^/%.]+") do
+    parts[#parts + 1] = seg
+  end
+  if #parts == 0 then
+    return nil
+  end
+  parts[#parts] = parts[#parts]:gsub("%$.*$", "") -- 去内部类后缀
+  if parts[#parts] == "" then
+    return nil
+  end
   return table.concat(parts, "/") .. ".java"
 end
 
@@ -115,32 +135,44 @@ end
 --- 已经装了一个 (用来 echo message), 整个换掉会吞掉它原本的 status 消息。
 --- @param client table 需有 .name == "jdtls" 与可写的 .handlers
 function M.install_phase_handler(client)
-  if not (client and client.name == "jdtls") then return end
+  if not (client and client.name == "jdtls") then
+    return
+  end
   -- LspAttach **每个 buffer** 都会触发一次: 没有这道闸门的话, N 个 java buffer
   -- 会把 handler 套 N 层 (第 2 个 buffer 的 prev 是第 1 个的包装), 最内层
   -- nvim-jdtls 的 status handler 于是每次被重复调用 N 次 (message 重复打印)。
-  if client._aosp_nav_phase_handler then return end
+  if client._aosp_nav_phase_handler then
+    return
+  end
   client._aosp_nav_phase_handler = true
   local prev = client.handlers and client.handlers["language/status"]
   client.handlers = client.handlers or {}
   client.handlers["language/status"] = function(err, result, ctx, config)
-    if prev then prev(err, result, ctx, config) end
-    if err or type(result) ~= "table" or result.type ~= "ServiceReady" then return end
+    if prev then
+      prev(err, result, ctx, config)
+    end
+    if err or type(result) ~= "table" or result.type ~= "ServiceReady" then
+      return
+    end
     -- 只把 indexing 翻成 ready。no-out / failed 不是"索引中", ServiceReady 到来
     -- 也不代表那个会话的归类该改 (非 AOSP 文件照样会 attach 到 jdtls)。
     -- [#3] 按树翻牌: 从 client 的 root_dir 解析它属于哪棵树 (state 的分区键);
     -- 解析不出 (反编译视图 / 测试假 client) 时落回 _active 兜底槽。
     local state = require("aosp-nav.state")
     local key = require("aosp-nav.java.root").aosp_root(
-      client.root_dir or (client.config and client.config.root_dir) or "")
+      client.root_dir or (client.config and client.config.root_dir) or ""
+    )
     if state.get(key).phase == "indexing" then
       state.set({ phase = "ready" }, key)
     end
     -- [#4] ServiceReady = 导入完成的真信号: 此时做 jdt.ls 契约自检 (invisible
     -- project 命名)。廉价、只读磁盘; 结果进 :Aosp 面板的 "jdtls contract" 行。
     if key and key ~= "" then
-      pcall(require("aosp-nav.java.contract").check,
-        require("aosp-nav.java.instances").data_dir(client), key)
+      pcall(
+        require("aosp-nav.java.contract").check,
+        require("aosp-nav.java.instances").data_dir(client),
+        key
+      )
     end
   end
 end
@@ -156,29 +188,45 @@ local _attach_tree_warned = {}
 --- 根), 多树会话里这是唯一可靠的暴露点 —— 把静默错配变成一条可行动的告警。
 --- @param client table|nil
 function M.check_attach_tree(client)
-  if not (client and client.name == "jdtls") then return end
+  if not (client and client.name == "jdtls") then
+    return
+  end
   local rm = require("aosp-nav.java.root")
   local rd = client.root_dir or (client.config and client.config.root_dir)
   local key = rd and rm.aosp_root(rd) or nil
-  if not key or _attach_tree_warned[key] then return end
+  if not key or _attach_tree_warned[key] then
+    return
+  end
   local st = require("aosp-nav.state").get(key)
-  if st.android_root ~= nil then return end -- 这棵树组装过, 一致
+  if st.android_root ~= nil then
+    return
+  end -- 这棵树组装过, 一致
   _attach_tree_warned[key] = true
-  log.user(("jdtls started rooted at %s, but the jars/sourcePaths in its settings were "
-    .. "assembled for another tree (this setup resolves root_dir outside aosp-nav's "
-    .. "root_dir fn, so the re-assembly pass never ran). Cross-tree navigation in THIS "
-    .. "client may resolve against the wrong jars — reopen the client or switch to "
-    .. "LazyVim-style jdtls opts so root_dir stays a function.")
-    :format(key), { id = "attach-tree:" .. key, timeout = 15000 })
+  log.user(
+    (
+      "jdtls started rooted at %s, but the jars/sourcePaths in its settings were "
+      .. "assembled for another tree (this setup resolves root_dir outside aosp-nav's "
+      .. "root_dir fn, so the re-assembly pass never ran). Cross-tree navigation in THIS "
+      .. "client may resolve against the wrong jars — reopen the client or switch to "
+      .. "LazyVim-style jdtls opts so root_dir stays a function."
+    ):format(key),
+    { id = "attach-tree:" .. key, timeout = 15000 }
+  )
 end
 
 local function hint_if_jar_jump(buf)
-  if not vim.api.nvim_buf_is_valid(buf) then return end
+  if not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
   local name = vim.api.nvim_buf_get_name(buf)
   local rel = jdt_buffer_source_rel(name)
-  if not rel then return end
+  if not rel then
+    return
+  end
   local hit = require("aosp-nav.java.source_inject").source_file_for_rel(rel)
-  if not hit then return end
+  if not hit then
+    return
+  end
   -- !! 为什么只有 :AospCleanWorkspace 能修 !!
   -- java.project.addToSourcePath 只能 **追加**, 注入的根永远排在 ~1126 个 jar
   -- 之后; JDT 取类路径上第一个包含该类型的条目, 所以同 FQN 的 jar 必胜。
@@ -187,13 +235,17 @@ local function hint_if_jar_jump(buf)
   -- 解析后的输出路径, 客户端重建不出那份 raw 列表。唯一能把注入根排在 jar **之前**
   -- 的路径是导入期注入, 而 jdt.ls 只在 invisible project 首次创建时采纳它 ——
   -- 即 :AospCleanWorkspace 删掉 -data 重建。别再试图找运行期的替代方案。
-  log.info(("go-to-definition for %s landed in a decompiled jar (jdt://) instead of "
-    .. "the real source at %s.\nInjected source roots can only win over the jars when "
-    .. "jdtls builds the invisible project's classpath; the runtime command can only "
-    .. "append, so a jar with the same FQN still comes first.\n"
-    .. "Run :AospCleanWorkspace to rebuild the jdtls workspace with the source roots "
-    .. "placed ahead of the jars."):format(rel, hit),
-    { once = true, id = "jdt-jar-jump-hint", timeout = 15000 })
+  log.info(
+    (
+      "go-to-definition for %s landed in a decompiled jar (jdt://) instead of "
+      .. "the real source at %s.\nInjected source roots can only win over the jars when "
+      .. "jdtls builds the invisible project's classpath; the runtime command can only "
+      .. "append, so a jar with the same FQN still comes first.\n"
+      .. "Run :AospCleanWorkspace to rebuild the jdtls workspace with the source roots "
+      .. "placed ahead of the jars."
+    ):format(rel, hit),
+    { once = true, id = "jdt-jar-jump-hint", timeout = 15000 }
+  )
 end
 
 --- 注入 AOSP 特化配置到 jdtls opts
@@ -322,8 +374,8 @@ function M.configure(opts, ctx)
     -- jdt.ls 的 invisible project 只接受**工作区相对路径** (绝对路径会让
     -- InvisibleProjectImporter.getSourcePaths 抛异常, 整个工程退化成
     -- jdt.ls-java-project 假工程), 用户写绝对路径这里兜住
-    source_paths = require("aosp-nav.java.source_inject").to_workspace_relative(
-      java_cfg.source_paths, root_path)
+    source_paths =
+      require("aosp-nav.java.source_inject").to_workspace_relative(java_cfg.source_paths, root_path)
   elseif java_cfg.mode == "aosp" and is_android and aosp_root then
     source_inject = require("aosp-nav.java.source_inject")
     -- 同步 + 只读缓存: sourcePaths 必须出现在 initialize 请求里
@@ -466,11 +518,11 @@ function M.configure(opts, ctx)
   if init_settings then
     opts.jdtls = opts.jdtls or {}
     opts.jdtls.init_options = opts.jdtls.init_options or {}
-    opts.jdtls.init_options.settings = vim.tbl_deep_extend("force",
-      opts.jdtls.init_options.settings or {}, init_settings)
+    opts.jdtls.init_options.settings =
+      vim.tbl_deep_extend("force", opts.jdtls.init_options.settings or {}, init_settings)
     opts.init_options = opts.init_options or {}
-    opts.init_options.settings = vim.tbl_deep_extend("force",
-      opts.init_options.settings or {}, init_settings)
+    opts.init_options.settings =
+      vim.tbl_deep_extend("force", opts.init_options.settings or {}, init_settings)
   end
 
   -- 9. 深度合并: AOSP 字段优先, 但不覆盖用户其他 settings (如 completion, signatureHelp 等)
@@ -487,7 +539,9 @@ function M.configure(opts, ctx)
   if source_inject then
     source_inject.setup(java_cfg)
     -- 启动文件所属项目: 已有缓存则立即并入, 否则后台扫描 (不阻塞启动)
-    if bufname ~= "" then source_inject.on_file(bufname) end
+    if bufname ~= "" then
+      source_inject.on_file(bufname)
+    end
     -- 存量补注入: 上次会话攒下、还没进工作区的根, jdtls attach 后自动补上
     -- (累积那一刻的自动注入在 source_inject.apply 里; 关掉用 source_apply_auto)
     if java_cfg.source_apply_auto ~= false then
@@ -524,7 +578,9 @@ function M.configure(opts, ctx)
       group = hint_grp,
       pattern = "jdt://*",
       desc = "aosp-nav: one-time hint when a go-to-definition lands in a decompiled jar",
-      callback = function(args) hint_if_jar_jump(args.buf) end,
+      callback = function(args)
+        hint_if_jar_jump(args.buf)
+      end,
     })
   end
 
@@ -658,8 +714,10 @@ function M.configure(opts, ctx)
     if #blockers > 0 and ws_dir and #instances.jdtls_holders(ws_dir) == 0 then
       local kept = {}
       for _, name in ipairs(blockers) do
-        if workspace.orphan_project(ws_dir, name)
-            and workspace.remove_project_metadata(ws_dir, name) then
+        if
+          workspace.orphan_project(ws_dir, name)
+          and workspace.remove_project_metadata(ws_dir, name)
+        then
           log.debug("removed orphan jdtls project shell: " .. name)
         else
           kept[#kept + 1] = name
@@ -675,12 +733,15 @@ function M.configure(opts, ctx)
       for _, name in ipairs(blockers) do
         where[#where + 1] = workspace.project_location(ws_dir, name) or name
       end
-      local msg = ("%d externally-visible project(s) exist in the jdtls workspace — "
+      local msg = (
+        "%d externally-visible project(s) exist in the jdtls workspace — "
         .. "they keep the invisible project for this root from ever being created "
-        .. "(jumps land in a fake project):\n" .. table.concat(where, "\n"))
-        :format(#blockers)
+        .. "(jumps land in a fake project):\n"
+        .. table.concat(where, "\n")
+      ):format(#blockers)
       if workspace.gradle_download_evidence(ws_dir) then
-        msg = msg .. "\njdt.ls is still building / downloading Gradle for them. Run "
+        msg = msg
+          .. "\njdt.ls is still building / downloading Gradle for them. Run "
           .. ":AospCleanWorkspace to rebuild the jdtls workspace (exclusions are ready, "
           .. "so they will not be re-imported)."
       end
@@ -705,8 +766,8 @@ function M.configure(opts, ctx)
     --     自动做掉的事不单独通知 (见 DEVELOPMENT §2.10): 报告文本由
     --     instances.instances_message 生成, 无话可说时返回 nil。
     local inv = instances.jdtls_inventory()
-    local reaped = instances.reap_orphan_jdtls(inv,
-      { enabled = java_cfg.kill_orphan_jdtls ~= false })
+    local reaped =
+      instances.reap_orphan_jdtls(inv, { enabled = java_cfg.kill_orphan_jdtls ~= false })
     if #reaped > 0 then
       log.debug("reaped orphan jdtls (SIGTERM): " .. table.concat(reaped, ", "))
     end
@@ -735,8 +796,8 @@ function M.configure(opts, ctx)
   --     isolation_dir_owned 的两条闸证明 (缓存根之下 + basename 带本进程后缀);
   --     共用目录与别人的后缀一律不动。augroup 幂等: 一个会话只挂一次。
   if limited and conflict.ws_dir then
-    local iso_name = session_conflict.isolation_name(
-      vim.fn.fnamemodify(conflict.ws_dir, ":h:t"), vim.fn.getpid())
+    local iso_name =
+      session_conflict.isolation_name(vim.fn.fnamemodify(conflict.ws_dir, ":h:t"), vim.fn.getpid())
     local grp = vim.api.nvim_create_augroup("aosp_nav_session_isolation_cleanup", { clear = true })
     vim.api.nvim_create_autocmd("VimLeavePre", {
       group = grp,

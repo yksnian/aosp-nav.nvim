@@ -29,18 +29,24 @@ local _seen = {}
 local function coerce(v)
   if type(v) == "number" then
     for name, n in pairs(ORDER) do
-      if n == v then return name end
+      if n == v then
+        return name
+      end
     end
     return nil
   end
-  if type(v) == "string" and ORDER[v] then return v end
+  if type(v) == "string" and ORDER[v] then
+    return v
+  end
   return nil
 end
 
 --- 当前阈值名
 --- @return string
 function M.get_level()
-  if _level then return _level end
+  if _level then
+    return _level
+  end
   return coerce(vim.g.aosp_nav_log) or "warn"
 end
 
@@ -49,7 +55,9 @@ end
 --- @return string 生效后的阈值名
 function M.set_level(v)
   local name = coerce(v)
-  if name then _level = name end
+  if name then
+    _level = name
+  end
   return M.get_level()
 end
 
@@ -69,19 +77,29 @@ end
 local function emit(level, msg, opts)
   opts = opts or {}
   local id = opts.id or (opts.once and msg)
-  if id and _seen[id] then return false end
+  if id and _seen[id] then
+    return false
+  end
   local text = tostring(msg)
-  if not text:find("^%[aosp%-nav%]") then text = "[aosp-nav] " .. text end
+  if not text:find("^%[aosp%-nav%]") then
+    text = "[aosp-nav] " .. text
+  end
   local o = { title = opts.title or "aosp-nav" }
-  if opts.timeout then o.timeout = opts.timeout end
+  if opts.timeout then
+    o.timeout = opts.timeout
+  end
   vim.notify(text, VIM_LEVEL[level] or vim.log.levels.INFO, o)
-  if id then _seen[id] = true end
+  if id then
+    _seen[id] = true
+  end
   return true
 end
 
 local function levelled(level)
   return function(msg, opts)
-    if not M.enabled(level) then return false end
+    if not M.enabled(level) then
+      return false
+    end
     return emit(level, msg, opts)
   end
 end

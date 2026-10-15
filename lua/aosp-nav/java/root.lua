@@ -45,7 +45,9 @@ end
 --- @param child string
 --- @return boolean
 local function contains(dir, child)
-  if not child or child == "" then return false end
+  if not child or child == "" then
+    return false
+  end
   local c = normalize(child)
   return c == dir or c:sub(1, #dir + 1) == dir .. "/"
 end
@@ -71,13 +73,17 @@ function M.aosp_root(fname)
     local o = normalize(override)
     -- 只在该覆盖目录确实包含当前文件时生效, 免得用户配了 AOSP 根之后
     -- 连无关的 java 工程也被拽进那个 workspace
-    if contains(o, path) then return o end
+    if contains(o, path) then
+      return o
+    end
   end
 
   local detected = require("aosp-nav.android_root").find_android_platform_root(path, {
     sibling = false,
   })
-  if not detected then return nil end
+  if not detected then
+    return nil
+  end
   return normalize(detected)
 end
 
@@ -88,7 +94,9 @@ end
 --- @return string|nil root; nil = 插件不接管
 function M.workspace_root(fname)
   local cfg = require("aosp-nav").config or {}
-  if (cfg.java or {}).mode == "project" then return nil end
+  if (cfg.java or {}).mode == "project" then
+    return nil
+  end
   return M.aosp_root(fname)
 end
 
@@ -103,15 +111,20 @@ end
 --- @return string|nil project 规整后的绝对路径; nil = 不在树内 / 没有项目标记
 function M.project_dir(fname)
   local cfg = require("aosp-nav").config or {}
-  if (cfg.java or {}).mode ~= "project" then return nil end
+  if (cfg.java or {}).mode ~= "project" then
+    return nil
+  end
   fname = (fname and fname ~= "") and fname or vim.api.nvim_buf_get_name(0)
   local aosp = M.aosp_root(fname)
-  if not aosp then return nil end
+  if not aosp then
+    return nil
+  end
   local p = require("aosp-nav.java.projects").find_project_root(fname, aosp)
-  if not p then return nil end
+  if not p then
+    return nil
+  end
   return (vim.fn.fnamemodify(p, ":p"):gsub("/+$", ""))
 end
-
 
 --- 最后的兜底: 常规取根 (AOSP 根 / 用户的 root_dir) 都答不上来时, 复用**已经在跑的
 --- 那台** jdtls, 而不是让 LazyVim 拿一个错位的默认工作区另起一台。
@@ -143,9 +156,13 @@ end
 --- @return string|nil root; nil = 没有可复用的 (照旧交还 LazyVim 的兜底)
 function M.reuse_root()
   local clients = vim.lsp.get_clients({ name = "jdtls" })
-  if #clients == 0 then return nil end
+  if #clients == 0 then
+    return nil
+  end
 
-  local function root_of(c) return c.root_dir or (c.config and c.config.root_dir) end
+  local function root_of(c)
+    return c.root_dir or (c.config and c.config.root_dir)
+  end
 
   -- 优先"上一个 buffer 挂着的那个" —— 它是这次跳转的出发方, 与 nvim-jdtls
   -- open_classfile 挑 client 的口径一致; 挑不出来就退到最新的一台, 这种缓冲
@@ -159,7 +176,9 @@ function M.reuse_root()
     end
   end
   for i = #clients, 1, -1 do
-    if root_of(clients[i]) then return root_of(clients[i]) end
+    if root_of(clients[i]) then
+      return root_of(clients[i])
+    end
   end
   return nil
 end
@@ -180,7 +199,9 @@ end
 --- @param fname string|nil 求值 function 时的基准文件
 --- @return string|nil
 function M.client_root(c, fname)
-  if not c then return nil end
+  if not c then
+    return nil
+  end
   local rd = c.root_dir or (c.config and c.config.root_dir) or nil
   if type(rd) == "function" then
     local ok, v = pcall(rd, fname or vim.api.nvim_buf_get_name(0))
@@ -194,7 +215,9 @@ M.PROJECT_NEW_MIN_AVAIL_KB = 4 * 1024 * 1024
 M._mem_avail_kb = function()
   for _, l in ipairs(vim.fn.readfile("/proc/meminfo")) do
     local kb = l:match("^MemAvailable:%s+(%d+)")
-    if kb then return tonumber(kb) end
+    if kb then
+      return tonumber(kb)
+    end
   end
   return nil
 end
@@ -209,13 +232,14 @@ function M.jdtls_root_fn(user_root)
       -- 各自 -data 单模块索引。旧方案 (reuse_root 优先 + didChangeWorkspaceFolders
       -- 换根) 已证伪: folder swap 后 jdt.ls 不为 added folder 建 invisible project
       -- (~/aospnav-probe17 三联实验), gd 无处落。
-      local p = require("aosp-nav.java.projects").find_project_root(
-        fname, M.aosp_root(fname))
+      local p = require("aosp-nav.java.projects").find_project_root(fname, M.aosp_root(fname))
       if p then
         local log = require("aosp-nav.util.log")
         -- 1. 已有同台 (有效 root == p): 复用。
         for _, c in ipairs(vim.lsp.get_clients({ name = "jdtls" })) do
-          if M.client_root(c, fname) == p then return p end
+          if M.client_root(c, fname) == p then
+            return p
+          end
         end
         -- 2. 新台前回收无附着 buffer 的闲置实例 (防 JVM 随浏览积累)。
         local idle = 0
@@ -227,18 +251,26 @@ function M.jdtls_root_fn(user_root)
           end
         end
         if idle > 0 then
-          log.info(("stopped %d idle jdtls instance(s) before starting one for %s")
-            :format(idle, vim.fn.fnamemodify(p, ":t")))
+          log.info(
+            ("stopped %d idle jdtls instance(s) before starting one for %s"):format(
+              idle,
+              vim.fn.fnamemodify(p, ":t")
+            )
+          )
         end
         -- 3. 宿主内存闸: 可用内存不足时退回已有台 (宁可本 buffer 跳 jar, 不让宿主
         --    global OOM —— 2026-10-14 15:44 实测过教训)。
         local avail = M._mem_avail_kb and M._mem_avail_kb() or nil
         local live = M.reuse_root()
         if avail and avail < M.PROJECT_NEW_MIN_AVAIL_KB and live then
-          log.info(("new jdtls for %s skipped: %.1f GB memory available (need >= 4.0); "
-            .. "this buffer rides on the existing instance, cross-module jumps "
-            .. "land in jars"):format(vim.fn.fnamemodify(p, ":t"), avail / 1048576),
-            { once = true, id = "memgate:" .. p })
+          log.info(
+            (
+              "new jdtls for %s skipped: %.1f GB memory available (need >= 4.0); "
+              .. "this buffer rides on the existing instance, cross-module jumps "
+              .. "land in jars"
+            ):format(vim.fn.fnamemodify(p, ":t"), avail / 1048576),
+            { once = true, id = "memgate:" .. p }
+          )
           return live
         end
         return p
@@ -248,7 +280,9 @@ function M.jdtls_root_fn(user_root)
       -- 拿 cwd 另起一台 (本文件头记的 6-workspace 事故)。
       if type(user_root) == "function" then
         local ok, v = pcall(user_root, fname)
-        if ok and v then return v end
+        if ok and v then
+          return v
+        end
       elseif type(user_root) == "string" and user_root ~= "" then
         return user_root
       end
@@ -256,10 +290,14 @@ function M.jdtls_root_fn(user_root)
     end
 
     local r = M.workspace_root(fname)
-    if r then return r end
+    if r then
+      return r
+    end
     if type(user_root) == "function" then
       local ok, v = pcall(user_root, fname)
-      if ok and v then return v end
+      if ok and v then
+        return v
+      end
       return M.reuse_root()
     end
     return user_root or M.reuse_root()

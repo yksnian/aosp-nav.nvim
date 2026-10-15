@@ -23,17 +23,23 @@ local STUB_ROOTS = {}
 local real_find = sr_mod.find_for_project
 sr_mod.find_for_project = function(dir, o)
   local hits = STUB_ROOTS[vim.fn.fnamemodify(dir, ":p"):gsub("/+$", "")]
-  if hits then return vim.deepcopy(hits) end
+  if hits then
+    return vim.deepcopy(hits)
+  end
   return real_find and real_find(dir, o) or nil
 end
 
 -- 通知/请求捕获
-local notices = {}   -- {method=..., params=...}
+local notices = {} -- {method=..., params=...}
 local real_get_clients = vim.lsp.get_clients
 local clients = {}
 vim.lsp.get_clients = function(filter)
-  if type(filter) ~= "table" or not filter.name then return clients end
-  return vim.tbl_filter(function(c) return c.name == filter.name end, clients)
+  if type(filter) ~= "table" or not filter.name then
+    return clients
+  end
+  return vim.tbl_filter(function(c)
+    return c.name == filter.name
+  end, clients)
 end
 
 local function fake_client(root)
@@ -49,7 +55,9 @@ local function fake_client(root)
     request = function(_, method, params, cb)
       notices[#notices + 1] = { method = method, params = params }
       -- addToSourcePath 恒 "added"
-      vim.schedule(function() cb(nil, "added") end)
+      vim.schedule(function()
+        cb(nil, "added")
+      end)
       return true, function() end
     end,
   }
@@ -73,13 +81,17 @@ vim.fn.mkdir(AOSP .. "/build/soong", "p")
 vim.fn.mkdir(T .. "/elsewhere", "p")
 for _, f in ipairs({ F_A, F_B, F_NOPROJ, F_OUTSIDE }) do
   vim.fn.mkdir(vim.fn.fnamemodify(f, ":h"), "p")
-  local fh = assert(io.open(f, "w")); fh:write("// x\n"); fh:close()
+  local fh = assert(io.open(f, "w"))
+  fh:write("// x\n")
+  fh:close()
 end
 
 local cur_buf_name = ""
 local real_buf_get_name = vim.api.nvim_buf_get_name
 vim.api.nvim_buf_get_name = function(b)
-  if b == 0 or b == vim.api.nvim_get_current_buf() then return cur_buf_name end
+  if b == 0 or b == vim.api.nvim_get_current_buf() then
+    return cur_buf_name
+  end
   return real_buf_get_name(b)
 end
 
@@ -92,8 +104,10 @@ end
 local function addto_notices()
   local n = 0
   for _, x in ipairs(notices) do
-    if x.method == "workspace/executeCommand"
-      and x.params.command == "java.project.addToSourcePath" then
+    if
+      x.method == "workspace/executeCommand"
+      and x.params.command == "java.project.addToSourcePath"
+    then
       n = n + 1
     end
   end
@@ -138,10 +152,8 @@ for _, x in ipairs(notices) do
     seen_paths[x.params.arguments[1]] = true
   end
 end
-H.check(seen_paths["file://" .. P_B .. "/framework/src"],
-  "跨项目: 注入 B 的 framework/src")
-H.check(seen_paths["file://" .. P_B .. "/service/src"],
-  "跨项目: 注入 B 的 service/src")
+H.check(seen_paths["file://" .. P_B .. "/framework/src"], "跨项目: 注入 B 的 framework/src")
+H.check(seen_paths["file://" .. P_B .. "/service/src"], "跨项目: 注入 B 的 service/src")
 -- 不发 didChangeWorkspaceFolders (v18.6 起退役)
 H.eq(#vim.tbl_filter(function(x)
   return x.method == "workspace/didChangeWorkspaceFolders"

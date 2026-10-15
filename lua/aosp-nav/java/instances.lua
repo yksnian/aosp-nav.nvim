@@ -18,8 +18,11 @@ local M = {}
 local function parse_jdtls_argv(argv)
   local launcher, data = false, nil
   for i = 1, #argv do
-    if argv[i] == "-jar" and argv[i + 1]
-        and argv[i + 1]:find("org.eclipse.equinox.launcher", 1, true) then
+    if
+      argv[i] == "-jar"
+      and argv[i + 1]
+      and argv[i + 1]:find("org.eclipse.equinox.launcher", 1, true)
+    then
       launcher = true
     elseif argv[i] == "-data" and argv[i + 1] then
       data = argv[i + 1]:gsub("/+$", "")
@@ -78,10 +81,15 @@ function M.jdtls_inventory(opts)
     local pid = vim.fn.fnamemodify(entry, ":t")
     local argv = read_argv(pid)
     local launcher, data = false, nil
-    if argv then launcher, data = parse_jdtls_argv(argv) end
+    if argv then
+      launcher, data = parse_jdtls_argv(argv)
+    end
     if launcher then
-      local owner = proc.ancestor_named(pid, { nvim = true },
-        { comm = read_comm, ppid = read_ppid })
+      local owner = proc.ancestor_named(
+        pid,
+        { nvim = true },
+        { comm = read_comm, ppid = read_ppid }
+      )
       out[#out + 1] = {
         pid = pid,
         data = data,
@@ -104,11 +112,15 @@ end
 --- @param records table|nil 已扫好的 inventory (避免同一轮里重复扫 /proc)
 --- @return table pids 字符串进程号列表
 function M.jdtls_holders(workspace_dir, records)
-  if not workspace_dir or workspace_dir == "" then return {} end
+  if not workspace_dir or workspace_dir == "" then
+    return {}
+  end
   workspace_dir = workspace_dir:gsub("/+$", "")
   local out = {}
   for _, r in ipairs(records or M.jdtls_inventory()) do
-    if r.data == workspace_dir then out[#out + 1] = r.pid end
+    if r.data == workspace_dir then
+      out[#out + 1] = r.pid
+    end
   end
   return out
 end
@@ -127,7 +139,9 @@ end
 --- @param records table|nil 已扫好的 inventory (避免同一轮里重复扫 /proc)
 --- @return table{jdtls_inventory 的记录}
 function M.foreign_jdtls(workspace_dir, records)
-  if not workspace_dir or workspace_dir == "" then return {} end
+  if not workspace_dir or workspace_dir == "" then
+    return {}
+  end
   workspace_dir = workspace_dir:gsub("/+$", "")
   local self = vim.fn.getpid()
   local proc = require("aosp-nav.util.proc")
@@ -154,28 +168,41 @@ end
 --- @return table 真的发过 SIGTERM 的 pid 列表
 function M.reap_orphan_jdtls(records, opts)
   opts = opts or {}
-  if opts.enabled == false then return {} end
+  if opts.enabled == false then
+    return {}
+  end
   local victims = {}
   for _, r in ipairs(records or {}) do
-    if r.orphan and r.ours then victims[#victims + 1] = r.pid end
+    if r.orphan and r.ours then
+      victims[#victims + 1] = r.pid
+    end
   end
-  if #victims == 0 then return {} end
+  if #victims == 0 then
+    return {}
+  end
   -- libuv 的 kill 失败时**不抛错**, 而是返回 nil, err (实测: ESRCH 走这条) ——
   -- 所以不能只 pcall, 还要看返回值, 否则"根本没杀成"会被当成杀成了报给用户。
-  local kill = opts.kill or function(pid)
-    local ok, res = pcall(vim.uv.kill, tonumber(pid), "sigterm")
-    return ok and res ~= nil
-  end
+  local kill = opts.kill
+    or function(pid)
+      local ok, res = pcall(vim.uv.kill, tonumber(pid), "sigterm")
+      return ok and res ~= nil
+    end
   local out = {}
   for _, pid in ipairs(victims) do
-    if kill(pid) ~= false then out[#out + 1] = pid end
+    if kill(pid) ~= false then
+      out[#out + 1] = pid
+    end
   end
   local wait_ms = opts.wait_ms
-  if wait_ms == nil then wait_ms = 3000 end
+  if wait_ms == nil then
+    wait_ms = 3000
+  end
   if wait_ms > 0 then
     vim.wait(wait_ms, function()
       for _, pid in ipairs(out) do
-        if vim.fn.isdirectory("/proc/" .. pid) == 1 then return false end
+        if vim.fn.isdirectory("/proc/" .. pid) == 1 then
+          return false
+        end
       end
       return true
     end, 100)
@@ -199,12 +226,18 @@ function M.instances_message(rep)
   -- 既列 "ORPHAN (its nvim is gone)" 又列 "killed just now", 还会出现在 kill 行里
   -- 让用户去杀一个已经死掉的 pid。
   local gone = {}
-  for _, pid in ipairs(reaped) do gone[tostring(pid)] = true end
+  for _, pid in ipairs(reaped) do
+    gone[tostring(pid)] = true
+  end
   local live = {}
   for _, r in ipairs(holders) do
-    if not gone[tostring(r.pid)] then live[#live + 1] = r end
+    if not gone[tostring(r.pid)] then
+      live[#live + 1] = r
+    end
   end
-  if #live == 0 and #reaped == 0 then return nil end
+  if #live == 0 and #reaped == 0 then
+    return nil
+  end
   local parts = {}
   if #live > 0 or #reaped > 0 then
     local l = {
@@ -212,23 +245,30 @@ function M.instances_message(rep)
       "  " .. (rep.ws_dir or "?"),
     }
     for _, r in ipairs(live) do
-      l[#l + 1] = ("  pid %s — %s"):format(r.pid,
-        r.owner_pid and ("nvim %d"):format(r.owner_pid) or "ORPHAN (its nvim is gone)")
+      l[#l + 1] = ("  pid %s — %s"):format(
+        r.pid,
+        r.owner_pid and ("nvim %d"):format(r.owner_pid) or "ORPHAN (its nvim is gone)"
+      )
     end
     for _, pid in ipairs(reaped) do
       l[#l + 1] = ("  pid %s — ORPHAN, killed just now"):format(pid)
     end
     l[#l + 1] = "Two JVMs on one index overwrite each other (the index is deleted and "
-      .. "rebuilt, \"Java Index broken\"). Keep one:"
+      .. 'rebuilt, "Java Index broken"). Keep one:'
     local pids = {}
-    for _, r in ipairs(live) do pids[#pids + 1] = r.pid end
+    for _, r in ipairs(live) do
+      pids[#pids + 1] = r.pid
+    end
     local owned = {}
     for _, r in ipairs(live) do
-      if r.owner_pid then owned[#owned + 1] = ("nvim %d"):format(r.owner_pid) end
+      if r.owner_pid then
+        owned[#owned + 1] = ("nvim %d"):format(r.owner_pid)
+      end
     end
     if #pids > 0 then
       l[#l + 1] = (#owned > 0 and ("close " .. table.concat(owned, ", ") .. ", or ") or "")
-        .. "kill " .. table.concat(pids, " ")
+        .. "kill "
+        .. table.concat(pids, " ")
     end
     l[#l + 1] = "This does not need :AospCleanWorkspace unless the index turns out "
       .. "broken afterwards."
@@ -247,9 +287,13 @@ end
 --- @return string|nil
 function M.data_dir(client)
   local cmd = client and client.config and client.config.cmd
-  if type(cmd) ~= "table" then return nil end
+  if type(cmd) ~= "table" then
+    return nil
+  end
   for i, a in ipairs(cmd) do
-    if a == "-data" and cmd[i + 1] then return cmd[i + 1] end
+    if a == "-data" and cmd[i + 1] then
+      return cmd[i + 1]
+    end
   end
   return nil
 end
@@ -259,8 +303,12 @@ end
 --- @return string|nil
 function M.root_dir(client)
   local rd = client and client.root_dir
-  if not rd or rd == "" then rd = client and client.config and client.config.root_dir end
-  if type(rd) == "string" and rd ~= "" then return rd end
+  if not rd or rd == "" then
+    rd = client and client.config and client.config.root_dir
+  end
+  if type(rd) == "string" and rd ~= "" then
+    return rd
+  end
   return nil
 end
 
@@ -269,9 +317,13 @@ end
 --- @return string
 function M.tree_name(client)
   local rd = M.root_dir(client)
-  if rd then return vim.fn.fnamemodify(rd, ":t") end
+  if rd then
+    return vim.fn.fnamemodify(rd, ":t")
+  end
   local d = M.data_dir(client)
-  if d and d ~= "" then return vim.fn.fnamemodify(d:gsub("/+$", ""), ":h:t") end
+  if d and d ~= "" then
+    return vim.fn.fnamemodify(d:gsub("/+$", ""), ":h:t")
+  end
   return "jdtls"
 end
 
@@ -295,7 +347,9 @@ function M.jdtls_pid(client)
     local argv = proc.argv(pid)
     if argv and is_jdtls_on(argv, dir) then
       all[#all + 1] = pid
-      if proc.is_descendant(pid, self) then mine[#mine + 1] = pid end
+      if proc.is_descendant(pid, self) then
+        mine[#mine + 1] = pid
+      end
     end
   end
   local cands = #mine > 0 and mine or all
@@ -307,7 +361,9 @@ function M.jdtls_pid(client)
   local best
   for _, pid in ipairs(cands) do
     local ok, exe = pcall(vim.uv.fs_readlink, "/proc/" .. pid .. "/exe")
-    if ok and type(exe) == "string" and exe:find("/java", 1, true) then best = pid end
+    if ok and type(exe) == "string" and exe:find("/java", 1, true) then
+      best = pid
+    end
   end
   return best or cands[1], nil
 end

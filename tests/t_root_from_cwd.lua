@@ -34,8 +34,7 @@ local function not_dot(fname, label)
   local ok, root = pcall(root_mod.aosp_root, fname)
   H.check(ok, "aosp_root(" .. label .. ") 不抛异常: " .. tostring(root))
   H.check(root ~= ".", "aosp_root(" .. label .. ") 不是 '.' (got " .. tostring(root) .. ")")
-  H.check(root == nil or type(root) == "string",
-    "aosp_root(" .. label .. ") 返回 string|nil")
+  H.check(root == nil or type(root) == "string", "aosp_root(" .. label .. ") 返回 string|nil")
 end
 
 not_dot(nil, "nil")
@@ -73,8 +72,9 @@ if vim.env.AOSPNAV_LIVE_TEST == "1" and vim.fn.isdirectory(LIVE) == 1 then
 
   vim.fn.chdir(saved_cwd)
 else
-  io.write("SKIP: live root-from-cwd checks "
-    .. "(set AOSPNAV_LIVE_TEST=1 with " .. LIVE .. " present)\n")
+  io.write(
+    "SKIP: live root-from-cwd checks " .. "(set AOSPNAV_LIVE_TEST=1 with " .. LIVE .. " present)\n"
+  )
 end
 
 H.finish("t_root_from_cwd")

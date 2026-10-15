@@ -30,21 +30,21 @@ local _active = "_"
 local function blank()
   return {
     phase = "idle",
-    root = nil,          -- jdtls 工作区根
-    android_root = nil,  -- AOSP 检测根 (jar 缓存键)
+    root = nil, -- jdtls 工作区根
+    android_root = nil, -- AOSP 检测根 (jar 缓存键)
     jars = 0,
-    cache_origin = nil,  -- "cache" | "scan" | "fallback" | nil
+    cache_origin = nil, -- "cache" | "scan" | "fallback" | nil
     index_warned = false,
     -- [v8] sourcePaths 注入 (见 java/source_inject.lua)
-    source_roots = 0,          -- 导入期注入的条目数
+    source_roots = 0, -- 导入期注入的条目数
     -- [v10] 单一模式字段
-    mode = nil,                -- java.mode: "aosp" | "infer" | "project"
-    source_projects = 0,       -- 已累积的项目数
+    mode = nil, -- java.mode: "aosp" | "infer" | "project"
+    source_projects = 0, -- 已累积的项目数
     -- [v12] 会话隔离 (java/session_conflict.lua): 另一个 nvim 已占着本棵树本该用的
     -- `-data` 时, 本会话改用一份独立索引且不注入 sourcePaths/jars。面板据此解释
     -- "为什么这窗口跳 jar" (sourcePaths 未注入 / referencedLibraries=0 不是故障)。
-    limited = false,           -- true = 本会话用了隔离索引、功能受限
-    isolated_index = nil,      -- 隔离索引的 `-data` 路径 (limited 时才有)
+    limited = false, -- true = 本会话用了隔离索引、功能受限
+    isolated_index = nil, -- 隔离索引的 `-data` 路径 (limited 时才有)
   }
 end
 
@@ -60,8 +60,12 @@ end
 
 --- key 归一 (绝对化 + 去尾斜杠), 与 aosp_root 的产出同口径
 local function norm(key)
-  if not key or key == "" then return nil end
-  if key == "_" then return "_" end
+  if not key or key == "" then
+    return nil
+  end
+  if key == "_" then
+    return "_"
+  end
   return (vim.fn.fnamemodify(key, ":p"):gsub("/+$", ""))
 end
 

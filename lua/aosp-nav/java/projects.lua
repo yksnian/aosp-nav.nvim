@@ -25,8 +25,12 @@ end
 --- @param dir string
 --- @return boolean
 local function has_marker(dir)
-  if vim.fn.filereadable(dir .. "/.project") == 1 then return true end
-  if vim.fn.isdirectory(dir .. "/.git") == 1 then return true end
+  if vim.fn.filereadable(dir .. "/.project") == 1 then
+    return true
+  end
+  if vim.fn.isdirectory(dir .. "/.git") == 1 then
+    return true
+  end
   -- worktree / submodule 的 .git 是指向 gitdir 的普通文件
   return vim.fn.filereadable(dir .. "/.git") == 1
 end
@@ -38,11 +42,15 @@ end
 --- @param aosp_root string|nil AOSP 根 (nil = 不限边界, 只回到文件系统根)
 --- @return string|nil project_root 绝对路径; nil = 没找到 (或越过了 AOSP 根)
 function M.find_project_root(fname, aosp_root)
-  if not fname or fname == "" then return nil end
+  if not fname or fname == "" then
+    return nil
+  end
   -- 起点归一 (见 util/path.lua): 文件 -> 其所在目录, 目录 -> 自身。
   -- 传目录进来时不能再用 :h —— 那会把目录本身跳过, 从它的父目录开始找标记。
   local dir = normalize(require("aosp-nav.util.path").start_dir(fname))
-  if dir == "" or dir == "/" then return nil end
+  if dir == "" or dir == "/" then
+    return nil
+  end
 
   local bound = (aosp_root and aosp_root ~= "") and normalize(aosp_root) or nil
   -- 文件不在 AOSP 树内: 没有可信边界, 交给调用方
@@ -51,10 +59,16 @@ function M.find_project_root(fname, aosp_root)
   end
 
   while dir ~= "" and dir ~= "/" do
-    if bound and dir == bound then return nil end
-    if has_marker(dir) then return dir end
+    if bound and dir == bound then
+      return nil
+    end
+    if has_marker(dir) then
+      return dir
+    end
     local parent = dir:match("^(.*)/[^/]+$")
-    if not parent or parent == "" then break end
+    if not parent or parent == "" then
+      break
+    end
     dir = parent
   end
   return nil
@@ -65,8 +79,12 @@ end
 --- @param project_root string
 --- @return string
 function M.rel(aosp_root, project_root)
-  if not project_root then return "" end
-  if not aosp_root or aosp_root == "" then return project_root end
+  if not project_root then
+    return ""
+  end
+  if not aosp_root or aosp_root == "" then
+    return project_root
+  end
   local a = normalize(aosp_root)
   local prefix = a .. "/"
   if project_root:sub(1, #prefix) == prefix then

@@ -19,7 +19,9 @@ end
 local function predict_kls_root(fname, markers)
   local target = (fname ~= "") and fname or vim.fn.getcwd()
   local ok, r = pcall(vim.fs.root, target, markers)
-  if ok and type(r) == "string" and r ~= "" then return r end
+  if ok and type(r) == "string" and r ~= "" then
+    return r
+  end
   return nil
 end
 
@@ -29,11 +31,15 @@ end
 --- @param fname string 触发文件 (用于反查 AOSP 根)
 --- @return table|nil extra 供 ensure_script 使用
 local function kls_root_extra(root, fname)
-  if type(root) ~= "string" or root == "" then return nil end
+  if type(root) ~= "string" or root == "" then
+    return nil
+  end
   -- 用 aosp_root 而非 workspace_root: 后者在 java.mode="project" 下为
   -- nil, 而这里的映射要的是 AOSP 根 (KLS 的 workspace root 可能是模块目录)
   local aosp = require("aosp-nav.java.root").aosp_root(fname)
-  if not aosp then return nil end
+  if not aosp then
+    return nil
+  end
   return { root = root, aosp = aosp }
 end
 
@@ -84,7 +90,8 @@ function M.configure(opts)
   --    分发表让它直接命中正确的 AOSP 根 (脚本自身向上找 out/ 也能兜住没登记的)
   local buf = vim.api.nvim_buf_get_name(0)
   local path, err = require("aosp-nav.kotlin.classpath").ensure_script(
-    kls_root_extra(predict_kls_root(buf, opts.root_markers), buf))
+    kls_root_extra(predict_kls_root(buf, opts.root_markers), buf)
+  )
   if not path then
     log.error("kls-classpath generate failed: " .. (err or "unknown"))
   end
@@ -148,9 +155,13 @@ function M.configure(opts)
       callback = function()
         -- 正常 shutdown 流程优先, 再以祖先链精确补杀 KLS 不响应 shutdown 的残留
         for _, client in ipairs(vim.lsp.get_clients({ name = "kotlin_language_server" })) do
-          pcall(function() vim.lsp.stop_client(client.id) end)
+          pcall(function()
+            vim.lsp.stop_client(client.id)
+          end)
         end
-        pcall(function() proc.cleanup() end)
+        pcall(function()
+          proc.cleanup()
+        end)
       end,
     })
   end

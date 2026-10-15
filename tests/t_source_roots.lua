@@ -12,7 +12,9 @@ local H = require("tests.helper")
 local TMP = vim.fn.tempname()
 vim.fn.mkdir(TMP, "p")
 
-local function mkdir(p) vim.fn.mkdir(p, "p") end
+local function mkdir(p)
+  vim.fn.mkdir(p, "p")
+end
 local function write(path, lines)
   vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
   vim.fn.writefile(lines, path)
@@ -22,10 +24,14 @@ end
 -- 包名驱动源码根推导 (向上退 N 级), 所以 com/example/foo/Bar.java 的根是 .../com 的父级。
 local PROJ = TMP .. "/proj"
 mkdir(PROJ .. "/.git")
-write(PROJ .. "/framework/java/com/example/foo/Bar.java",
-  { "package com.example.foo;", "public class Bar {}" })
-write(PROJ .. "/service/java/com/example/svc/Baz.java",
-  { "package com.example.svc;", "public class Baz {}" })
+write(
+  PROJ .. "/framework/java/com/example/foo/Bar.java",
+  { "package com.example.foo;", "public class Bar {}" }
+)
+write(
+  PROJ .. "/service/java/com/example/svc/Baz.java",
+  { "package com.example.svc;", "public class Baz {}" }
+)
 
 -- 没有 java 源码的项目 (只有 .git) —— 扫描结果为空, 用来验证空列表被挡下。
 local EMPTY_PROJ = TMP .. "/empty-proj"
@@ -36,10 +42,15 @@ local nav = require("aosp-nav")
 nav.setup({ cache_dir = CACHE, java = { mode = "aosp" } })
 local SR = require("aosp-nav.java.source_roots")
 
-local function set_mode(m) nav.config.java.mode = m end
+local function set_mode(m)
+  nav.config.java.mode = m
+end
 
 -- ---------------------------------------------------------------------------
-H.check("两个入口都是函数", type(SR.find) == "function" and type(SR.find_for_project) == "function")
+H.check(
+  "两个入口都是函数",
+  type(SR.find) == "function" and type(SR.find_for_project) == "function"
+)
 
 -- mode="aosp": M.find 给结果, M.find_for_project 退让
 set_mode("aosp")
@@ -68,12 +79,16 @@ do
   -- 能直接复用同一份扫描结果的原因 (workspace 根恰好就是项目目录)。
   local all_relative = true
   for _, v in ipairs(a or {}) do
-    if v:sub(1, 1) == "/" then all_relative = false end
+    if v:sub(1, 1) == "/" then
+      all_relative = false
+    end
   end
   H.check("project: 全部是相对路径 (无绝对路径)", all_relative)
 
   local has = {}
-  for _, v in ipairs(a or {}) do has[v] = true end
+  for _, v in ipairs(a or {}) do
+    has[v] = true
+  end
   H.check("project: 含 framework/java", has["framework/java"] == true)
   H.check("project: 含 service/java", has["service/java"] == true)
 end
@@ -88,12 +103,12 @@ end
 -- 入参退化: nil / "" 一律 nil, 不抛错
 set_mode("project")
 H.eq(SR.find_for_project(nil), nil, "find_for_project(nil) -> nil")
-H.eq(SR.find_for_project(""), nil, "find_for_project(\"\") -> nil")
+H.eq(SR.find_for_project(""), nil, 'find_for_project("") -> nil')
 -- 缓存: 同一目录第二次调用结果一致 (scan_cached 命中, 不重扫)
 set_mode("project")
 do
-  local a = SR.find_for_project(PROJ, { no_cache = true })  -- 强制重扫, 事件缓存清掉
-  local b = SR.find_for_project(PROJ)                       -- 这次应命中缓存
+  local a = SR.find_for_project(PROJ, { no_cache = true }) -- 强制重扫, 事件缓存清掉
+  local b = SR.find_for_project(PROJ) -- 这次应命中缓存
   H.check("缓存后结果一致", vim.deep_equal(a, b))
 end
 
@@ -114,10 +129,14 @@ do
   local TREE = TMP .. "/tree"
   mkdir(TREE .. "/pkgA/.git")
   mkdir(TREE .. "/pkgB/.git")
-  write(TREE .. "/pkgA/framework/java/com/example/a/A.java",
-    { "package com.example.a;", "public class A {}" })
-  write(TREE .. "/pkgB/framework/java/com/example/b/B.java",
-    { "package com.example.b;", "public class B {}" })
+  write(
+    TREE .. "/pkgA/framework/java/com/example/a/A.java",
+    { "package com.example.a;", "public class A {}" }
+  )
+  write(
+    TREE .. "/pkgB/framework/java/com/example/b/B.java",
+    { "package com.example.b;", "public class B {}" }
+  )
   write(TREE .. "/loose/NoMarker.java", { "package x;", "public class NoMarker {}" })
 
   nav.config.android_root = TREE
@@ -128,25 +147,35 @@ do
   H.eq(pa, TREE .. "/pkgA", "project_dir: A.java -> pkgA")
   H.eq(pb, TREE .. "/pkgB", "project_dir: B.java -> pkgB")
   H.check("project_dir: 两个不同项目给出不同根", pa ~= pb)
-  H.eq(R.project_dir(TREE .. "/loose/NoMarker.java"), nil,
-    "project_dir: 树内无项目标记 -> nil (不猜)")
+  H.eq(
+    R.project_dir(TREE .. "/loose/NoMarker.java"),
+    nil,
+    "project_dir: 树内无项目标记 -> nil (不猜)"
+  )
 
   -- **这条才是 bug 的正面回归**: project 模式下绝不能把 AOSP 根当项目目录。
   H.check("project_dir 不等于 AOSP 根", pa ~= TREE)
-  H.eq(R.workspace_root(TREE .. "/pkgA/framework/java/com/example/a/A.java"), nil,
-    "workspace_root: project 模式仍是 nil (旧契约不变, 别靠它兜底)")
+  H.eq(
+    R.workspace_root(TREE .. "/pkgA/framework/java/com/example/a/A.java"),
+    nil,
+    "workspace_root: project 模式仍是 nil (旧契约不变, 别靠它兜底)"
+  )
 
   -- 非 project 模式: project_dir 退让 (它只回答 project 模式的问题)
   for _, m in ipairs({ "aosp", "infer" }) do
     set_mode(m)
-    H.eq(R.project_dir(TREE .. "/pkgA/framework/java/com/example/a/A.java"), nil,
-      ("project_dir: mode=%s 退让 -> nil"):format(m))
+    H.eq(
+      R.project_dir(TREE .. "/pkgA/framework/java/com/example/a/A.java"),
+      nil,
+      ("project_dir: mode=%s 退让 -> nil"):format(m)
+    )
   end
 
   -- 项目源码根必须是**项目相对**的 (相对 pkgA), 不是树相对
   set_mode("project")
   SR.reset(TREE .. "/pkgA")
-  local roots = SR.find_for_project(R.project_dir(TREE .. "/pkgA/framework/java/com/example/a/A.java"))
+  local roots =
+    SR.find_for_project(R.project_dir(TREE .. "/pkgA/framework/java/com/example/a/A.java"))
   H.eq(roots and #roots, 1, "pkgA: 找到 1 条根")
   H.eq(roots and roots[1], "framework/java", "pkgA: 根相对项目目录")
 

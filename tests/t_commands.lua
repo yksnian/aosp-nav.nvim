@@ -41,14 +41,19 @@ end
 -- 恰好五个 Aosp* 命令
 local aosp = {}
 for name in pairs(cmds) do
-  if name:match("^Aosp") then aosp[#aosp + 1] = name end
+  if name:match("^Aosp") then
+    aosp[#aosp + 1] = name
+  end
 end
 table.sort(aosp)
 local want = vim.deepcopy(EXPECTED)
 table.sort(want)
-H.eq(#aosp, 5, "恰好 5 个 Aosp* 命令 (实际 " .. #aosp .. ": " .. table.concat(aosp, ", ") .. ")")
-H.eq(table.concat(aosp, ","), table.concat(want, ","),
-  "Aosp* 命令集合恰为五个预期命令")
+H.eq(
+  #aosp,
+  5,
+  "恰好 5 个 Aosp* 命令 (实际 " .. #aosp .. ": " .. table.concat(aosp, ", ") .. ")"
+)
+H.eq(table.concat(aosp, ","), table.concat(want, ","), "Aosp* 命令集合恰为五个预期命令")
 -- :AospDebug 必须是 bang 命令 (无 bang = 快照, 有 bang = 落 thread dump)
 H.check(cmds.AospDebug and cmds.AospDebug.bang == true, ":AospDebug 支持 bang")
 H.check(cmds.Aosp and cmds.Aosp.bang == true, ":Aosp 支持 bang (强制注入源码根)")

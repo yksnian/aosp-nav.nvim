@@ -31,13 +31,19 @@ H.eq(sl("no-out", 0, "/aosp"), " AOSP(no out)", "no-out -> fallback 提示")
 H.eq(sl("failed", 0, nil), " AOSP(err)", "failed -> err 提示")
 
 -- --------------------------------------------------------- 链式 handler 语义
-local function ready_result() return { type = "ServiceReady", message = "Ready." } end
+local function ready_result()
+  return { type = "ServiceReady", message = "Ready." }
+end
 
 -- 1. ServiceReady 把 indexing 翻成 ready, 且**先**调用前一个 handler。
 local called_prev = 0
 local fake = {
   name = "jdtls",
-  handlers = { ["language/status"] = function() called_prev = called_prev + 1 end },
+  handlers = {
+    ["language/status"] = function()
+      called_prev = called_prev + 1
+    end,
+  },
 }
 javainit.install_phase_handler(fake)
 H.check(type(fake.handlers["language/status"]) == "function", "handler 已装")

@@ -40,9 +40,13 @@ end
 --- @param aosp_root string|nil 该 client 所属的 AOSP 根 (同时是分区键)
 --- @return table|nil verdict nil = 无从核验 (没工作区/非 AOSP)
 function M.check(ws_dir, aosp_root)
-  if not ws_dir or ws_dir == "" or not aosp_root or aosp_root == "" then return nil end
+  if not ws_dir or ws_dir == "" or not aosp_root or aosp_root == "" then
+    return nil
+  end
   local v = _verdicts[aosp_root]
-  if v and v.invisible_ok ~= nil then return v end
+  if v and v.invisible_ok ~= nil then
+    return v
+  end
   if not v then
     v = {}
     _verdicts[aosp_root] = v
@@ -59,15 +63,22 @@ function M.check(ws_dir, aosp_root)
   local projects = workspace.workspace_projects(ws_dir)
   local found = false
   for _, name in ipairs(projects) do
-    if name == expect then found = true break end
+    if name == expect then
+      found = true
+      break
+    end
   end
   v.invisible_ok = found
   if not found then
-    require("aosp-nav.util.log").user(("jdt.ls contract check: invisible project %q is "
-      .. "absent from the workspace while no blocker exists — jdt.ls likely changed its "
-      .. "project-naming scheme; sourcePaths injection for this tree may be inert. "
-      .. "Check :Aosp and the plugin's supported jdt.ls version.")
-      :format(expect), { id = "contract:" .. aosp_root, timeout = 15000 })
+    require("aosp-nav.util.log").user(
+      (
+        "jdt.ls contract check: invisible project %q is "
+        .. "absent from the workspace while no blocker exists — jdt.ls likely changed its "
+        .. "project-naming scheme; sourcePaths injection for this tree may be inert. "
+        .. "Check :Aosp and the plugin's supported jdt.ls version."
+      ):format(expect),
+      { id = "contract:" .. aosp_root, timeout = 15000 }
+    )
   end
   return v
 end
@@ -77,15 +88,24 @@ end
 --- @return table|nil { text, ok, action }
 function M.verdict(aosp_root)
   local v = aosp_root and _verdicts[aosp_root] or nil
-  if not v then return nil end
+  if not v then
+    return nil
+  end
   if v.invisible_ok == false then
-    return { text = "invisible-project name mismatch (jdt.ls scheme changed?)",
-      ok = false, action = "sourcePaths may be inert; see :Aosp blockers row" }
+    return {
+      text = "invisible-project name mismatch (jdt.ls scheme changed?)",
+      ok = false,
+      action = "sourcePaths may be inert; see :Aosp blockers row",
+    }
   end
   if (v.apply_failed or 0) > 0 then
-    return { text = ("addToSourcePath: %d failure(s) — jdt.ls reply wording may have "
-      .. "changed"):format(v.apply_failed), ok = false,
-      action = "check :AospRescan and the jdt.ls version" }
+    return {
+      text = ("addToSourcePath: %d failure(s) — jdt.ls reply wording may have " .. "changed"):format(
+        v.apply_failed
+      ),
+      ok = false,
+      action = "check :AospRescan and the jdt.ls version",
+    }
   end
   return { text = "ok", ok = true, action = nil }
 end

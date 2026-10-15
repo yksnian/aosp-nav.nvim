@@ -72,7 +72,7 @@ local MAX_BATCH = 50
 -- 必须便宜: 单批 <=5, 其余的留到下个会话 (累积文件已持久化) 或用户手动 :Aosp!。
 local MAX_AUTO_ROOTS = 5
 local _project_applied = {} -- [v16b] [client_key][模块 rel] = true (每会话每模块一次)
-local _proj_armed = {}      -- [v16b] [模块 rel] = true (去抖)
+local _proj_armed = {} -- [v16b] [模块 rel] = true (去抖)
 
 -- [v10] 就绪门控的轮询节奏与总预算。导入实测 ~3.5 分钟, 所以总预算要覆盖它;
 -- 服务器永久忙/死掉则在这个 deadline 后放弃并出声 (must-see, 见 M.report)。
@@ -107,7 +107,9 @@ function M.client(fname)
     local bufnr = vim.fn.bufnr(fname)
     if bufnr and bufnr > 0 then
       local c = vim.lsp.get_clients({ name = "jdtls", bufnr = bufnr })[1]
-      if c then return c end
+      if c then
+        return c
+      end
     end
   end
   return vim.lsp.get_clients({ name = "jdtls" })[1]
@@ -120,7 +122,9 @@ end
 --- @return string
 local function client_key(client)
   local root = client and (client.root_dir or (client.config and client.config.root_dir))
-  if root and root ~= "" then return root end
+  if root and root ~= "" then
+    return root
+  end
   return client and ("client:" .. tostring(client.id)) or "?"
 end
 
@@ -138,7 +142,9 @@ end
 --- @param client table|nil
 --- @return boolean
 local function ready(client)
-  if not client or not client.initialized then return false end
+  if not client or not client.initialized then
+    return false
+  end
   local p = client.progress and client.progress.pending
   return p == nil or next(p) == nil
 end
@@ -149,7 +155,9 @@ end
 --- @return string
 function M.abs_of(aosp_root, rel)
   rel = (rel:gsub("^%./", ""):gsub("/+$", ""))
-  if rel == "" or rel == "." then return aosp_root end
+  if rel == "" or rel == "." then
+    return aosp_root
+  end
   return aosp_root .. "/" .. rel
 end
 
@@ -160,10 +168,16 @@ end
 --- @return string|nil
 local function strip_link(path)
   path = (path:gsub("/+$", ""))
-  if path == "_" then return "." end
-  if path:sub(1, 2) == "_/" then return path:sub(3) end
+  if path == "_" then
+    return "."
+  end
+  if path:sub(1, 2) == "_/" then
+    return path:sub(3)
+  end
   -- 没有 link 前缀 (可见工程形态) 对 invisible project 无意义
-  if path:sub(1, 1) == "/" then return nil end
+  if path:sub(1, 1) == "/" then
+    return nil
+  end
   return path
 end
 
@@ -174,7 +188,9 @@ end
 --- @param names table 候选工程名 (jdtls root_dir 可能是 aosp 根或项目根)
 --- @return table|nil rels 去重后的相对路径列表, nil = 一个都没读到
 function M.installed(ws_dir, names)
-  if not ws_dir or ws_dir == "" then return nil end
+  if not ws_dir or ws_dir == "" then
+    return nil
+  end
   for _, name in ipairs(names or {}) do
     local f = ws_dir .. "/" .. name .. "/.classpath"
     if vim.fn.filereadable(f) == 1 then
@@ -204,13 +220,17 @@ function M.workspace(fname)
   local rm = require("aosp-nav.java.root")
   local bufname = (fname and fname ~= "") and fname or vim.api.nvim_buf_get_name(0)
   local ws_dir = ws.workspace_dir(bufname)
-  if not ws_dir then return nil, {} end
+  if not ws_dir then
+    return nil, {}
+  end
   local names, seen = {}, {}
   -- [v18.2] project 模式下 workspace_root() 返回 nil, 而 -data 里的 invisible project
   -- 是**按项目目录**命名的 (Wifi_xxx) —— 不把 project_dir 的名字加进候选, 磁盘
   -- .classpath 永远读不到, 面板退化为 memory view、needs_reorder 恒 false。
   for _, root in ipairs({
-    rm.project_dir(bufname), rm.workspace_root(bufname), rm.aosp_root(bufname),
+    rm.project_dir(bufname),
+    rm.workspace_root(bufname),
+    rm.aosp_root(bufname),
   }) do
     if root and root ~= "" and not seen[root] then
       seen[root] = true
@@ -233,28 +253,38 @@ function M.pending(fname)
   -- [v18.6] project 模式同样走运行期增量 (workspace_follow 切项目时注入新项目根):
   -- 两个模式的注入机制自此合一 (addToSourcePath + reorder), infer 仍不注入。
   if j.mode ~= "aosp" and j.mode ~= "project" then
-    return nil, "java.mode must be \"aosp\" or \"project\" (current: "
-      .. tostring(j.mode) .. ")", "mode"
+    return nil,
+      'java.mode must be "aosp" or "project" (current: ' .. tostring(j.mode) .. ")",
+      "mode"
   end
   local rm = require("aosp-nav.java.root")
   local bufname = (fname and fname ~= "") and fname or vim.api.nvim_buf_get_name(0)
   -- 与 source_inject 同一基准: union 相对的是 jdtls 工作区根 (= AOSP 根)
   local aosp_root = rm.aosp_root(bufname)
-  if not aosp_root then return nil, "not inside an AOSP tree", "not-aosp" end
+  if not aosp_root then
+    return nil, "not inside an AOSP tree", "not-aosp"
+  end
 
   local ws_dir, names = M.workspace(bufname)
   local installed = M.installed(ws_dir, names)
   if not installed then
-    return nil, "cannot read the invisible project's .classpath under "
-      .. tostring(ws_dir or "?") .. " (is jdtls running for this tree?)", "no-classpath"
+    return nil,
+      "cannot read the invisible project's .classpath under "
+        .. tostring(ws_dir or "?")
+        .. " (is jdtls running for this tree?)",
+      "no-classpath"
   end
 
   local have = {}
-  for _, rel in ipairs(installed) do have[rel] = true end
+  for _, rel in ipairs(installed) do
+    have[rel] = true
+  end
 
   local out = {}
   for _, rel in ipairs(require("aosp-nav.java.source_inject").union(j, aosp_root)) do
-    if not have[rel] then out[#out + 1] = rel end
+    if not have[rel] then
+      out[#out + 1] = rel
+    end
   end
   table.sort(out)
   return out
@@ -271,11 +301,17 @@ end
 --- @return string outcome "added"|"present"|"failed"
 --- @return string message
 local function classify(result)
-  if type(result) ~= "table" then return "failed", "no result" end
+  if type(result) ~= "table" then
+    return "failed", "no result"
+  end
   local msg = type(result.message) == "string" and result.message or ""
-  if msg:find("Successfully added", 1, true) then return "added", msg end
+  if msg:find("Successfully added", 1, true) then
+    return "added", msg
+  end
   if result.status ~= true then
-    if msg:find("already in the source path", 1, true) then return "present", msg end
+    if msg:find("already in the source path", 1, true) then
+      return "present", msg
+    end
     return "failed", msg ~= "" and msg or "unknown error"
   end
   -- "No need to add it to source path again, ..." 等
@@ -294,10 +330,16 @@ M._classify = classify
 --- @param rels table 相对路径列表
 --- @param done fun(summary table)
 local function add_serial(client, aosp_root, rels, done)
-  local summary = { added = 0, present = 0, failed = 0, missing = 0, errors = {},
+  local summary = {
+    added = 0,
+    present = 0,
+    failed = 0,
+    missing = 0,
+    errors = {},
     -- [v13] 本次**确实写进 workspace** 的相对路径 (added 分支逐条记录) —— 完成后由
     -- start 回填 source_inject 的 installed 账本, 否则面板的 pending 永远清不了零
-    added_rels = {} }
+    added_rels = {},
+  }
   local i = 0
 
   local function step()
@@ -369,8 +411,8 @@ local _running = {}
 local _applied_ok = {}
 
 -- 有界轮询状态 (取代旧的墙钟 RETRY 循环), 同样按 client 分区
-local _poll_armed = {}        -- 已排一次 vim.defer_fn 轮询
-local _deadline = {}          -- 自动路径的总预算截止 (单调 ms; nil = 未开始)
+local _poll_armed = {} -- 已排一次 vim.defer_fn 轮询
+local _deadline = {} -- 自动路径的总预算截止 (单调 ms; nil = 未开始)
 
 -- 每棵树至多提示一次自动失败 (M.report 的闸)
 local _auto_reported = {}
@@ -386,10 +428,16 @@ local _attach_done = {}
 --- @return string
 local function summarize(s)
   local lines = {
-    ("source roots: %d added, %d already present, %d failed, %d missing")
-      :format(s.added, s.present, s.failed, s.missing),
+    ("source roots: %d added, %d already present, %d failed, %d missing"):format(
+      s.added,
+      s.present,
+      s.failed,
+      s.missing
+    ),
   }
-  for _, e in ipairs(s.errors) do lines[#lines + 1] = "  " .. e end
+  for _, e in ipairs(s.errors) do
+    lines[#lines + 1] = "  " .. e
+  end
   return table.concat(lines, "\n")
 end
 
@@ -403,12 +451,18 @@ end
 --- @return boolean started false = 已有一批在跑
 local function start(client, aosp_root, batch, tag, deferred, fname)
   local key = client_key(client)
-  if _running[key] then return false end
+  if _running[key] then
+    return false
+  end
   _running[key] = true
   if log.enabled("debug") then
-    log.debug(("%s: adding %d source root(s) to the running jdtls workspace%s")
-      :format(tag, #batch,
-        (deferred and deferred > 0) and (", %d deferred to next session"):format(deferred) or ""))
+    log.debug(
+      ("%s: adding %d source root(s) to the running jdtls workspace%s"):format(
+        tag,
+        #batch,
+        (deferred and deferred > 0) and (", %d deferred to next session"):format(deferred) or ""
+      )
+    )
   end
   add_serial(client, aosp_root, batch, function(s)
     _running[key] = nil
@@ -480,7 +534,9 @@ local NOP_JAR_SUFFIX = "/out/soong/.aospnav-reflib-nop.jar"
 --- @param names table 候选工程名
 --- @return string|nil
 local function classpath_order(ws_dir, names)
-  if not ws_dir or ws_dir == "" then return nil end
+  if not ws_dir or ws_dir == "" then
+    return nil
+  end
   for _, name in ipairs(names or {}) do
     local f = ws_dir .. "/" .. name .. "/.classpath"
     if vim.fn.filereadable(f) == 1 then
@@ -497,7 +553,9 @@ local function classpath_order(ws_dir, names)
         end
       end
       if first_lib then
-        if not last_src then return "src-first" end -- 只有 lib 没有 src: 无需重排
+        if not last_src then
+          return "src-first"
+        end -- 只有 lib 没有 src: 无需重排
         return last_src < first_lib and "src-first" or "src-behind"
       end
       return nil
@@ -518,7 +576,9 @@ end
 local function host_mem_available_kb()
   for _, l in ipairs(vim.fn.readfile("/proc/meminfo")) do
     local kb = l:match("^MemAvailable:%s+(%d+)")
-    if kb then return tonumber(kb) end
+    if kb then
+      return tonumber(kb)
+    end
   end
   return nil
 end
@@ -539,8 +599,12 @@ local REORDER_MIN_AVAIL_KB = 6 * 1024 * 1024 -- 6GB (16G 宿主的一半; 被闸
 function M.reorder(client, aosp_root, fname)
   local avail = host_mem_available_kb()
   if avail and avail < REORDER_MIN_AVAIL_KB then
-    log.info(("reorder skipped: %.1f GB memory available (need >= 6.0); "
-      .. "the next jdtls start reorders it for free"):format(avail / 1048576))
+    log.info(
+      (
+        "reorder skipped: %.1f GB memory available (need >= 6.0); "
+        .. "the next jdtls start reorders it for free"
+      ):format(avail / 1048576)
+    )
     return false
   end
   local jars = require("aosp-nav.java.jars").find_android_jars({ fname = fname })
@@ -549,9 +613,11 @@ function M.reorder(client, aosp_root, fname)
     return false
   end
   local cfg = client.config or {}
-  local settings = vim.tbl_deep_extend("force",
+  local settings = vim.tbl_deep_extend(
+    "force",
     vim.deepcopy(cfg.settings or {}),
-    vim.deepcopy(cfg.init_options and cfg.init_options.settings or {}))
+    vim.deepcopy(cfg.init_options and cfg.init_options.settings or {})
+  )
   local inc = vim.deepcopy(jars)
   inc[#inc + 1] = aosp_root .. NOP_JAR_SUFFIX
   settings.java = settings.java or {}
@@ -573,8 +639,12 @@ end
 --- @param fname string|nil
 local function maybe_reorder(client, aosp_root, fname)
   local ws_dir, names = M.workspace(fname)
-  if classpath_order(ws_dir, names) ~= "src-behind" then return end
-  if not M.reorder(client, aosp_root, fname) then return end
+  if classpath_order(ws_dir, names) ~= "src-behind" then
+    return
+  end
+  if not M.reorder(client, aosp_root, fname) then
+    return
+  end
   vim.defer_fn(function()
     local ws2, names2 = M.workspace(fname)
     if classpath_order(ws2, names2) == "src-behind" then
@@ -584,14 +654,13 @@ local function maybe_reorder(client, aosp_root, fname)
 end
 
 M.start = start -- [v18.6] 导出编排体: workspace_follow 的项目切换注入走同一链路
-                -- (逐条 addToSourcePath 建节点, 完成回调自动 reorder 提权)
+-- (逐条 addToSourcePath 建节点, 完成回调自动 reorder 提权)
 
 --- 增量注入入口 (手动, :Aosp!)。逐条 addToSourcePath 建节点, 完成后自动重排提权。
 --- @param opts table|nil { force = boolean }
 function M.apply(opts)
   opts = opts or {}
-  local fname = (opts.fname and opts.fname ~= "") and opts.fname
-    or vim.api.nvim_buf_get_name(0)
+  local fname = (opts.fname and opts.fname ~= "") and opts.fname or vim.api.nvim_buf_get_name(0)
   local client = M.client(fname)
   -- [v15] 面板/非树 buffer 上跑 :Aosp! 的早退修复: 树解析失败时回退到
   -- jdtls client 的根 (单 jdtls 会话下安全), 与 ui.panel_basis 同思路 ——
@@ -601,8 +670,12 @@ function M.apply(opts)
     client = cands[1]
     if client then
       local r = client.root_dir
-      if not r or r == "" then r = client.config and client.config.root_dir end
-      if type(r) == "string" and r ~= "" then fname = r end
+      if not r or r == "" then
+        r = client.config and client.config.root_dir
+      end
+      if type(r) == "string" and r ~= "" then
+        fname = r
+      end
     end
   end
   if not client then
@@ -621,9 +694,12 @@ function M.apply(opts)
   local pending, err, code = M.pending(fname)
   if not pending then
     if opts.current_project then
-      log.warn("cannot apply source roots incrementally: " .. err
-        .. " (will retry on the next buffer switch)",
-        { once = true, id = "auto-pending:" .. tostring(code) })
+      log.warn(
+        "cannot apply source roots incrementally: "
+          .. err
+          .. " (will retry on the next buffer switch)",
+        { once = true, id = "auto-pending:" .. tostring(code) }
+      )
     else
       log.warn("cannot apply source roots incrementally: " .. err)
     end
@@ -651,12 +727,16 @@ function M.apply(opts)
   -- OOM 被杀的先例, 所以先建议重启 (重启走 initialize.sourcePaths, 一次性且顺序更优),
   -- :Aosp! 只作为"就要现在做"的第二选择。
   if #pending > MAX_BATCH and not opts.force then
-    log.warn(("%d source roots pending — more than the %d/run safety limit.\n"
-      .. "This usually means the .classpath baseline was misread or the initial import "
-      .. "never injected sourcePaths. Prefer restarting jdtls (they are applied in one "
-      .. "pass on the next start); re-run as :Aosp! only if you need them now — it "
-      .. "rebuilds the whole classpath per root and can exhaust the JVM heap.")
-      :format(#pending, MAX_BATCH), { timeout = 12000 })
+    log.warn(
+      (
+        "%d source roots pending — more than the %d/run safety limit.\n"
+        .. "This usually means the .classpath baseline was misread or the initial import "
+        .. "never injected sourcePaths. Prefer restarting jdtls (they are applied in one "
+        .. "pass on the next start); re-run as :Aosp! only if you need them now — it "
+        .. "rebuilds the whole classpath per root and can exhaust the JVM heap."
+      ):format(#pending, MAX_BATCH),
+      { timeout = 12000 }
+    )
     return false, "over-limit"
   end
 
@@ -687,29 +767,49 @@ end
 --- @param fname string|nil 当前 buffer 文件
 function M.apply_project_auto(fname)
   local java = require("aosp-nav").java
-  if not java or java.auto_project_apply == false then return end
-  if not fname or fname == "" then return end
+  if not java or java.auto_project_apply == false then
+    return
+  end
+  if not fname or fname == "" then
+    return
+  end
   local client = M.client(fname)
-  if not client then return end -- 非 jdtls buffer, 静默
+  if not client then
+    return
+  end -- 非 jdtls buffer, 静默
   local proj = vim.fs.root(fname, ".git")
-  if not proj then return end
+  if not proj then
+    return
+  end
   local aosp = require("aosp-nav.java.root").aosp_root(fname)
-  if not aosp then return end
+  if not aosp then
+    return
+  end
   local pre = proj:sub(#aosp + 2)
-  if pre == "" then return end
+  if pre == "" then
+    return
+  end
   local key = client_key(client)
   _project_applied[key] = _project_applied[key] or {}
-  if _project_applied[key][pre] then return end
-  if _proj_armed[pre] then return end
+  if _project_applied[key][pre] then
+    return
+  end
+  if _proj_armed[pre] then
+    return
+  end
   _proj_armed[pre] = true
   vim.defer_fn(function()
     _proj_armed[pre] = nil
-    if _project_applied[key][pre] then return end
+    if _project_applied[key][pre] then
+      return
+    end
     -- [v18.13] 成功才记账: apply 失败 (最常见 = invisible project 未就绪, .classpath
     -- 尚未落盘) 时回滚, 下次 BufEnter 重试 —— 旧实现先记账再执行, 一次瞬态失败就让
     -- 该模块本会话永不再自动补根 (工作站实测: 通知出现一次后静默失效)。
     local ok = M.apply({ force = true, current_project = true, fname = fname })
-    if not ok then _project_applied[key][pre] = nil end
+    if not ok then
+      _project_applied[key][pre] = nil
+    end
   end, 20000)
 end
 
@@ -726,10 +826,18 @@ end
 --- @param fname string|nil 轮询回来时继续锁定的文件
 --- @return boolean
 local function arm_poll(key, fname)
-  if _applied_ok[key] or _running[key] then return false end
-  if _poll_armed[key] then return true end
-  if not _deadline[key] then _deadline[key] = now_ms() + AUTO_DEADLINE_MS end
-  if now_ms() >= _deadline[key] then return false end
+  if _applied_ok[key] or _running[key] then
+    return false
+  end
+  if _poll_armed[key] then
+    return true
+  end
+  if not _deadline[key] then
+    _deadline[key] = now_ms() + AUTO_DEADLINE_MS
+  end
+  if now_ms() >= _deadline[key] then
+    return false
+  end
   _poll_armed[key] = true
   vim.defer_fn(function()
     _poll_armed[key] = nil
@@ -755,7 +863,9 @@ end
 --- @return string|nil 实际发出的文案 (nil = 被闸挡下); 供测试断言
 function M.report(status, detail, key)
   key = key or "?"
-  if _auto_reported[key] then return nil end
+  if _auto_reported[key] then
+    return nil
+  end
   _auto_reported[key] = true
   -- 承诺"下次自动生效"的依据是**已落盘**的累积列表: 数一下里面有几个项目。
   -- 读内存态 (启动时由 inject_sync 从磁盘种入), 不扫描、不发请求。
@@ -765,21 +875,29 @@ function M.report(status, detail, key)
   local ok, st = pcall(function()
     return require("aosp-nav.java.source_inject").state(key)
   end)
-  if ok and st and st.projects then n = #st.projects end
+  if ok and st and st.projects then
+    n = #st.projects
+  end
   -- 文案只讲两件事: 本次会话会怎样 (退回 jar)、下次会怎样 (自动生效); 不提命令。
   -- "fall back to jars" 用 fall back 而非 "use jars": 只有这些根**独有**、jdt.ls
   -- 推断覆盖不到的类才落 jar, 已导入模块内的照常跳真实源码 (不夸大影响面)。
   -- 状态名与 detail 只进 debug —— 用户不需要知道 not-ready 是什么。
   local body = "Jumps to classes outside the imported modules fall back to jars "
     .. "for this session — applied automatically on next start."
-  local msg = (n > 0
-    and ("source roots from %d project(s) are not in jdtls yet "
-      .. "(it was still importing).\n"):format(n)
-    or "some source roots are not in jdtls yet (it was still importing).\n")
-    .. body
+  local msg = (
+    n > 0
+      and ("source roots from %d project(s) are not in jdtls yet " .. "(it was still importing).\n"):format(
+        n
+      )
+    or "some source roots are not in jdtls yet (it was still importing).\n"
+  ) .. body
   if log.enabled("debug") then
-    log.debug(("auto source-root apply gave up: %s%s"):format(
-      status, detail and (": " .. tostring(detail)) or ""))
+    log.debug(
+      ("auto source-root apply gave up: %s%s"):format(
+        status,
+        detail and (": " .. tostring(detail)) or ""
+      )
+    )
   end
   -- id 带 key: util/log 的 _seen 按 id 全局去重, 固定 id 会把第二棵树的那条吞掉。
   log.info(msg, { id = "source-apply-deferred:" .. key, timeout = 12000 })
@@ -795,39 +913,56 @@ function M.auto(opts)
   opts = opts or {}
   local j = cfg().java
   -- 非 aosp 模式 (infer 不注入; project 走导入时的一次性注入) / 用户关掉自动: 不是错误, 静默
-  if j.source_apply_auto == false or j.mode ~= "aosp" then return "off" end
-  local fname = (opts.fname and opts.fname ~= "") and opts.fname
-    or vim.api.nvim_buf_get_name(0)
+  if j.source_apply_auto == false or j.mode ~= "aosp" then
+    return "off"
+  end
+  local fname = (opts.fname and opts.fname ~= "") and opts.fname or vim.api.nvim_buf_get_name(0)
   -- 一律由**触发文件**推出树与 client: 去抖/轮询窗口里用户可能已经切到另一棵树
   local client = M.client(fname)
-  if not client then return "no-client" end
+  if not client then
+    return "no-client"
+  end
   local key = client_key(client)
   -- 这棵树已成功注入过一次: 自动路径收工 (R2b)
-  if _applied_ok[key] then return "done" end
+  if _applied_ok[key] then
+    return "done"
+  end
   -- 已经有一批在跑: 两者的 pending 是同一份旧 .classpath 算出来的, 再来一遍纯属重复
-  if _running[key] then return "busy" end
+  if _running[key] then
+    return "busy"
+  end
   -- 就绪门控: 等 server 忙完 (导入/建索引) 再动手, 而不是等固定墙钟
-  if not ready(client) then return "not-ready" end
+  if not ready(client) then
+    return "not-ready"
+  end
 
   local pending, err, code = M.pending(fname)
   if not pending then
     -- not-aosp: auto 挂在任意 java 文件的 attach 上, 非 AOSP 树是常态, 静默。
     -- no-classpath: 工程还没建好 (全新工作区正在导入) —— 那时 initialize 里带的
     --   sourcePaths 本来就会被采纳, 没有要补的东西。
-    if code == "not-aosp" or code == "no-classpath" then return "off" end
+    if code == "not-aosp" or code == "no-classpath" then
+      return "off"
+    end
     return "unknown", err
   end
-  if #pending == 0 then return "none" end
+  if #pending == 0 then
+    return "none"
+  end
 
   local aosp_root = require("aosp-nav.java.root").aosp_root(fname)
-  if not aosp_root then return "off" end
+  if not aosp_root then
+    return "off"
+  end
 
   local cap = MAX_AUTO_ROOTS
   local batch, deferred = pending, 0
   -- 自动路径: 超出上限只取前 cap 条, 其余推迟到下个会话 (不静默超发)。
   if #pending > cap and not opts.force then
     batch = {}
-    for i = 1, cap do batch[i] = pending[i] end
+    for i = 1, cap do
+      batch[i] = pending[i]
+    end
     deferred = #pending - cap
   end
 
@@ -841,17 +976,23 @@ function M.auto_apply(opts)
   opts = opts or {}
   -- fname 只解析一次: 轮询窗口里用户可能切到别的缓冲/别的树, 整条链 (选 client、
   -- 算 pending、记账、提示) 必须锁定同一个文件, 否则会张冠李戴。
-  local fname = (opts.fname and opts.fname ~= "") and opts.fname
-    or vim.api.nvim_buf_get_name(0)
+  local fname = (opts.fname and opts.fname ~= "") and opts.fname or vim.api.nvim_buf_get_name(0)
   local status, detail = M.auto({ fname = fname, force = opts.force })
-  if status == "started" or status == "none" or status == "off"
-      or status == "busy" or status == "done" then
+  if
+    status == "started"
+    or status == "none"
+    or status == "off"
+    or status == "busy"
+    or status == "done"
+  then
     return status
   end
   -- not-ready / no-client / unknown: 有界轮询 (等待 server 就绪)。
   -- toomany 已不复存在 —— 自动路径改为"截断 + 推迟", 不再拒绝。
   local key = client_key(M.client(fname))
-  if arm_poll(key, fname) then return "retry" end
+  if arm_poll(key, fname) then
+    return "retry"
+  end
   M.report(status, detail, key)
   return status
 end
@@ -864,20 +1005,28 @@ end
 function M.attach(client)
   client = client or M.client()
   local key = client_key(client)
-  if _attach_done[key] then return end
+  if _attach_done[key] then
+    return
+  end
   _attach_done[key] = true
-  vim.defer_fn(function() M.auto_apply() end, 1000)
+  vim.defer_fn(function()
+    M.auto_apply()
+  end, 1000)
 end
 
 --- 测试钩子: 查询/设置某棵树的"已成功自动注入过"标记。
 --- (分区语义无法用真 jdtls 之外的途径观察, repo 既有惯例见 M._classify)
 --- @param root string aosp 根
 --- @return boolean
-function M._is_applied(root) return _applied_ok[root] == true end
+function M._is_applied(root)
+  return _applied_ok[root] == true
+end
 
 --- 测试钩子: 见 M._is_applied
 --- @param root string
 --- @param v boolean|nil
-function M._set_applied(root, v) _applied_ok[root] = v or nil end
+function M._set_applied(root, v)
+  _applied_ok[root] = v or nil
+end
 
 return M

@@ -17,13 +17,19 @@ local M = {}
 --- @return table|nil argv 参数列表; 进程不存在/读不到时 nil
 function M.argv(pid)
   local ok, fd = pcall(vim.uv.fs_open, ("/proc/%s/cmdline"):format(pid), "r", 438)
-  if not ok or not fd then return nil end
+  if not ok or not fd then
+    return nil
+  end
   local chunks = {}
   while true do
     local ok2, d = pcall(vim.uv.fs_read, fd, 65536, nil)
-    if not ok2 or type(d) ~= "string" or #d == 0 then break end
+    if not ok2 or type(d) ~= "string" or #d == 0 then
+      break
+    end
     chunks[#chunks + 1] = d
-    if #d < 65536 then break end
+    if #d < 65536 then
+      break
+    end
   end
   pcall(vim.uv.fs_close, fd)
   local s = table.concat(chunks)
@@ -32,10 +38,14 @@ function M.argv(pid)
   while true do
     local z = s:find("\0", start, true)
     if not z then
-      if start <= #s then argv[#argv + 1] = s:sub(start) end
+      if start <= #s then
+        argv[#argv + 1] = s:sub(start)
+      end
       break
     end
-    if z > start then argv[#argv + 1] = s:sub(start, z - 1) end
+    if z > start then
+      argv[#argv + 1] = s:sub(start, z - 1)
+    end
     start = z + 1
   end
   return #argv > 0 and argv or nil
@@ -48,7 +58,9 @@ end
 --- @return integer|nil
 function M.ppid(pid)
   local ok, lines = pcall(vim.fn.readfile, ("/proc/%s/stat"):format(pid), "", 1)
-  if not ok or not lines or not lines[1] then return nil end
+  if not ok or not lines or not lines[1] then
+    return nil
+  end
   local rest = lines[1]:match("%)%s*(.*)$")
   return rest and tonumber(rest:match("^%S+%s+(%d+)")) or nil
 end
@@ -60,7 +72,9 @@ end
 --- @return string|nil 进程不存在/读不到时 nil
 function M.comm(pid)
   local ok, lines = pcall(vim.fn.readfile, ("/proc/%s/comm"):format(pid), "", 1)
-  if not ok or not lines or not lines[1] then return nil end
+  if not ok or not lines or not lines[1] then
+    return nil
+  end
   local s = lines[1]:gsub("%s+$", "")
   return s ~= "" and s or nil
 end
@@ -83,13 +97,21 @@ function M.ancestor_named(pid, names, opts)
   local read_ppid = opts.ppid or M.ppid
   local read_comm = opts.comm or M.comm
   local cur = tonumber(pid)
-  if not cur then return nil end
+  if not cur then
+    return nil
+  end
   for _ = 1, (opts.limit or 64) do
     local name = read_comm(cur)
-    if not name then return nil end
-    if names[name] then return cur, name end
+    if not name then
+      return nil
+    end
+    if names[name] then
+      return cur, name
+    end
     local pp = read_ppid(cur)
-    if not pp or pp <= 1 then return nil end
+    if not pp or pp <= 1 then
+      return nil
+    end
     cur = pp
   end
   return nil
@@ -102,12 +124,20 @@ end
 --- @return boolean
 function M.is_descendant(pid, ancestor)
   local cur, limit = tonumber(pid), tonumber(ancestor)
-  if not cur or not limit then return false end
+  if not cur or not limit then
+    return false
+  end
   for _ = 1, 64 do
-    if cur == limit then return true end
-    if cur <= 1 then return false end
+    if cur == limit then
+      return true
+    end
+    if cur <= 1 then
+      return false
+    end
     cur = M.ppid(cur)
-    if not cur then return false end
+    if not cur then
+      return false
+    end
   end
   return false
 end

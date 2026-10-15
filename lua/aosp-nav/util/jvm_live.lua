@@ -27,10 +27,14 @@ local M = {}
 --- @param b number|nil
 --- @return string
 function M.fmt_bytes(b)
-  if type(b) ~= "number" then return "n/a" end
+  if type(b) ~= "number" then
+    return "n/a"
+  end
   local units = { { 1024 ^ 3, "G" }, { 1024 ^ 2, "M" }, { 1024, "K" } }
   for _, u in ipairs(units) do
-    if b >= u[1] then return ("%.1f%s"):format(b / u[1], u[2]) end
+    if b >= u[1] then
+      return ("%.1f%s"):format(b / u[1], u[2])
+    end
   end
   return ("%dB"):format(b)
 end
@@ -39,12 +43,18 @@ end
 --- @param s number|nil
 --- @return string
 function M.fmt_s(s)
-  if type(s) ~= "number" then return "n/a" end
-  if s < 60 then return ("%.1fs"):format(s) end
+  if type(s) ~= "number" then
+    return "n/a"
+  end
+  if s < 60 then
+    return ("%.1fs"):format(s)
+  end
   local h = math.floor(s / 3600)
   local m = math.floor((s % 3600) / 60)
   local sec = math.floor(s % 60)
-  if h > 0 then return ("%dh %dm %ds"):format(h, m, sec) end
+  if h > 0 then
+    return ("%dh %dm %ds"):format(h, m, sec)
+  end
   return ("%dm %ds"):format(m, sec)
 end
 
@@ -52,8 +62,12 @@ end
 --- @param ms number|nil
 --- @return string
 function M.fmt_ms(ms)
-  if type(ms) ~= "number" then return "n/a" end
-  if ms >= 1000 then return ("%.1fs"):format(ms / 1000) end
+  if type(ms) ~= "number" then
+    return "n/a"
+  end
+  if ms >= 1000 then
+    return ("%.1fs"):format(ms / 1000)
+  end
   return ("%.0fms"):format(ms)
 end
 
@@ -64,7 +78,9 @@ end
 --- @return table<string, string|number>
 function M.parse_perfcounters(text)
   local out = {}
-  if type(text) ~= "string" then return out end
+  if type(text) ~= "string" then
+    return out
+  end
   for l in text:gmatch("[^\r\n]+") do
     -- 键里不可能有 '=' 或空白, 值里可能有 '=' (如 policy 的复合串) —— 所以键用
     -- [^=%s]+ 而不是 %S+ (%S+ 会把 "a.b=c=d" 整个吃掉, 然后找不到 '=' 而整行丢弃)
@@ -84,7 +100,9 @@ end
 --- @param text string|nil
 --- @return number|nil seconds
 function M.parse_uptime(text)
-  if type(text) ~= "string" then return nil end
+  if type(text) ~= "string" then
+    return nil
+  end
   local n = text:match("([%d%.]+)%s*s")
   return n and tonumber(n) or nil
 end
@@ -96,7 +114,9 @@ end
 --- @param text string|nil
 --- @return table { kind = "g1"|"parallel"|"other", lines = table<string> }
 function M.parse_heap_info(text)
-  if type(text) ~= "string" then return { kind = "other", lines = {} } end
+  if type(text) ~= "string" then
+    return { kind = "other", lines = {} }
+  end
   local kind = "other"
   -- G1 的 heap_info 首行是 "garbage-first heap   total ...K, used ..."
   if text:find("garbage-first", 1, true) then
@@ -112,7 +132,9 @@ end
 --- @param text string|nil
 --- @return table { rss_kb = integer|nil, threads = integer|nil }
 function M.parse_proc_status(text)
-  if type(text) ~= "string" then return {} end
+  if type(text) ~= "string" then
+    return {}
+  end
   local rss = text:match("VmRSS:%s*(%d+)%s*kB")
   local th = text:match("Threads:%s*(%d+)")
   return { rss_kb = rss and tonumber(rss) or nil, threads = th and tonumber(th) or nil }
@@ -125,10 +147,14 @@ local function collectors_of(pc)
   local idx = {}
   for k in pairs(pc) do
     local n = k:match("^sun%.gc%.collector%.(%d+)%.invocations$")
-    if n then idx[tonumber(n)] = true end
+    if n then
+      idx[tonumber(n)] = true
+    end
   end
   local list = {}
-  for n in pairs(idx) do list[#list + 1] = n end
+  for n in pairs(idx) do
+    list[#list + 1] = n
+  end
   table.sort(list)
   local out = {}
   for _, n in ipairs(list) do
@@ -155,8 +181,10 @@ local function classify_collectors(collectors)
     local n = type(c.name) == "string" and c.name:lower() or ""
     if not young and n:find("young", 1, true) then
       young = c
-    elseif not major and (n:find("full", 1, true) or n:find("old", 1, true)
-        or n:find("major", 1, true)) then
+    elseif
+      not major
+      and (n:find("full", 1, true) or n:find("old", 1, true) or n:find("major", 1, true))
+    then
       major = c
     end
   end
@@ -180,7 +208,9 @@ local function generation_of(pc, g)
   local seen = false
   for i = 0, math.max(spaces, 4) - 1 do
     local u = tonumber(pc[("sun.gc.generation.%d.space.%d.used"):format(g, i)])
-    if u then used, seen = used + u, true end
+    if u then
+      used, seen = used + u, true
+    end
   end
   return { capacity = capacity, max_capacity = maxc, used = seen and used or nil, spaces = spaces }
 end
@@ -216,7 +246,9 @@ function M.assemble(pid, raw, static)
   snap.major_time_s = major and major.time_ns / 1e9 or nil
 
   local total_ns = 0
-  for _, c in ipairs(cols) do total_ns = total_ns + c.time_ns end
+  for _, c in ipairs(cols) do
+    total_ns = total_ns + c.time_ns
+  end
   snap.gc_total_s = total_ns / 1e9
   if snap.uptime_s and snap.uptime_s > 0 then
     snap.gc_pct = snap.gc_total_s / snap.uptime_s * 100
@@ -240,17 +272,19 @@ function M.assemble(pid, raw, static)
   snap.major_pause_ms = tonumber(pc["sun.gc.policy.avgMajorPauseTime"])
   snap.promoted_avg_bytes = tonumber(pc["sun.gc.policy.avgPromotedAvg"])
   snap.live_at_last_full_gc = tonumber(pc["sun.gc.policy.liveAtLastFullGc"])
-  snap.gc_policy_name = type(pc["sun.gc.policy.name"]) == "string" and pc["sun.gc.policy.name"] or nil
+  snap.gc_policy_name = type(pc["sun.gc.policy.name"]) == "string" and pc["sun.gc.policy.name"]
+    or nil
 
   snap.young = generation_of(pc, 0)
   snap.old = generation_of(pc, 1)
 
   local xmx = static and static.xmx or nil
   snap.young_cap_frac = (xmx and snap.young.capacity) and snap.young.capacity / xmx or nil
-  snap.old_used_frac = (snap.old.capacity and snap.old.used)
-      and snap.old.used / snap.old.capacity or nil
+  snap.old_used_frac = (snap.old.capacity and snap.old.used) and snap.old.used / snap.old.capacity
+    or nil
   snap.live_ceiling_frac = (snap.old.max_capacity and snap.live_at_last_full_gc)
-      and snap.live_at_last_full_gc / snap.old.max_capacity or nil
+      and snap.live_at_last_full_gc / snap.old.max_capacity
+    or nil
   if snap.promoted_avg_bytes and snap.young_interval_ms and snap.young_interval_ms > 0 then
     snap.promotion_Bps = snap.promoted_avg_bytes / (snap.young_interval_ms / 1000)
   end
@@ -262,14 +296,14 @@ end
 --- 暂时现象的形态一律 info, 并在文案里说明 —— 否则导入期每次都会误报, 用户就会
 --- 学会忽略这个面板。
 M.THRESH = {
-  gc_pct_warn = 50,          -- %  (实测 8G 基准 18.5, 6G 死亡螺旋 82)
-  gc_pct_info = 20,          -- %
+  gc_pct_warn = 50, -- %  (实测 8G 基准 18.5, 6G 死亡螺旋 82)
+  gc_pct_info = 20, -- %
   young_cap_frac_info = 0.05, -- 新生代 / -Xmx (实测病态 0.008); 仅 ParallelGC, 见 verdict
   young_interval_info_ms = 50, -- ms (实测 25)
   major_interval_info_ms = 5000, -- ms (实测 3400)
-  old_used_info = 0.95,      -- old.used / old.capacity
-  live_ceiling_warn = 0.90,  -- 存活集 / old gen 上限 (6G 死亡螺旋 0.95)
-  rss_over_xmx = 1.15,       -- RSS / -Xmx
+  old_used_info = 0.95, -- old.used / old.capacity
+  live_ceiling_warn = 0.90, -- 存活集 / old gen 上限 (6G 死亡螺旋 0.95)
+  rss_over_xmx = 1.15, -- RSS / -Xmx
 }
 
 --- 对快照做判定。纯函数, 返回 finding 列表; 输入为 nil 的规则**跳过** (G1 下
@@ -289,30 +323,44 @@ function M.verdict(snap)
     if a.xmx == nil then
       add("xmx_missing", "warn", "the jdtls cmd has no -Xmx", a.advice)
     elseif not a.xmx_ok then
-      add("xmx_small", "warn",
+      add(
+        "xmx_small",
+        "warn",
         ("-Xmx%s is below the measured floor for a full AOSP tree"):format(tostring(a.xmx_text)),
-        a.advice)
+        a.advice
+      )
     elseif not a.host_ok then
       -- -Xmx 够大, 但比物理内存还大 —— 这条**必须**独立于 xmx_small 报: 堆内部指标
       -- (old gen %、full GC 间隔) 这时通常全绿, 旧版面板恰恰因此漏报 (见 jvm.lua 注释)。
-      add("xmx_over_host", "warn",
-        ("-Xmx%s is %d%% of this host's %s RAM — larger than the machine it runs on")
-          :format(tostring(a.xmx_text), math.floor(a.host_ratio * 100 + 0.5),
-            M.fmt_bytes(a.mem_total)),
-        a.advice)
+      add(
+        "xmx_over_host",
+        "warn",
+        ("-Xmx%s is %d%% of this host's %s RAM — larger than the machine it runs on"):format(
+          tostring(a.xmx_text),
+          math.floor(a.host_ratio * 100 + 0.5),
+          M.fmt_bytes(a.mem_total)
+        ),
+        a.advice
+      )
     end
   end
 
   -- 动态: 活进程
   if snap.gc_pct then
     if snap.gc_pct > T.gc_pct_warn then
-      add("gc_pct_high", "warn",
+      add(
+        "gc_pct_high",
+        "warn",
         ("spent %.1f%% of uptime in GC — the JVM is GC-bound, not indexing"):format(snap.gc_pct),
-        "raise -Xmx; this is the death-spiral shape")
+        "raise -Xmx; this is the death-spiral shape"
+      )
     elseif snap.gc_pct > T.gc_pct_info then
-      add("gc_pct_elevated", "info",
+      add(
+        "gc_pct_elevated",
+        "info",
         ("spent %.1f%% of uptime in GC (healthy idle is a few %%)"):format(snap.gc_pct),
-        "normal while importing/building; if it stays here, see the rows below")
+        "normal while importing/building; if it stays here, see the rows below"
+      )
     end
   end
 
@@ -322,52 +370,86 @@ function M.verdict(snap)
   -- 本规则的阈值上** (0.0499 < 0.05 就报), 报出来病因还是错的。G1 若真有问题,
   -- young_interval_low / major_interval_low 两条照样能抓到。
   local gc_kind = snap.heap and snap.heap.kind
-  if gc_kind == "parallel"
-      and snap.young_cap_frac and snap.young_cap_frac < T.young_cap_frac_info then
-    add("young_gen_tiny", "info",
-      ("young gen is only %s = %.1f%% of the heap (the adaptive size policy shrinks it)")
-        :format(M.fmt_bytes(snap.young.capacity), snap.young_cap_frac * 100),
+  if
+    gc_kind == "parallel"
+    and snap.young_cap_frac
+    and snap.young_cap_frac < T.young_cap_frac_info
+  then
+    add(
+      "young_gen_tiny",
+      "info",
+      ("young gen is only %s = %.1f%% of the heap (the adaptive size policy shrinks it)"):format(
+        M.fmt_bytes(snap.young.capacity),
+        snap.young_cap_frac * 100
+      ),
       -- 2026-10-10 实测定下的处方: 最省事且已验证有效的是删掉那两个 flag, 不是换 GC ——
       -- 它们只是把预算放宽 (20%), 而策略在宽预算里只会优化占用。换 G1 仍然可行, 但那是
       -- 用一整个收集器的代价去修一个尺寸旋钮, 所以退到备选位。
-      "drop -XX:GCTimeRatio / -XX:AdaptiveSizePolicyWeight — a lax GC-time budget makes it optimize footprint; else -XX:+UseG1GC")
+      "drop -XX:GCTimeRatio / -XX:AdaptiveSizePolicyWeight — a lax GC-time budget makes it optimize footprint; else -XX:+UseG1GC"
+    )
   end
 
   if snap.young_interval_ms and snap.young_interval_ms < T.young_interval_info_ms then
-    add("young_interval_low", "info",
-      ("young GC every %s (%d so far)"):format(M.fmt_ms(snap.young_interval_ms),
-        snap.young_invocations or 0),
-      "eden too small for the allocation rate — see the young-gen row")
+    add(
+      "young_interval_low",
+      "info",
+      ("young GC every %s (%d so far)"):format(
+        M.fmt_ms(snap.young_interval_ms),
+        snap.young_invocations or 0
+      ),
+      "eden too small for the allocation rate — see the young-gen row"
+    )
   end
 
-  if snap.major_interval_ms and snap.major_interval_ms < T.major_interval_info_ms
-      and (snap.major_invocations or 0) > 0 then
-    add("major_interval_low", "info",
-      ("full GC every %s (%d so far) — too often for an LSP server")
-        :format(M.fmt_ms(snap.major_interval_ms), snap.major_invocations),
+  if
+    snap.major_interval_ms
+    and snap.major_interval_ms < T.major_interval_info_ms
+    and (snap.major_invocations or 0) > 0
+  then
+    add(
+      "major_interval_low",
+      "info",
+      ("full GC every %s (%d so far) — too often for an LSP server"):format(
+        M.fmt_ms(snap.major_interval_ms),
+        snap.major_invocations
+      ),
       -- old gen 每几秒一次 full GC 通常不是"放不下", 而是被上面那条 (早晋升) 灌满的;
       -- 先按 young_gen_tiny 那条处置, 无效再换 GC (并发标记绕开 full GC 循环)。
-      "usually a consequence of premature promotion (see the young-gen row); else -XX:+UseG1GC")
+      "usually a consequence of premature promotion (see the young-gen row); else -XX:+UseG1GC"
+    )
   end
 
   if snap.live_ceiling_frac and snap.live_ceiling_frac > T.live_ceiling_warn then
-    add("live_set_ceiling", "warn",
-      ("live set %s = %.0f%% of the old-gen ceiling %s — the working set will not fit")
-        :format(M.fmt_bytes(snap.live_at_last_full_gc), snap.live_ceiling_frac * 100,
-          M.fmt_bytes(snap.old.max_capacity)),
-      "raise -Xmx (>= 8G measured ample for a full AOSP tree)")
+    add(
+      "live_set_ceiling",
+      "warn",
+      ("live set %s = %.0f%% of the old-gen ceiling %s — the working set will not fit"):format(
+        M.fmt_bytes(snap.live_at_last_full_gc),
+        snap.live_ceiling_frac * 100,
+        M.fmt_bytes(snap.old.max_capacity)
+      ),
+      "raise -Xmx (>= 8G measured ample for a full AOSP tree)"
+    )
   end
 
   if snap.old_used_frac and snap.old_used_frac > T.old_used_info then
-    add("old_committed_high", "info",
-      ("old gen %.0f%% of its committed size (a full GC is due)"):format(snap.old_used_frac * 100))
+    add(
+      "old_committed_high",
+      "info",
+      ("old gen %.0f%% of its committed size (a full GC is due)"):format(snap.old_used_frac * 100)
+    )
   end
 
   if snap.rss_kb and a and a.xmx and snap.rss_kb * 1024 > a.xmx * T.rss_over_xmx then
-    add("rss_over_xmx", "warn",
-      ("RSS %s exceeds -Xmx %s — native/off-heap memory or swapping")
-        :format(M.fmt_bytes(snap.rss_kb * 1024), M.fmt_bytes(a.xmx)),
-      "check swap; lower -Xmx only if the host is thrashing")
+    add(
+      "rss_over_xmx",
+      "warn",
+      ("RSS %s exceeds -Xmx %s — native/off-heap memory or swapping"):format(
+        M.fmt_bytes(snap.rss_kb * 1024),
+        M.fmt_bytes(a.xmx)
+      ),
+      "check swap; lower -Xmx only if the host is thrashing"
+    )
   end
 
   return out
@@ -380,25 +462,47 @@ end
 function M.render(snap, findings)
   snap = snap or {}
   local out = {}
-  local function row(name, value) out[#out + 1] = ("%-11s %s"):format(name, value) end
+  local function row(name, value)
+    out[#out + 1] = ("%-11s %s"):format(name, value)
+  end
 
   local a = snap.assess
-  row("pid", ("%s   jcmd=%s%s"):format(snap.pid or "?",
-    snap.jcmd or "n/a", snap.jcmd_how and (" (" .. snap.jcmd_how .. ")") or ""))
+  row(
+    "pid",
+    ("%s   jcmd=%s%s"):format(
+      snap.pid or "?",
+      snap.jcmd or "n/a",
+      snap.jcmd_how and (" (" .. snap.jcmd_how .. ")") or ""
+    )
+  )
   row("uptime", M.fmt_s(snap.uptime_s))
-  row("rss", ("%s   threads=%s"):format(
-    snap.rss_kb and M.fmt_bytes(snap.rss_kb * 1024) or "n/a",
-    snap.threads and tostring(snap.threads) or "n/a"))
+  row(
+    "rss",
+    ("%s   threads=%s"):format(
+      snap.rss_kb and M.fmt_bytes(snap.rss_kb * 1024) or "n/a",
+      snap.threads and tostring(snap.threads) or "n/a"
+    )
+  )
   if a then
-    row("vmargs", ("-Xmx%s%s%s"):format(
-      a.xmx_text or "none", a.parallel_gc and " +ParallelGC" or "",
-      a.xmx_ok and "" or "  (too small)"))
+    row(
+      "vmargs",
+      ("-Xmx%s%s%s"):format(
+        a.xmx_text or "none",
+        a.parallel_gc and " +ParallelGC" or "",
+        a.xmx_ok and "" or "  (too small)"
+      )
+    )
     -- 宿主内存一行: -Xmx 只要跟物理内存比才有意义。放这里用户一眼能看出
     -- "堆上限比机器还大" —— 这正是旧版漏掉的盲区。
     if a.mem_total then
-      row("host mem", ("%s   -Xmx = %d%% of RAM%s"):format(
-        M.fmt_bytes(a.mem_total), math.floor((a.host_ratio or 0) * 100 + 0.5),
-        a.host_ok and "" or "  (too large)"))
+      row(
+        "host mem",
+        ("%s   -Xmx = %d%% of RAM%s"):format(
+          M.fmt_bytes(a.mem_total),
+          math.floor((a.host_ratio or 0) * 100 + 0.5),
+          a.host_ok and "" or "  (too large)"
+        )
+      )
     end
   end
 
@@ -406,32 +510,71 @@ function M.render(snap, findings)
   -- sun.gc.policy.name 只在 heap_info 认不出时才拿来兜底 —— ParallelGC 的
   -- "ParScav:MSC" 对用户没有意义, 而 G1 的 "GarbageFirst" 与 "G1" 是同一个东西。
   local policy
-  if snap.heap.kind == "parallel" then policy = "ParallelGC"
-  elseif snap.heap.kind == "g1" then policy = "G1"
-  else policy = snap.gc_policy_name or "?" end
-  row("gc policy", ("%s   total %s (%.1f%% of uptime)"):format(
-    policy, M.fmt_s(snap.gc_total_s), snap.gc_pct or 0))
-  row("young gc", ("%s x in %s   every %s"):format(
-    snap.young_invocations and tostring(snap.young_invocations) or "n/a",
-    M.fmt_s(snap.young_time_s), M.fmt_ms(snap.young_interval_ms)))
-  row("full gc", ("%s x in %s   every %s"):format(
-    snap.major_invocations and tostring(snap.major_invocations) or "n/a",
-    M.fmt_s(snap.major_time_s), M.fmt_ms(snap.major_interval_ms)))
+  if snap.heap.kind == "parallel" then
+    policy = "ParallelGC"
+  elseif snap.heap.kind == "g1" then
+    policy = "G1"
+  else
+    policy = snap.gc_policy_name or "?"
+  end
+  row(
+    "gc policy",
+    ("%s   total %s (%.1f%% of uptime)"):format(policy, M.fmt_s(snap.gc_total_s), snap.gc_pct or 0)
+  )
+  row(
+    "young gc",
+    ("%s x in %s   every %s"):format(
+      snap.young_invocations and tostring(snap.young_invocations) or "n/a",
+      M.fmt_s(snap.young_time_s),
+      M.fmt_ms(snap.young_interval_ms)
+    )
+  )
+  row(
+    "full gc",
+    ("%s x in %s   every %s"):format(
+      snap.major_invocations and tostring(snap.major_invocations) or "n/a",
+      M.fmt_s(snap.major_time_s),
+      M.fmt_ms(snap.major_interval_ms)
+    )
+  )
   if snap.promoted_avg_bytes then
-    row("promotion", ("%s per young GC%s"):format(M.fmt_bytes(snap.promoted_avg_bytes),
-      snap.promotion_Bps and ("  (~" .. M.fmt_bytes(snap.promotion_Bps) .. "/s)") or ""))
+    row(
+      "promotion",
+      ("%s per young GC%s"):format(
+        M.fmt_bytes(snap.promoted_avg_bytes),
+        snap.promotion_Bps and ("  (~" .. M.fmt_bytes(snap.promotion_Bps) .. "/s)") or ""
+      )
+    )
   end
 
   local y, o = snap.young or {}, snap.old or {}
-  row("young gen", ("used %s   committed %s   max %s"):format(
-    M.fmt_bytes(y.used), M.fmt_bytes(y.capacity), M.fmt_bytes(y.max_capacity)))
-  row("old gen", ("used %s   committed %s   max %s%s"):format(
-    M.fmt_bytes(o.used), M.fmt_bytes(o.capacity), M.fmt_bytes(o.max_capacity),
-    snap.old_used_frac and ("  (%.0f%%)"):format(snap.old_used_frac * 100) or ""))
+  row(
+    "young gen",
+    ("used %s   committed %s   max %s"):format(
+      M.fmt_bytes(y.used),
+      M.fmt_bytes(y.capacity),
+      M.fmt_bytes(y.max_capacity)
+    )
+  )
+  row(
+    "old gen",
+    ("used %s   committed %s   max %s%s"):format(
+      M.fmt_bytes(o.used),
+      M.fmt_bytes(o.capacity),
+      M.fmt_bytes(o.max_capacity),
+      snap.old_used_frac and ("  (%.0f%%)"):format(snap.old_used_frac * 100) or ""
+    )
+  )
   if snap.live_at_last_full_gc then
-    row("live set", ("%s at last full GC%s"):format(M.fmt_bytes(snap.live_at_last_full_gc),
-      snap.live_ceiling_frac and ("  (%.0f%% of old-gen ceiling)")
-        :format(snap.live_ceiling_frac * 100) or ""))
+    row(
+      "live set",
+      ("%s at last full GC%s"):format(
+        M.fmt_bytes(snap.live_at_last_full_gc),
+        snap.live_ceiling_frac
+            and ("  (%.0f%% of old-gen ceiling)"):format(snap.live_ceiling_frac * 100)
+          or ""
+      )
+    )
   end
 
   out[#out + 1] = ""
@@ -441,7 +584,9 @@ function M.render(snap, findings)
     out[#out + 1] = "verdict:"
     for _, f in ipairs(findings) do
       out[#out + 1] = ("  [%s] %s"):format(f.level, f.msg)
-      if f.action then out[#out + 1] = "        -> " .. f.action end
+      if f.action then
+        out[#out + 1] = "        -> " .. f.action
+      end
     end
   end
 
@@ -449,7 +594,9 @@ function M.render(snap, findings)
     out[#out + 1] = ""
     out[#out + 1] = ("heap (%s), verbatim:"):format(snap.heap.kind)
     for _, l in ipairs(snap.heap.lines) do
-      if l:match("%S") then out[#out + 1] = "  " .. l end
+      if l:match("%S") then
+        out[#out + 1] = "  " .. l
+      end
     end
   end
 
@@ -460,7 +607,9 @@ function M.render(snap, findings)
     out[#out + 1] = ""
     out[#out + 1] = "vm flags:"
     for _, l in ipairs(flags) do
-      if l:find("%S") then out[#out + 1] = "  " .. l end
+      if l:find("%S") then
+        out[#out + 1] = "  " .. l
+      end
     end
   end
   return out
@@ -481,15 +630,21 @@ function M.find_jcmd(pid, opts)
   local exe = opts.exe_target
   if exe == nil and not opts.skip_exe then
     local ok, t = pcall(vim.uv.fs_readlink, ("/proc/%s/exe"):format(tostring(pid)))
-    if ok and type(t) == "string" then exe = t end
+    if ok and type(t) == "string" then
+      exe = t
+    end
   end
   if type(exe) == "string" and exe ~= "" then
     exe = exe:gsub(" %(deleted%)$", "") -- 进程被替换过时 readlink 会带这个后缀
     local cand = exe:gsub("/[^/]+$", "/jcmd")
-    if cand ~= exe and executable(cand) == 1 then return cand, "exe-sibling" end
+    if cand ~= exe and executable(cand) == 1 then
+      return cand, "exe-sibling"
+    end
   end
   local p = exepath("jcmd")
-  if type(p) == "string" and p ~= "" then return p, "PATH" end
+  if type(p) == "string" and p ~= "" then
+    return p, "PATH"
+  end
   return nil, nil
 end
 
@@ -505,7 +660,9 @@ end
 --- @param stderr string|nil
 --- @return string|nil
 local function stderr_reason(stderr)
-  if type(stderr) ~= "string" then return nil end
+  if type(stderr) ~= "string" then
+    return nil
+  end
   for line in stderr:gmatch("[^\r\n]+") do
     if line:find("%S") and line:match("^%[%d+:%d+:") == nil then
       return line
@@ -543,8 +700,8 @@ function M.run_jcmd(jcmd, pid, args)
   -- **之后**再判有没有实质内容 —— 空输出必须自己判成失败, 否则面板会拿一份空快照
   -- 渲染出一整屏 n/a, 比报错还难懂。
   if out:find("%S") == nil then
-    return nil, stderr_reason(res.stderr)
-      or ("jcmd produced no output (exit " .. tostring(res.code) .. ")")
+    return nil,
+      stderr_reason(res.stderr) or ("jcmd produced no output (exit " .. tostring(res.code) .. ")")
   end
   -- 尾部换行也去掉: 它是 stdout 的收尾符, 不是内容。留着的话任何把它拼进一行的
   -- 地方 (如面板的 "vm flags: ...") 都会带进一个换行 —— 而 nvim_buf_set_lines
@@ -557,7 +714,9 @@ end
 --- @return string|nil
 local function read_proc_status(pid)
   local ok, lines = pcall(vim.fn.readfile, ("/proc/%s/status"):format(tostring(pid)))
-  if not ok or type(lines) ~= "table" then return nil end
+  if not ok or type(lines) ~= "table" then
+    return nil
+  end
   return table.concat(lines, "\n")
 end
 
@@ -571,7 +730,9 @@ function M.snapshot(pid, static)
     return nil, "jcmd not found (a JRE has no jcmd — install a full JDK)"
   end
   local pc, err = M.run_jcmd(jcmd, pid, { "PerfCounter.print" })
-  if not pc then return nil, "PerfCounter.print: " .. tostring(err) end
+  if not pc then
+    return nil, "PerfCounter.print: " .. tostring(err)
+  end
   local raw = {
     jcmd = jcmd,
     jcmd_how = how,
@@ -598,14 +759,15 @@ function M.thread_dump(jcmd, pid, path)
     return false, "could not run jcmd: " .. tostring(res)
   end
   if res.code ~= 0 then
-    local msg = stderr_reason(res.stderr)
-      or ("jcmd exited with " .. tostring(res.code))
+    local msg = stderr_reason(res.stderr) or ("jcmd exited with " .. tostring(res.code))
     return false, msg
   end
   -- 同样剥掉 jcmd 回显的 "<pid>:" 首行 (一个给人读的 dump 不该以它开头)
   local text = (res.stdout or ""):gsub("^%d+:%s*\n", "", 1)
   local wok, werr = pcall(vim.fn.writefile, vim.split(text, "\n", { plain = true }), path)
-  if not wok then return false, "could not write " .. path .. ": " .. tostring(werr) end
+  if not wok then
+    return false, "could not write " .. path .. ": " .. tostring(werr)
+  end
   return true, nil
 end
 

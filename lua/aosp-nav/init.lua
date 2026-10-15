@@ -50,7 +50,7 @@ setmetatable(M, {
         M.setup()
       end
       local mod = require("aosp-nav." .. key)
-      rawset(t, key, mod)  -- 缓存到表上, 后续访问不再触发 __index
+      rawset(t, key, mod) -- 缓存到表上, 后续访问不再触发 __index
       return mod
     end
     if key == "status" or key == "statusline" then

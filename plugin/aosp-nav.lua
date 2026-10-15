@@ -17,7 +17,7 @@
 --   会显示绿灯", 它属于活进程面板的入口, 而不是配置面板。
 
 vim.api.nvim_create_user_command("Aosp", function(args)
-  require("aosp-nav").setup()  -- ensure initialized
+  require("aosp-nav").setup() -- ensure initialized
   if args.bang then
     -- R2: 强制批量注入折进 :Aosp 的 bang, 不单开命令。
     -- M.apply({force=true}) 是契约稳定的入口。
@@ -56,7 +56,7 @@ end, {
 })
 
 vim.api.nvim_create_user_command("AospCollectJars", function(args)
-  require("aosp-nav").setup()  -- ensure initialized
+  require("aosp-nav").setup() -- ensure initialized
   require("aosp-nav.collect").collect_jars(args.fargs[1], args.fargs[2])
 end, {
   nargs = "*",

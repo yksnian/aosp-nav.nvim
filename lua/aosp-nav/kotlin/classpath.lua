@@ -50,7 +50,9 @@ end
 --- @return table list { {root=string, aosp=string}, ... }
 function M.registered_roots()
   local f = roots_file()
-  if vim.fn.filereadable(f) ~= 1 then return {} end
+  if vim.fn.filereadable(f) ~= 1 then
+    return {}
+  end
   local out = {}
   for _, l in ipairs(vim.fn.readfile(f)) do
     local root, aosp = l:match("^(.-)\t(.+)$")
@@ -68,14 +70,18 @@ local MAX_ROOTS = 50
 --- @param aosp string|nil AOSP 根
 --- @return boolean changed 是否有变化 (true = 需要重新生成脚本)
 function M.register_root(root, aosp)
-  if not root or root == "" or not aosp or aosp == "" then return false end
+  if not root or root == "" or not aosp or aosp == "" then
+    return false
+  end
   local dir = vim.fn.fnamemodify(root, ":p"):gsub("/+$", "")
   local list = M.registered_roots()
   local seen = {}
   local out = {}
   for _, e in ipairs(list) do
     if e.root == dir then
-      if e.aosp == aosp then return false end  -- 已登记且一致
+      if e.aosp == aosp then
+        return false
+      end -- 已登记且一致
     else
       out[#out + 1] = e
       seen[e.root] = true
@@ -100,11 +106,17 @@ end
 --- @return string|nil path
 function M.probe()
   local path = M.script_path()
-  if vim.fn.filereadable(path) ~= 1 then return "none", path end
+  if vim.fn.filereadable(path) ~= 1 then
+    return "none", path
+  end
   local head = vim.fn.readfile(path, "", 5)
   local text = table.concat(head or {}, "\n")
-  if text:match("# aosp%-nav%.nvim classpath") then return "nvim", path end
-  if text:match("# aosp%-nav managed") then return "vscode", path end
+  if text:match("# aosp%-nav%.nvim classpath") then
+    return "nvim", path
+  end
+  if text:match("# aosp%-nav managed") then
+    return "vscode", path
+  end
   return "user", path
 end
 
@@ -120,7 +132,9 @@ local function lua_pattern_to_ere(pat)
     local c = pat:sub(i, i)
     if c == "%" then
       local n = pat:sub(i + 1, i + 1)
-      if n == "" then return nil end
+      if n == "" then
+        return nil
+      end
       if n == "d" then
         table.insert(out, "[0-9]")
       elseif n == "w" then
@@ -132,16 +146,38 @@ local function lua_pattern_to_ere(pat)
         return nil
       else
         -- %. %$ 等: 字面量, ERE 中 . 需转义
-        if n == "." or n == "*" or n == "+" or n == "?" or n == "(" or n == ")"
-            or n == "[" or n == "]" or n == "{" or n == "}" or n == "|" then
+        if
+          n == "."
+          or n == "*"
+          or n == "+"
+          or n == "?"
+          or n == "("
+          or n == ")"
+          or n == "["
+          or n == "]"
+          or n == "{"
+          or n == "}"
+          or n == "|"
+        then
           table.insert(out, BS .. n)
         else
           table.insert(out, n)
         end
       end
       i = i + 2
-    elseif c == "." or c == "*" or c == "+" or c == "?" or c == "(" or c == ")"
-        or c == "[" or c == "]" or c == "{" or c == "}" or c == "|" then
+    elseif
+      c == "."
+      or c == "*"
+      or c == "+"
+      or c == "?"
+      or c == "("
+      or c == ")"
+      or c == "["
+      or c == "]"
+      or c == "{"
+      or c == "}"
+      or c == "|"
+    then
       table.insert(out, BS .. c)
       i = i + 1
     else
@@ -156,7 +192,9 @@ end
 --- @param s string
 --- @return string|nil quoted
 local function shq(s)
-  if s:find("'", 1, true) then return nil end
+  if s:find("'", 1, true) then
+    return nil
+  end
   return "'" .. s .. "'"
 end
 
@@ -202,7 +240,9 @@ function M.render(branches)
   local ere_parts = {}
   for _, pat in ipairs(j.exclude_jars) do
     local ere = lua_pattern_to_ere(pat)
-    if ere then table.insert(ere_parts, ere) end
+    if ere then
+      table.insert(ere_parts, ere)
+    end
   end
   local exclude_re = ""
   if #ere_parts > 0 then
@@ -210,7 +250,9 @@ function M.render(branches)
   end
 
   local vsc = shq(vscode_backup_path())
-  if not vsc then return nil, "config dir contains single quote" end
+  if not vsc then
+    return nil, "config dir contains single quote"
+  end
 
   -- 分发表: root -> AOSP 根。用 case 的 | 合并同一 AOSP 根下的多个 root
   local case_lines = {}
@@ -228,9 +270,10 @@ function M.render(branches)
   end
   for _, aosp in ipairs(order) do
     local q = shq(aosp)
-    if not q then return nil, "aosp root contains single quote: " .. aosp end
-    table.insert(case_lines,
-      "  " .. table.concat(by_aosp[aosp], "|") .. ") root=" .. q .. " ;;")
+    if not q then
+      return nil, "aosp root contains single quote: " .. aosp
+    end
+    table.insert(case_lines, "  " .. table.concat(by_aosp[aosp], "|") .. ") root=" .. q .. " ;;")
   end
 
   local lines = {
@@ -263,21 +306,27 @@ function M.render(branches)
   table.insert(lines, "SOONG_TAGS=(")
   for _, t in ipairs(k.soong_tag_priority) do
     local q = shq(t)
-    if not q then return nil, "soong_tag_priority contains single quote" end
+    if not q then
+      return nil, "soong_tag_priority contains single quote"
+    end
     table.insert(lines, "  " .. q)
   end
   table.insert(lines, ")")
   table.insert(lines, "MAKE_JARS=(")
   for _, t in ipairs(k.make_jar_priority) do
     local q = shq(t)
-    if not q then return nil, "make_jar_priority contains single quote" end
+    if not q then
+      return nil, "make_jar_priority contains single quote"
+    end
     table.insert(lines, "  " .. q)
   end
   table.insert(lines, ")")
   table.insert(lines, "EXCLUDE_KW=(")
   for _, kw in ipairs(j.exclude_paths) do
     local q = shq(kw)
-    if not q then return nil, "exclude_paths contains single quote: " .. kw end
+    if not q then
+      return nil, "exclude_paths contains single quote: " .. kw
+    end
     table.insert(lines, "  " .. q)
   end
   table.insert(lines, ")")
@@ -286,7 +335,9 @@ function M.render(branches)
   local siblings = {}
   for _, s in ipairs(cfg.sibling_projects or { "soc/qcom/qssi", "google/aosp" }) do
     local q = shq(tostring(s))
-    if not q then return nil, "sibling_projects contains single quote: " .. tostring(s) end
+    if not q then
+      return nil, "sibling_projects contains single quote: " .. tostring(s)
+    end
     siblings[#siblings + 1] = q
   end
   table.insert(lines, "SIBLINGS=( " .. table.concat(siblings, " ") .. " )")
@@ -436,7 +487,9 @@ exit 0
 
   -- 用函数式 gsub: 路径里可能含 % , 字符串替换会把 %s 之类当捕获引用
   local branch_text = #case_lines > 0 and (table.concat(case_lines, "\n") .. "\n") or ""
-  body = body:gsub("__BRANCHES__\n", function() return branch_text end)
+  body = body:gsub("__BRANCHES__\n", function()
+    return branch_text
+  end)
 
   return table.concat(lines, "\n") .. "\n" .. body, nil
 end
@@ -471,9 +524,13 @@ function M.ensure_script(extra)
       if vim.fn.rename(path, bak) ~= 0 then
         return nil, "cannot move the VSCode classpath script to " .. bak
       end
-      log.info(("taking over the classpath script (the original aosp-nav-vscode version "
-        .. "was saved to %s); for an unregistered workspace this script execs it, so both "
-        .. "plugins can coexist"):format(bak))
+      log.info(
+        (
+          "taking over the classpath script (the original aosp-nav-vscode version "
+          .. "was saved to %s); for an unregistered workspace this script execs it, so both "
+          .. "plugins can coexist"
+        ):format(bak)
+      )
     else
       -- 用户自己的脚本: 备份 + 警告一次 (与旧行为一致)
       vim.fn.rename(path, path .. ".bak")

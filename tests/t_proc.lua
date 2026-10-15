@@ -52,8 +52,12 @@ local function chain(spec)
     ppid_of[tonumber(pid)] = s[2]
   end
   return {
-    comm = function(p) return comm_of[tonumber(p)] end,
-    ppid = function(p) return ppid_of[tonumber(p)] end,
+    comm = function(p)
+      return comm_of[tonumber(p)]
+    end,
+    ppid = function(p)
+      return ppid_of[tonumber(p)]
+    end,
   }
 end
 local NAMES = { nvim = true }
@@ -64,7 +68,11 @@ H.eq(proc.ancestor_named(100, NAMES, o), 300, "ancestor_named: 上溯两跳命�
 
 -- 一路到 init 都没命中 = 孤儿 (它的 nvim 已经退出)
 local o2 = chain({ ["100"] = { "java", 200 }, ["200"] = { "bash", 1 } })
-H.eq(proc.ancestor_named(100, NAMES, o2), nil, "ancestor_named: 走到 init 都没 nvim -> nil (孤儿)")
+H.eq(
+  proc.ancestor_named(100, NAMES, o2),
+  nil,
+  "ancestor_named: 走到 init 都没 nvim -> nil (孤儿)"
+)
 
 -- 起点自己就是 nvim (给自己扫时的情况)
 local o3 = chain({ ["100"] = { "nvim", 1 } })
@@ -80,8 +88,11 @@ H.eq(proc.ancestor_named(100, NAMES, o5), nil, "ancestor_named: 成环时有上�
 
 -- limit: 链路比上限长时放弃
 local o6 = chain({ ["100"] = { "java", 200 }, ["200"] = { "bash", 300 }, ["300"] = { "nvim", 1 } })
-H.eq(proc.ancestor_named(100, NAMES, { comm = o6.comm, ppid = o6.ppid, limit = 2 }), nil,
-  "ancestor_named: 超过 limit -> nil")
+H.eq(
+  proc.ancestor_named(100, NAMES, { comm = o6.comm, ppid = o6.ppid, limit = 2 }),
+  nil,
+  "ancestor_named: 超过 limit -> nil"
+)
 H.eq(proc.ancestor_named("bogus", NAMES, o6), nil, "ancestor_named(非数字 pid) == nil")
 
 H.finish("proc")

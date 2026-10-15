@@ -30,8 +30,12 @@ local REAL_CACHE = vim.fn.stdpath("cache") .. "/jdtls"
 
 SC.reset()
 local c_hit = SC.check(nil, {
-  workspace_dir = function() return WS end,
-  foreign = function() return { { pid = 4242, data = WS } } end,
+  workspace_dir = function()
+    return WS
+  end,
+  foreign = function()
+    return { { pid = 4242, data = WS } }
+  end,
   force = true,
 })
 check(c_hit.conflict == true, "check: 有别的 nvim 的 jdtls 占同一 -data -> conflict")
@@ -40,18 +44,29 @@ eq(#c_hit.foreign, 1, "check: 冲突出现在 foreign 里")
 
 SC.reset()
 local c_none = SC.check(nil, {
-  workspace_dir = function() return WS end,
-  foreign = function() return {} end,   -- 真实场景下孤儿/别处 -data 都已经被 foreign_jdtls 滤掉
+  workspace_dir = function()
+    return WS
+  end,
+  foreign = function()
+    return {}
+  end, -- 真实场景下孤儿/别处 -data 都已经被 foreign_jdtls 滤掉
   force = true,
 })
-check(c_none.conflict == false, "check: foreign 为空 (没有 / 只剩孤儿 / -data 在别处) -> 不冲突")
+check(
+  c_none.conflict == false,
+  "check: foreign 为空 (没有 / 只剩孤儿 / -data 在别处) -> 不冲突"
+)
 eq(#c_none.foreign, 0, "check: 不冲突时 foreign 为空")
 
 -- 拿不到工作区 (非 AOSP 文件) -> 不判断, 也不炸
 SC.reset()
 local c_nil = SC.check(nil, {
-  workspace_dir = function() return nil end,
-  foreign = function() error("不应该在 ws_dir 为 nil 时去扫 foreign") end,
+  workspace_dir = function()
+    return nil
+  end,
+  foreign = function()
+    error("不应该在 ws_dir 为 nil 时去扫 foreign")
+  end,
   force = true,
 })
 check(c_nil.conflict == false, "check: 算不出 -data 时 -> 不冲突")
@@ -64,8 +79,18 @@ local function counting_foreign()
   calls = calls + 1
   return { { pid = 1, data = WS } }
 end
-SC.check(nil, { workspace_dir = function() return WS end, foreign = counting_foreign })
-SC.check(nil, { workspace_dir = function() return WS end, foreign = counting_foreign })
+SC.check(nil, {
+  workspace_dir = function()
+    return WS
+  end,
+  foreign = counting_foreign,
+})
+SC.check(nil, {
+  workspace_dir = function()
+    return WS
+  end,
+  foreign = counting_foreign,
+})
 eq(calls, 1, "check: 同一 ws_dir 只扫一次 (结果缓存)")
 
 -- ==================== isolation_name ====================
@@ -74,7 +99,10 @@ local n1 = SC.isolation_name("qssi", 111)
 local n2 = SC.isolation_name("qssi", 222)
 eq(n1, "qssi-nvim111", "isolation_name: 原值 + -nvim<pid>")
 eq(n2, "qssi-nvim222", "isolation_name: 同一个 base 换个 pid -> 换个名字")
-check(n1 ~= n2, "isolation_name: 两个会话的名字必须不同 (否则还是会撞同一 -data)")
+check(
+  n1 ~= n2,
+  "isolation_name: 两个会话的名字必须不同 (否则还是会撞同一 -data)"
+)
 eq(SC.isolation_name("qssi", 111), n1, "isolation_name: 同一会话稳定")
 eq(SC.isolation_name("", 1), nil, "isolation_name: 空 base -> nil")
 eq(SC.isolation_name(nil, 1), nil, "isolation_name: 没有 base -> nil")
@@ -85,36 +113,51 @@ eq(SC.isolation_name(nil, 1), nil, "isolation_name: 没有 base -> nil")
 local PID = 7777
 local ISO_ROOT = CACHE_ROOT .. "/qssi-nvim" .. PID
 -- 两种形态都认: 隔离根自己, 或它的 workspace 子目录
-check(SC.isolation_dir_owned(ISO_ROOT, PID) == true,
-  "owned: 隔离根 (缓存根之下 + 本进程后缀) -> 可删")
-check(SC.isolation_dir_owned(ISO_ROOT .. "/workspace", PID) == true,
-  "owned: 隔离根的 workspace 子目录 -> 同样认 (同一份隔离)")
-check(SC.isolation_dir_owned(WS, PID) == false,
-  "owned: 共用的 qssi/workspace 没有本进程后缀 -> 不许删")
-check(SC.isolation_dir_owned(CACHE_ROOT .. "/qssi-nvim9999/workspace", PID) == false,
-  "owned: 别人的后缀 -> 不许删")
-check(SC.isolation_dir_owned(vim.fn.expand("~/.cache/jdtls/jdtls-6577a689"), PID) == false,
-  "owned: 缓存根之外的别人的 -data -> 不许删")
+check(
+  SC.isolation_dir_owned(ISO_ROOT, PID) == true,
+  "owned: 隔离根 (缓存根之下 + 本进程后缀) -> 可删"
+)
+check(
+  SC.isolation_dir_owned(ISO_ROOT .. "/workspace", PID) == true,
+  "owned: 隔离根的 workspace 子目录 -> 同样认 (同一份隔离)"
+)
+check(
+  SC.isolation_dir_owned(WS, PID) == false,
+  "owned: 共用的 qssi/workspace 没有本进程后缀 -> 不许删"
+)
+check(
+  SC.isolation_dir_owned(CACHE_ROOT .. "/qssi-nvim9999/workspace", PID) == false,
+  "owned: 别人的后缀 -> 不许删"
+)
+check(
+  SC.isolation_dir_owned(vim.fn.expand("~/.cache/jdtls/jdtls-6577a689"), PID) == false,
+  "owned: 缓存根之外的别人的 -data -> 不许删"
+)
 check(SC.isolation_dir_owned("/", PID) == false, "owned: 根目录 -> 不许删")
 check(SC.isolation_dir_owned(nil, PID) == false, "owned: nil -> 不许删")
 check(SC.isolation_dir_owned("", PID) == false, "owned: 空串 -> 不许删")
 -- 尾斜杠不应影响判定
-check(SC.isolation_dir_owned(ISO_ROOT .. "/workspace/", PID) == true,
-  "owned: 尾斜杠照旧认得出")
+check(
+  SC.isolation_dir_owned(ISO_ROOT .. "/workspace/", PID) == true,
+  "owned: 尾斜杠照旧认得出"
+)
 -- 前缀陷阱: <cache_root>-evil 不是 <cache_root>/... 之下的路径
-check(SC.isolation_dir_owned(CACHE_ROOT .. "-evil/qssi-nvim" .. PID .. "/workspace", PID) == false,
-  "owned: <cache_root> 前缀相同的兄弟目录不算在里面")
+check(
+  SC.isolation_dir_owned(CACHE_ROOT .. "-evil/qssi-nvim" .. PID .. "/workspace", PID) == false,
+  "owned: <cache_root> 前缀相同的兄弟目录不算在里面"
+)
 
 -- ==================== isolation_root: 删的是根不是 workspace ====================
 -- 泄漏形态 (实测 2026-10-13): jdtls 还没建出 workspace 就被关掉, 磁盘上只剩
 -- `<base>-nvim<pid>/config/` —— 只删 workspace 会整个漏掉, 目录留在缓存里累积。
 -- 所以 cleanup 删的是隔离**根**。
-eq(SC.isolation_root(ISO_ROOT .. "/workspace"), ISO_ROOT,
-  "isolation_root: 传 workspace 子目录 -> 取其父 (隔离根)")
-eq(SC.isolation_root(ISO_ROOT), ISO_ROOT,
-  "isolation_root: 已经传的是根 -> 原样返回")
-eq(SC.isolation_root(ISO_ROOT .. "/workspace/"), ISO_ROOT,
-  "isolation_root: 尾斜杠不影响")
+eq(
+  SC.isolation_root(ISO_ROOT .. "/workspace"),
+  ISO_ROOT,
+  "isolation_root: 传 workspace 子目录 -> 取其父 (隔离根)"
+)
+eq(SC.isolation_root(ISO_ROOT), ISO_ROOT, "isolation_root: 已经传的是根 -> 原样返回")
+eq(SC.isolation_root(ISO_ROOT .. "/workspace/"), ISO_ROOT, "isolation_root: 尾斜杠不影响")
 eq(SC.isolation_root(nil), nil, "isolation_root: nil -> nil")
 eq(SC.isolation_root(""), nil, "isolation_root: 空串 -> nil")
 
@@ -124,17 +167,21 @@ local REALP = vim.fn.getpid()
 local leak = CACHE_ROOT .. "/qssi-nvim" .. REALP
 vim.fn.mkdir(leak .. "/config", "p")
 check(vim.fn.isdirectory(leak) == 1, "端到端: 泄漏目录已造出")
-SC.cleanup(leak .. "/workspace")   -- 故意传不存在的 workspace 子路径
-check(vim.fn.isdirectory(leak) == 0,
-  "端到端: cleanup(不存在的 workspace) 仍删掉整个隔离根 (只剩 config/ 也不漏)")
+SC.cleanup(leak .. "/workspace") -- 故意传不存在的 workspace 子路径
+check(
+  vim.fn.isdirectory(leak) == 0,
+  "端到端: cleanup(不存在的 workspace) 仍删掉整个隔离根 (只剩 config/ 也不漏)"
+)
 
 -- 端到端反面: 共用的 qssi/workspace 绝不能被删
 local shared = CACHE_ROOT .. "/qssi"
 vim.fn.mkdir(shared .. "/workspace", "p")
 SC.cleanup(shared .. "/workspace")
-check(vim.fn.isdirectory(shared .. "/workspace") == 1,
-  "端到端: cleanup 对**共用**索引无动于衷 (没有本进程后缀)")
-vim.fn.delete(shared, "rf")   -- 清掉刚才造的假共用目录
+check(
+  vim.fn.isdirectory(shared .. "/workspace") == 1,
+  "端到端: cleanup 对**共用**索引无动于衷 (没有本进程后缀)"
+)
+vim.fn.delete(shared, "rf") -- 清掉刚才造的假共用目录
 
 -- ==================== configure 集成: 回归闸 ====================
 -- 本改动最核心的约束 (用户反复强调): **不影响单 nvim 的正常路径**。这里直接跑
@@ -151,7 +198,9 @@ nav.config = require("aosp-nav.config").defaults
 local function make_opts()
   return {
     root_dir = nil,
-    project_name = function(rd) return vim.fn.fnamemodify(rd, ":t") end,
+    project_name = function(rd)
+      return vim.fn.fnamemodify(rd, ":t")
+    end,
   }
 end
 
@@ -161,8 +210,12 @@ SC.reset()
 local saved_check = SC.check
 SC.check = function(fname, deps)
   return saved_check(fname, {
-    workspace_dir = function() return WS end,
-    foreign = function() return {} end,
+    workspace_dir = function()
+      return WS
+    end,
+    foreign = function()
+      return {}
+    end,
     force = true,
   })
 end
@@ -170,13 +223,19 @@ end
 local opts_plain = make_opts()
 local orig_pn = opts_plain.project_name
 local ok_plain, err_plain = pcall(javainit.configure, opts_plain)
-SC.check = saved_check          -- 立刻还原, 别影响后面的断言
+SC.check = saved_check -- 立刻还原, 别影响后面的断言
 H.check(ok_plain, "configure (无冲突) 不抛异常: " .. tostring(err_plain))
 -- 回归闸 #1: 无冲突 -> project_name 必须**原样** (没有 -nvim<pid> 后缀)
-H.eq(opts_plain.project_name, orig_pn,
-  "回归闸: 无冲突时 opts.project_name 没被包装 (逐引用相同)")
-H.eq(opts_plain.project_name("/x/qssi"), "qssi",
-  "回归闸: 无冲突时 project_name 照旧返回 basename")
+H.eq(
+  opts_plain.project_name,
+  orig_pn,
+  "回归闸: 无冲突时 opts.project_name 没被包装 (逐引用相同)"
+)
+H.eq(
+  opts_plain.project_name("/x/qssi"),
+  "qssi",
+  "回归闸: 无冲突时 project_name 照旧返回 basename"
+)
 
 -- 非 AOSP 目录 (本仓库) 里跑: 不该注入任何 AOSP 字段, 也不该炸
 local opts_repo = make_opts()
@@ -193,8 +252,12 @@ if vim.env.AOSPNAV_LIVE_TEST == "1" and vim.fn.isdirectory(LIVE) == 1 then
     local saved2 = SC.check
     SC.check = function(fname, deps)
       local r = saved2(fname, {
-        workspace_dir = function() return WS end,
-        foreign = function() return { { pid = 9999, data = WS } } end,
+        workspace_dir = function()
+          return WS
+        end,
+        foreign = function()
+          return { { pid = 9999, data = WS } }
+        end,
         force = true,
       })
       return r
@@ -205,8 +268,10 @@ if vim.env.AOSPNAV_LIVE_TEST == "1" and vim.fn.isdirectory(LIVE) == 1 then
     H.check(ok_lim, "configure (冲突, 真树) 不抛异常: " .. tostring(err_lim))
     -- 包装后的 project_name 必须带本进程 pid 后缀
     local name = opts_lim.project_name and opts_lim.project_name(LIVE)
-    H.check(type(name) == "string" and name:find("-nvim" .. vim.fn.getpid(), 1, true) ~= nil,
-      "冲突: project_name 被换成本会话的隔离名 (got " .. tostring(name) .. ")")
+    H.check(
+      type(name) == "string" and name:find("-nvim" .. vim.fn.getpid(), 1, true) ~= nil,
+      "冲突: project_name 被换成本会话的隔离名 (got " .. tostring(name) .. ")"
+    )
     -- 隔离名必须**不同于**原名 (否则 -data 还是那份共用的)
     local st = require("aosp-nav.state").get()
     H.check(st.limited == true, "冲突: state.limited 被置真 (面板据此解释)")
@@ -222,10 +287,14 @@ end
 -- 用本进程 pid 精确定位, 不断言"零个 -nvim" (用户真身可能正开着隔离会话, 那是合法的)。
 -- 这条是 2026-10-13 那次"测试在真缓存里留下 qssi-nvim<pid>"的回归闸。
 local mine = "-nvim" .. vim.fn.getpid()
-local leaked_real = (vim.fn.isdirectory(REAL_CACHE) == 1
-  and vim.fn.filereadable(REAL_CACHE .. "/qssi" .. mine .. "/config") ~= 0) or false
-check(not leaked_real,
-  "收尾: 真缓存根里不得出现**本测试 PID** 造的隔离目录 (qssi" .. mine .. ")")
+local leaked_real = (
+  vim.fn.isdirectory(REAL_CACHE) == 1
+  and vim.fn.filereadable(REAL_CACHE .. "/qssi" .. mine .. "/config") ~= 0
+) or false
+check(
+  not leaked_real,
+  "收尾: 真缓存根里不得出现**本测试 PID** 造的隔离目录 (qssi" .. mine .. ")"
+)
 vim.fn.delete(TMP, "rf")
 SC.set_cache_root(nil)
 

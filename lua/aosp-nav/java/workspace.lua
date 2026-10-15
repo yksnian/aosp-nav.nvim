@@ -57,7 +57,9 @@ end
 ---   cache_dir 时由调用方传入, 使归属判定与 clean_workspace 的 dir 同源)
 --- @return string|nil
 function M.expected_workspace_dir(root, cache_base)
-  if not root or root == "" then return nil end
+  if not root or root == "" then
+    return nil
+  end
   local base = (cache_base and cache_base ~= "") and cache_base or vim.fn.stdpath("cache")
   return base .. "/jdtls/" .. vim.fn.fnamemodify(root, ":t") .. "/workspace"
 end
@@ -84,7 +86,9 @@ end
 --- @param workspace_dir string|nil
 --- @return table names 已排序
 function M.workspace_projects(workspace_dir)
-  if not workspace_dir or vim.fn.isdirectory(workspace_dir) ~= 1 then return {} end
+  if not workspace_dir or vim.fn.isdirectory(workspace_dir) ~= 1 then
+    return {}
+  end
   local dir = workspace_dir .. "/.metadata/.plugins/org.eclipse.core.resources/.projects"
   local out = {}
   for _, p in ipairs(vim.fn.glob(dir .. "/*", false, true)) do
@@ -142,13 +146,21 @@ end
 --- @param name string 工程名
 --- @return string|nil path
 function M.project_location(workspace_dir, name)
-  if not workspace_dir or workspace_dir == "" then return nil end
-  local f = workspace_dir .. "/.metadata/.plugins/org.eclipse.core.resources/.projects/"
-    .. name .. "/.location"
-  if vim.fn.filereadable(f) ~= 1 then return nil end
+  if not workspace_dir or workspace_dir == "" then
+    return nil
+  end
+  local f = workspace_dir
+    .. "/.metadata/.plugins/org.eclipse.core.resources/.projects/"
+    .. name
+    .. "/.location"
+  if vim.fn.filereadable(f) ~= 1 then
+    return nil
+  end
   for _, line in ipairs(vim.fn.readfile(f)) do
     local p = line:match("URI//file:([^%z%s]+)")
-    if p and p ~= "" then return p end
+    if p and p ~= "" then
+      return p
+    end
   end
   return nil
 end
@@ -168,10 +180,14 @@ end
 --- @param name string
 --- @return boolean
 function M.orphan_project(workspace_dir, name)
-  if not workspace_dir or workspace_dir == "" then return false end
+  if not workspace_dir or workspace_dir == "" then
+    return false
+  end
   local res = workspace_dir .. "/.metadata/.plugins/org.eclipse.core.resources"
   local pdir = res .. "/.projects/" .. name
-  if vim.fn.isdirectory(pdir) ~= 1 then return false end
+  if vim.fn.isdirectory(pdir) ~= 1 then
+    return false
+  end
   local core = pdir .. "/org.eclipse.jdt.core"
   if vim.fn.isdirectory(core) == 1 and #vim.fn.glob(core .. "/*", false, true) > 0 then
     return false
@@ -182,7 +198,9 @@ function M.orphan_project(workspace_dir, name)
   for _, pat in ipairs({ res .. "/.root/*.tree", res .. "/*.snap" }) do
     for _, f in ipairs(vim.fn.glob(pat, false, true)) do
       local n = grep_count({ "grep", "-acx", name, f })
-      if n == nil or n ~= 0 then return false end
+      if n == nil or n ~= 0 then
+        return false
+      end
     end
   end
   return true
@@ -197,12 +215,17 @@ end
 --- @param name string
 --- @return boolean ok
 function M.remove_project_metadata(workspace_dir, name)
-  if not workspace_dir or workspace_dir == "" then return false end
+  if not workspace_dir or workspace_dir == "" then
+    return false
+  end
   -- name 来自 glob 的 basename, 这里再挡一道, 免得拼出 ../ 之类的东西
-  if name == "" or name == "." or name == ".." or name:find("[/\\]") then return false end
-  local pdir = workspace_dir .. "/.metadata/.plugins/org.eclipse.core.resources/.projects/"
-    .. name
-  if vim.fn.isdirectory(pdir) ~= 1 then return false end
+  if name == "" or name == "." or name == ".." or name:find("[/\\]") then
+    return false
+  end
+  local pdir = workspace_dir .. "/.metadata/.plugins/org.eclipse.core.resources/.projects/" .. name
+  if vim.fn.isdirectory(pdir) ~= 1 then
+    return false
+  end
   return vim.fn.delete(pdir, "rf") == 0
 end
 
@@ -217,13 +240,20 @@ end
 --- @param workspace_dir string|nil
 --- @return boolean
 function M.gradle_download_evidence(workspace_dir)
-  if not workspace_dir or workspace_dir == "" then return false end
+  if not workspace_dir or workspace_dir == "" then
+    return false
+  end
   local log_file = workspace_dir .. "/.metadata/.log"
-  if vim.fn.filereadable(log_file) ~= 1 then return false end
+  if vim.fn.filereadable(log_file) ~= 1 then
+    return false
+  end
   local n = grep_count({
-    "grep", "-ac",
-    "-e", "services.gradle.org/distributions",
-    "-e", "Could not run phased build action",
+    "grep",
+    "-ac",
+    "-e",
+    "services.gradle.org/distributions",
+    "-e",
+    "Could not run phased build action",
     log_file,
   })
   return (n or 0) > 0
@@ -238,16 +268,24 @@ end
 --- @param workspace_dir string|nil
 --- @return table|nil { files, bytes, newest, dir }
 function M.index_state(workspace_dir)
-  if not workspace_dir or workspace_dir == "" then return nil end
+  if not workspace_dir or workspace_dir == "" then
+    return nil
+  end
   local dir = workspace_dir .. "/.metadata/.plugins/org.eclipse.jdt.core"
-  if vim.fn.isdirectory(dir) ~= 1 then return nil end
+  if vim.fn.isdirectory(dir) ~= 1 then
+    return nil
+  end
   local files, bytes, newest = 0, 0, 0
   for _, f in ipairs(vim.fn.glob(dir .. "/*.index", false, true)) do
     files = files + 1
     local sz = vim.fn.getfsize(f)
-    if sz > 0 then bytes = bytes + sz end
+    if sz > 0 then
+      bytes = bytes + sz
+    end
     local t = vim.fn.getftime(f)
-    if t > newest then newest = t end
+    if t > newest then
+      newest = t
+    end
   end
   return { files = files, bytes = bytes, newest = newest, dir = dir }
 end

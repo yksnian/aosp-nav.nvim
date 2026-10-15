@@ -10,7 +10,7 @@
 
 local M = {}
 
-M._timer = nil            -- 孤儿巡检 timer
+M._timer = nil -- 孤儿巡检 timer
 M._fallback_baseline = nil -- 非 Linux 平台的快照 (fallback 用)
 M._fallback_active = false
 
@@ -20,10 +20,14 @@ local IS_LINUX = (vim.uv.os_uname().sysname == "Linux")
 --- 读 /proc/<pid>/cmdline, 返回以空格拼接的完整命令行 (失败返回 nil)
 local function read_cmdline(pid)
   local f = io.open(("/proc/%d/cmdline"):format(pid), "r")
-  if not f then return nil end
+  if not f then
+    return nil
+  end
   local data = f:read("*a")
   f:close()
-  if not data or data == "" then return nil end
+  if not data or data == "" then
+    return nil
+  end
   -- cmdline 是 \0 分隔的参数数组
   return (data:gsub("%z", " "))
 end
@@ -31,7 +35,9 @@ end
 --- 读 /proc/<pid>/status 的 PPid (失败/进程已死返回 nil)
 local function read_ppid(pid)
   local f = io.open(("/proc/%d/status"):format(pid), "r")
-  if not f then return nil end
+  if not f then
+    return nil
+  end
   local content = f:read("*a")
   f:close()
   return content:match("PPid:%s*(%d+)")
@@ -47,7 +53,9 @@ local function list_kls()
   end
   for _, tok in ipairs(vim.split(vim.trim(out), "\n", { plain = true })) do
     local pid = tonumber(tok)
-    if pid and pid ~= vim.uv.os_getpid() then pids[pid] = true end
+    if pid and pid ~= vim.uv.os_getpid() then
+      pids[pid] = true
+    end
   end
   return pids
 end
@@ -58,10 +66,16 @@ local function is_ours(pid)
   local cur = pid
   for _ = 1, 8 do
     local ppid = read_ppid(cur)
-    if not ppid then return false end          -- 进程已死/不可读
+    if not ppid then
+      return false
+    end -- 进程已死/不可读
     ppid = tonumber(ppid)
-    if ppid == mypid then return true end      -- 父进程是本 nvim ✓
-    if ppid <= 1 then return false end         -- 到 init 了, 不是我们的
+    if ppid == mypid then
+      return true
+    end -- 父进程是本 nvim ✓
+    if ppid <= 1 then
+      return false
+    end -- 到 init 了, 不是我们的
     cur = ppid
   end
   return false
@@ -72,10 +86,14 @@ end
 --- MainKt 这个入口类别的 daemon 化 java 进程极少, 误伤面可接受。
 local function is_orphan(pid)
   local ppid = read_ppid(pid)
-  if not ppid or tonumber(ppid) ~= 1 then return false end
+  if not ppid or tonumber(ppid) ~= 1 then
+    return false
+  end
   local cmdline = read_cmdline(pid)
-  if not cmdline or not cmdline:find("MainKt", 1, true) then return false end
-  return true   -- PPid=1 的 MainKt: 孤儿 (KLS 非 daemon)
+  if not cmdline or not cmdline:find("MainKt", 1, true) then
+    return false
+  end
+  return true -- PPid=1 的 MainKt: 孤儿 (KLS 非 daemon)
 end
 
 --- 杀单个 pid: TERM -> 等最长 500ms -> 仍存活则 KILL。
@@ -86,11 +104,15 @@ end
 --- @return boolean true = 已确认死亡
 local function terminate(pid)
   local ok = pcall(vim.uv.kill, pid, "sigterm")
-  if not ok then return true end -- 进程已不存在, 视作完成
+  if not ok then
+    return true
+  end -- 进程已不存在, 视作完成
   for _ = 1, 5 do
     vim.uv.sleep(100)
     local alive = pcall(vim.uv.kill, pid, 0) -- signal 0 = 只探活
-    if not alive then return true end
+    if not alive then
+      return true
+    end
   end
   pcall(vim.uv.kill, pid, "sigkill")
   return true
@@ -146,19 +168,27 @@ end
 --- configure() 时调用: Linux 下启动孤儿巡检 timer; 非 Linux 记录快照
 function M.setup()
   if IS_LINUX then
-    if M._timer then return end
+    if M._timer then
+      return
+    end
     -- 每 10 分钟顺带清扫孤儿 (本会话开着 KLS 时; 其它情况为 0 成本空扫)
     M._timer = vim.uv.new_timer()
-    M._timer:start(10 * 60 * 1000, 10 * 60 * 1000, vim.schedule_wrap(function()
-      -- 仅在当前会话存在 KLS client 时执行 (避免无 KLS 用户的无谓扫描)
-      if #vim.lsp.get_clients({ name = "kotlin_language_server" }) > 0 then
-        pcall(function()
-          for pid in pairs(list_kls()) do
-            if is_orphan(pid) then terminate(pid) end
-          end
-        end)
-      end
-    end))
+    M._timer:start(
+      10 * 60 * 1000,
+      10 * 60 * 1000,
+      vim.schedule_wrap(function()
+        -- 仅在当前会话存在 KLS client 时执行 (避免无 KLS 用户的无谓扫描)
+        if #vim.lsp.get_clients({ name = "kotlin_language_server" }) > 0 then
+          pcall(function()
+            for pid in pairs(list_kls()) do
+              if is_orphan(pid) then
+                terminate(pid)
+              end
+            end
+          end)
+        end
+      end)
+    )
   else
     M._fallback_baseline = list_kls()
   end

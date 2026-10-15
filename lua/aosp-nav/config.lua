@@ -53,21 +53,21 @@ M.defaults = {
       "^dex%.jar$",
       "^srcjars%d+%.jar$",
       "^kapt%-%w+%.jar$",
-      "stubs",   -- API 签名 jar 家族 (android-non-updatable.stubs.* 等, 无方法体)
-      "%-stub",  -- [v5] 桩实现模块 (sysprop-library-stub-<name> 等): getter 返回
-                 -- 默认值, 无真实逻辑, 真实实现由同名不带 -stub 段的模块提供
-      "^jrt%-fs%.jar$",  -- [v6] JDK 模块系统工具 jar (libcore/prebuilts 的
-                         -- system_modules 产物), 与代码阅读无关
-      "%-headers",  -- [v6] API 桩家族 (framework-minus-apex-headers 等):
-                    -- turbine 头文件 jar, 与主模块产物同 FQN; 真身由主模块提供。
-                    -- 上线前验证: find out/soong/.intermediates -maxdepth 4 \
-                    --   -type d -name '*-headers*' 确认无误伤
+      "stubs", -- API 签名 jar 家族 (android-non-updatable.stubs.* 等, 无方法体)
+      "%-stub", -- [v5] 桩实现模块 (sysprop-library-stub-<name> 等): getter 返回
+      -- 默认值, 无真实逻辑, 真实实现由同名不带 -stub 段的模块提供
+      "^jrt%-fs%.jar$", -- [v6] JDK 模块系统工具 jar (libcore/prebuilts 的
+      -- system_modules 产物), 与代码阅读无关
+      "%-headers", -- [v6] API 桩家族 (framework-minus-apex-headers 等):
+      -- turbine 头文件 jar, 与主模块产物同 FQN; 真身由主模块提供。
+      -- 上线前验证: find out/soong/.intermediates -maxdepth 4 \
+      --   -type d -name '*-headers*' 确认无误伤
     },
     -- 排除的路径关键词 (包含该片段的 jar 路径会被排除, 普通字符串匹配)
     -- 勿加 "android_common_apex": 会误杀只有 apex 变体的模块 (core-oj 等)
     exclude_paths = {
-      "linux_glibc_common",   -- host (编译机) 变体, 另有变体规则兜底
-      "development/",         -- 开发工具 (monkey 等), 无生产代码引用
+      "linux_glibc_common", -- host (编译机) 变体, 另有变体规则兜底
+      "development/", -- 开发工具 (monkey 等), 无生产代码引用
     },
     -- [v4] Lua 模式排除: 匹配 .intermediates/ 之后的相对路径 (锚定 ^ 可精确
     -- 到顶层目录, 子串式的 exclude_paths 做不到)。用于用户自助裁剪, 如:
@@ -151,7 +151,7 @@ M.defaults = {
     -- 给得越多首次索引越重 —— 实测 frameworks/base/core/java (4638 文件) 让
     -- 首次索引从 154s/2.1G 变为 183s/5.0G, 建议只放最常跳转的目标。
     core_source_roots = {
-      "frameworks/base/core/java",          -- android.* (framework.jar)
+      "frameworks/base/core/java", -- android.* (framework.jar)
       "frameworks/base/services/core/java", -- com.android.server.* (services.jar)
     },
     -- [v8] 累积的 .git 项目数上限 (LRU 淘汰; 0 = 不限)。每个项目会把它的源码根
@@ -222,21 +222,22 @@ M.defaults = {
     --   java/com/** 下模块 (如 textclassifier_flags_lib, 属无害缺失)
     -- make 树(Android 14-)取 pattern 最后一个无通配符分量作 <stem>*_intermediates 匹配
     curated_modules = {
-      "frameworks/base/framework",                    -- Activity/Context/View
+      "frameworks/base/framework", -- Activity/Context/View
       "frameworks/base/framework-minus-apex",
-      "libcore/core-all",                             -- java.* 核心库 (带方法体)
+      "libcore/core-all", -- java.* 核心库 (带方法体)
       -- "libcore/core-oj*": core-oj 只有 apex31 变体且脚本排除 apex, 匹配不到;
       --   java.* 解析由 core-all 提供, 无需此条
       "external/icu/android_icu4j/core-icu4j",
       "external/icu/android_icu4j/core-repackaged-icu4j",
-      "frameworks/base/services/core/*",              -- system_server
+      "frameworks/base/services/core/*", -- system_server
       "frameworks/base/ext",
-      "frameworks/base/packages/SystemUI/**",         -- 上游 SystemUI
-      "external/dagger2/dagger2", "external/dagger2/hilt*", -- SystemUI DI 依赖
+      "frameworks/base/packages/SystemUI/**", -- 上游 SystemUI
+      "external/dagger2/dagger2",
+      "external/dagger2/hilt*", -- SystemUI DI 依赖
       -- Kotlin 运行时 (AOSP framework/SystemUI Kotlin 代码的依赖):
       -- kotlin-stdlib 不加: mason KLS 自带 stdlib 已前置 classpath 首位, 同 FQN 必胜
-      "external/kotlinc/kotlin-parcelize-runtime",  -- @Parcelize (kotlinx.parcelize.*)
-      "external/kotlinc/kotlin-reflect",            -- kotlin.reflect.*
+      "external/kotlinc/kotlin-parcelize-runtime", -- @Parcelize (kotlinx.parcelize.*)
+      "external/kotlinc/kotlin-reflect", -- kotlin.reflect.*
       -- 设备变体只有 turbine-combined (API 签名无方法体), 补全/跳转签名可用
       "external/kotlinx.coroutines/kotlinx_coroutines",
     },
@@ -279,7 +280,9 @@ local function drop_legacy_keys(user_opts)
     j.exclude_self_jars = nil
     j.source_patterns = nil
   end
-  if user_opts.clang ~= nil then user_opts.clang = nil end
+  if user_opts.clang ~= nil then
+    user_opts.clang = nil
+  end
 end
 
 --- 校验配置
@@ -300,9 +303,13 @@ function M.validate(cfg)
   -- 一个写错的枚举值不该让 setup 放弃整个插件 (连 jar 收集都不做)。
   if cfg.log_level ~= nil and not LOG_LEVELS[cfg.log_level] then
     local bad = tostring(cfg.log_level)
-    log.warn(("log_level = %q is not a valid value, falling back to 'warn' "
-      .. "(one of: debug|info|warn|error|off)"):format(bad),
-      { once = true, id = "log_level:" .. bad })
+    log.warn(
+      (
+        "log_level = %q is not a valid value, falling back to 'warn' "
+        .. "(one of: debug|info|warn|error|off)"
+      ):format(bad),
+      { once = true, id = "log_level:" .. bad }
+    )
     cfg.log_level = "warn"
   end
 
@@ -314,8 +321,12 @@ function M.validate(cfg)
   end
 
   -- exclude_merge 合法值
-  if cfg.java and cfg.java.exclude_merge
-      and cfg.java.exclude_merge ~= "append" and cfg.java.exclude_merge ~= "replace" then
+  if
+    cfg.java
+    and cfg.java.exclude_merge
+    and cfg.java.exclude_merge ~= "append"
+    and cfg.java.exclude_merge ~= "replace"
+  then
     return false, "java.exclude_merge must be 'append' or 'replace'"
   end
 
@@ -328,38 +339,53 @@ function M.validate(cfg)
     elseif not JAVA_MODES[m] then
       -- 提示里**只列 README 记的那两个值**: infer 是内部基线, 不引导用户去配它
       -- (它仍在 JAVA_MODES 里合法通过校验, 只是不作为"可选项"被宣传)。
-      log.warn(("java.mode = %q is not a valid value, falling back to 'project' "
-        .. "(one of: 'project' | 'aosp')")
-        :format(tostring(m)), { once = true, id = "java_mode:" .. tostring(m) })
+      log.warn(
+        (
+          "java.mode = %q is not a valid value, falling back to 'project' "
+          .. "(one of: 'project' | 'aosp')"
+        ):format(tostring(m)),
+        { once = true, id = "java_mode:" .. tostring(m) }
+      )
       cfg.java.mode = "project"
     end
 
     -- [v8] source_paths_max_projects 须为非负数字 (旧 normalize_modes 的行为, 保留)
     local mx = cfg.java.source_paths_max_projects
     if mx ~= nil and (type(mx) ~= "number" or mx < 0) then
-      log.warn(("java.source_paths_max_projects = %s is not a non-negative number, "
-        .. "falling back to 8"):format(tostring(mx)),
-        { once = true, id = "max_projects:" .. tostring(mx) })
+      log.warn(
+        (
+          "java.source_paths_max_projects = %s is not a non-negative number, "
+          .. "falling back to 8"
+        ):format(tostring(mx)),
+        { once = true, id = "max_projects:" .. tostring(mx) }
+      )
       cfg.java.source_paths_max_projects = 8
     end
-
   end
 
   -- [v7] import_exclusions_ttl 必须是数字 (秒)
-  if cfg.java and cfg.java.import_exclusions_ttl ~= nil
-      and type(cfg.java.import_exclusions_ttl) ~= "number" then
+  if
+    cfg.java
+    and cfg.java.import_exclusions_ttl ~= nil
+    and type(cfg.java.import_exclusions_ttl) ~= "number"
+  then
     return false, "java.import_exclusions_ttl must be a number (seconds)"
   end
 
   -- [v10] import_exclusions_scan 在 enabled=false 时完全失效: 默认值 enabled=true /
   -- scan=true, 用户只要设 enabled=false 就会静默落入这个组合 (scan 保持默认),
   -- 于是"扫描"什么也不做。只提示一次, 不做硬报错。
-  if cfg.java and cfg.java.import_exclusions_enabled == false
-      and cfg.java.import_exclusions_scan ~= false then
-    log.warn("java.import_exclusions_scan has no effect: the scan is skipped when "
-      .. "import_exclusions_enabled=false; set enabled back to true to turn it on, "
-      .. "or set scan to false to silence this message",
-      { once = true, id = "scan_inert" })
+  if
+    cfg.java
+    and cfg.java.import_exclusions_enabled == false
+    and cfg.java.import_exclusions_scan ~= false
+  then
+    log.warn(
+      "java.import_exclusions_scan has no effect: the scan is skipped when "
+        .. "import_exclusions_enabled=false; set enabled back to true to turn it on, "
+        .. "or set scan to false to silence this message",
+      { once = true, id = "scan_inert" }
+    )
   end
 
   -- kotlin 段校验 (kotlin 启用时)
@@ -367,7 +393,10 @@ function M.validate(cfg)
     if cfg.kotlin.jar_mode ~= "curated" and cfg.kotlin.jar_mode ~= "all" then
       return false, "kotlin.jar_mode must be 'curated' or 'all'"
     end
-    if cfg.kotlin.jar_mode == "curated" and (not cfg.kotlin.curated_modules or #cfg.kotlin.curated_modules == 0) then
+    if
+      cfg.kotlin.jar_mode == "curated"
+      and (not cfg.kotlin.curated_modules or #cfg.kotlin.curated_modules == 0)
+    then
       return false, "kotlin.curated_modules must not be empty in curated mode"
     end
     if not cfg.kotlin.soong_tag_priority or #cfg.kotlin.soong_tag_priority == 0 then

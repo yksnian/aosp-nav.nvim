@@ -83,8 +83,7 @@ function M.collect_jars(aosp_out, output_dir)
   end
 
   _running = true
-  log.info(("collecting jars %s -> %s (async, continue working)")
-    :format(aosp_out, output_dir))
+  log.info(("collecting jars %s -> %s (async, continue working)"):format(aosp_out, output_dir))
 
   local started_at = os.time()
 
@@ -105,8 +104,10 @@ function M.collect_jars(aosp_out, output_dir)
           tail_lines[#tail_lines + 1] = lines[i]
         end
       end
-      log.error("collect failed (exit " .. code .. ")\n"
-        .. table.concat(tail_lines, "\n"), { timeout = 10000 })
+      log.error(
+        "collect failed (exit " .. code .. ")\n" .. table.concat(tail_lines, "\n"),
+        { timeout = 10000 }
+      )
       return
     end
 
@@ -120,8 +121,10 @@ function M.collect_jars(aosp_out, output_dir)
     end
 
     local elapsed = os.time() - started_at
-    log.info("collect finished in " .. elapsed .. "s\n"
-      .. table.concat(summary, "\n"), { timeout = 10000 })
+    log.info(
+      "collect finished in " .. elapsed .. "s\n" .. table.concat(summary, "\n"),
+      { timeout = 10000 }
+    )
 
     -- 清除 jar 内存缓存 (收集后 fallback jar 可能变化)
     -- 注意: 文件缓存 keyed by android_root, 未编译项目本就无缓存; 已编译项目

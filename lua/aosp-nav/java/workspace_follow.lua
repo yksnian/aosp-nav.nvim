@@ -43,7 +43,9 @@ end
 --- @param child string
 --- @return boolean
 local function contains(dir, child)
-  if not dir or dir == "" or not child or child == "" then return false end
+  if not dir or dir == "" or not child or child == "" then
+    return false
+  end
   local d, c = normalize(dir), normalize(child)
   return c == d or c:sub(1, #d + 1) == d .. "/"
 end
@@ -56,15 +58,18 @@ end
 --- @return string|nil project 规整后的绝对路径
 --- @return string|nil aosp_root 该项目的 AOSP 根 (用于算相对路径与提示文案)
 function M.target(fname)
-  if not fname or fname == "" then return nil, nil end
+  if not fname or fname == "" then
+    return nil, nil
+  end
   local root_mod = require("aosp-nav.java.root")
   -- project_dir 就是"当前 buffer 所属项目目录"的**唯一定义** (root.lua); 这里不重算,
   -- 免得它与面板/注入路径各算一套。nil 表示不在树内或没有项目标记。
   local p = root_mod.project_dir(fname)
-  if not p then return nil, nil end
+  if not p then
+    return nil, nil
+  end
   return normalize(p), root_mod.aosp_root(fname)
 end
-
 
 --- 当前 buffer 挂着的 jdtls client (口径与 java/source_apply.client 一致:
 --- 先按 buffer 找, 找不到再退到任意一台)。按 buffer 找是必须的 —— 一个会话里可以
@@ -98,11 +103,12 @@ end
 --- @param client table
 --- @return string|nil
 function M.current_root(client)
-  if not client then return nil end
+  if not client then
+    return nil
+  end
   local cid = tostring(client.id or root_of(client) or "?")
   return _target_of[cid] or root_of(client)
 end
-
 
 --- BufEnter 钩子: 当前 buffer 所属项目与已注入的项目不一致时, 把目标项目的源码根
 --- **addToSourcePath 进当前 invisible project** (aosp 模式的运行期机制复用), 并提权。
@@ -121,16 +127,24 @@ end
 --- @return boolean changed 是否触发了注入
 function M.on_buf_enter(fname)
   local cfg = require("aosp-nav").config
-  if not cfg.java or cfg.java.mode ~= "project" then return false end
+  if not cfg.java or cfg.java.mode ~= "project" then
+    return false
+  end
 
   fname = (fname and fname ~= "") and fname or vim.api.nvim_buf_get_name(0)
-  if not fname or fname == "" then return false end
+  if not fname or fname == "" then
+    return false
+  end
 
   local target, aosp = M.target(fname)
-  if not target then return false end
+  if not target then
+    return false
+  end
   local client = M.client()
   -- 还没有 jdtls 在跑: 第一台的根由 root.lua 的 root_dir 函数负责, 这里不插手。
-  if not client then return false end
+  if not client then
+    return false
+  end
 
   -- [v18.7] project 模式的跨项目注入是**结构性不可行**: addToSourcePath 只接受
   -- rootPaths 边界内的路径, 而 project 模式的 rootPaths=[单模块目录] —— 其他模块
@@ -138,30 +152,30 @@ function M.on_buf_enter(fname)
   -- 明示边界, 不再静默发注定失败的请求。
   require("aosp-nav.util.log").info(
     "project mode indexes one module; cross-module jumps land in jars "
-      .. "(switch java.mode to 'aosp' for cross-module source navigation)")
+      .. "(switch java.mode to 'aosp' for cross-module source navigation)"
+  )
 
   -- 目标项目的源码根 (相对目标项目) -> 相对 AOSP 根 (注入形态与 aosp 模式一致)
-  local ok_sr, roots = pcall(
-    require("aosp-nav.java.source_roots").find_for_project, target, {})
-  if not ok_sr or not roots or #roots == 0 then return false end
+  local ok_sr, roots = pcall(require("aosp-nav.java.source_roots").find_for_project, target, {})
+  if not ok_sr or not roots or #roots == 0 then
+    return false
+  end
   local batch = {}
   for _, r in ipairs(roots) do
     local abs = r:sub(1, 1) == "/" and r or (target .. "/" .. r)
     local rel = require("aosp-nav.java.projects").rel(aosp, abs)
-    if rel ~= "" then batch[#batch + 1] = rel end
+    if rel ~= "" then
+      batch[#batch + 1] = rel
+    end
   end
-  local fh = io.open("/home/yangwj12/aospnav-probe17/follow_trace.log", "a")
-  fh:write(os.date("%H:%M:%S ") .. ("target=%s roots=%d batch=%d"):format(
-    tostring(target), #roots, #batch) .. "\n"); fh:close()
-  if #batch == 0 then return false end
+  if #batch == 0 then
+    return false
+  end
 
   -- [v18.6] 注入走 aosp 运行期机制 (逐条 addToSourcePath + 完成后自动 reorder 提权);
   -- tag=manual 使完成回调照实回报。pending 差集已在 source_apply 内处理。
   local sa = require("aosp-nav.java.source_apply")
   local ok_start = sa.start(client, aosp, batch, "manual", nil, fname)
-  local fh2 = io.open("/home/yangwj12/aospnav-probe17/follow_trace.log", "a")
-  fh2:write(os.date("%H:%M:%S ") .. ("start=%s batch=%d"):format(
-    tostring(ok_start), #batch) .. "\n"); fh2:close()
   return ok_start and true or false
 end
 
