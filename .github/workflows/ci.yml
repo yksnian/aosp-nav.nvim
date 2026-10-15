@@ -1,0 +1,36 @@
+# ci.yml: 每次 push / PR 跑一遍完整测试套件 (tests/run.sh, 无框架依赖,
+# 只要求一个 headless nvim)。style 检查用 stylua --diff, 与仓库 stylua.toml 对齐。
+name: ci
+
+on:
+  push:
+    # 本仓库无 main: 默认分支 master, 日常开发 dev (origin/HEAD -> master)
+    branches: [master, dev]
+  pull_request:
+    # 不加 branches 过滤: 对任何目标分支的 PR 都跑
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install neovim (stable)
+        uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: stable
+      - name: run test suite
+        run: bash tests/run.sh
+
+  style:
+    runs-on: ubuntu-latest
+    # 非阻断: 存量文件尚有风格偏差, 先可见、不挡合并; 逐步收敛后再摘掉这行
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: stylua check
+        uses: JohnnyMorganz/stylua-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          version: v0.20.0
+          args: --check .

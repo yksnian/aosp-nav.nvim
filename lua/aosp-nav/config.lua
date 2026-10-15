@@ -26,6 +26,12 @@ M.defaults = {
   log_level = "warn",
   -- nil = 自动检测 (从打开文件路径向上找含 out 产物的目录)
   android_root = nil,
+  -- [v13] 兄弟子项目优先级: 打开的文件自身祖先里没有 out/ 时, 在最近的顶层根下按
+  -- 此顺序找兄弟项目的 out (厂商目录自身不编译的布局, 见 android_root.lua)。
+  -- 原为 android_root.lua 写死的 { "soc/qcom/qssi", "google/aosp" } —— 别家布局要改
+  -- 插件源码才能用, 故提为配置 (kotlin classpath 脚本的 SIBLINGS 也用这一份)。
+  -- 语义 = 整表替换。
+  sibling_projects = { "soc/qcom/qssi", "google/aosp" },
   -- jar 列表缓存目录 (避免每次打开 java 文件都全盘扫描)
   cache_dir = vim.fn.expand("~/.cache/nvim/aosp_nav"),
   java = {
@@ -47,21 +53,21 @@ M.defaults = {
       "^dex%.jar$",
       "^srcjars%d+%.jar$",
       "^kapt%-%w+%.jar$",
-      "stubs",   -- API 签名 jar 家族 (android-non-updatable.stubs.* 等, 无方法体)
-      "%-stub",  -- [v5] 桩实现模块 (sysprop-library-stub-<name> 等): getter 返回
-                 -- 默认值, 无真实逻辑, 真实实现由同名不带 -stub 段的模块提供
-      "^jrt%-fs%.jar$",  -- [v6] JDK 模块系统工具 jar (libcore/prebuilts 的
-                         -- system_modules 产物), 与代码阅读无关
-      "%-headers",  -- [v6] API 桩家族 (framework-minus-apex-headers 等):
-                    -- turbine 头文件 jar, 与主模块产物同 FQN; 真身由主模块提供。
-                    -- 上线前验证: find out/soong/.intermediates -maxdepth 4 \
-                    --   -type d -name '*-headers*' 确认无误伤
+      "stubs", -- API 签名 jar 家族 (android-non-updatable.stubs.* 等, 无方法体)
+      "%-stub", -- [v5] 桩实现模块 (sysprop-library-stub-<name> 等): getter 返回
+      -- 默认值, 无真实逻辑, 真实实现由同名不带 -stub 段的模块提供
+      "^jrt%-fs%.jar$", -- [v6] JDK 模块系统工具 jar (libcore/prebuilts 的
+      -- system_modules 产物), 与代码阅读无关
+      "%-headers", -- [v6] API 桩家族 (framework-minus-apex-headers 等):
+      -- turbine 头文件 jar, 与主模块产物同 FQN; 真身由主模块提供。
+      -- 上线前验证: find out/soong/.intermediates -maxdepth 4 \
+      --   -type d -name '*-headers*' 确认无误伤
     },
     -- 排除的路径关键词 (包含该片段的 jar 路径会被排除, 普通字符串匹配)
     -- 勿加 "android_common_apex": 会误杀只有 apex 变体的模块 (core-oj 等)
     exclude_paths = {
-      "linux_glibc_common",   -- host (编译机) 变体, 另有变体规则兜底
-      "development/",         -- 开发工具 (monkey 等), 无生产代码引用
+      "linux_glibc_common", -- host (编译机) 变体, 另有变体规则兜底
+      "development/", -- 开发工具 (monkey 等), 无生产代码引用
     },
     -- [v4] Lua 模式排除: 匹配 .intermediates/ 之后的相对路径 (锚定 ^ 可精确
     -- 到顶层目录, 子串式的 exclude_paths 做不到)。用于用户自助裁剪, 如:
@@ -94,12 +100,32 @@ M.defaults = {
     import_exclusions_enabled = true,
     import_exclusions_scan = true,
     import_exclusions_ttl = 604800,
+    -- [v10] 启动时 SIGTERM 掉**孤儿** jdtls。孤儿 = 上一个 nvim 崩了/被 kill -9/
+    -- 终端被关之后, 被 init 收养、还一直占着同一份 -data 的那个 JVM —— 不收拾它,
+    -- 之后每个新会话都撞上"两个 jdtls 抢一份索引"(索引被反复删除重建)。
+    -- 没有任何会话拥有它, 所以这是纯垃圾; 与空壳工程自清 (java/init.lua 第 13a 步)
+    -- 同一个道理: 能自动做掉的事就自动做掉, 不留一条要用户手动 kill 的消息。
+    -- 安全闸在 instances.reap_orphan_jdtls: 只杀"确实是孤儿"**且** -data 在本插件缓存根
+    -- 之下的; 别的编辑器也用 jdtls, 缺了任何一条都不动它。设 false 关掉。
+    kill_orphan_jdtls = true,
     -- [v10] 单一模式键 (取代旧的 workspace_mode + source_paths_mode 组合):
-    --   "aosp" (默认) = 工作区根是 AOSP 根 **且** 注入 sourcePaths (预置核心集
-    --     + 按打开项目累积)。跨模块跳转落到可编辑的真实 .java。
-    --   "infer" = 工作区根是 AOSP 根, 但**不**注入 —— 让 jdt.ls 按打开文件的
-    --     package 逐文件推断源码根; 跨模块跳转落到反编译 jar。
-    --   "project" = 工作区根是每个项目 (.git/.project 就近) 的目录, 不注入。
+    --   "project" (默认, [v18.8]) = 工作区根是**当前 buffer 所属项目** (.git/.project
+    --     就近) 的目录, 只索引这一个模块 (首次导入快, 单模块量级内存)。**每个项目
+    --     一台 jdtls** (vscode 同款): 同项目的文件复用同台, 打开其他项目的文件时
+    --     自动另起一台 (各自 -data, 各自索引); 跨模块跳转落 jar —— jdt.ls 的
+    --     addToSourcePath 只认 rootPaths 边界内的路径 (三联实验
+    --     ~/aospnav-probe17, 2026-10-14), 单模块 root 无法扩展其他模块, 这是
+    --     设计使然而非缺陷。新台起前自动回收无附着 buffer 的闲置实例, 且有
+    --     宿主内存闸 (可用 <4GB 时退回已有台, 防全局 OOM)。
+    --   "aosp" = 工作区根是 AOSP 根 **且** 注入 sourcePaths (预置核心集 + 按打开
+    --     项目累积)。跨模块跳转落到可编辑的真实 .java (rootPaths=[AOSP 根], 全树
+    --     都在 addToSourcePath 边界内) —— 整树索引的内存代价由 reorder 内存闸兜底。
+    --     想要单 JVM 共享全树索引时显式选它。
+    --   "infer" = **不对外宣传的基线模式** (v11 降级, 见 DEVELOPMENT.md §3):
+    --     工作区根是 AOSP 根, 但不注入, 让 jdt.ls 逐文件推断源码根。
+    --     它与 aosp 的**索引范围完全相同** (都是整棵树), 所以并不更快;
+    --     多出来的只是"不必维护注入列表", 因而没有注入列表被 jdt.ls 截断 (§2.17b)
+    --     这类失效形态。留作跳转出问题时的对照/兜底, 不出现在 README。
     -- 注意 (机制, 见 DEVELOPMENT.md): 注入这个 key 会**整体关闭** jdt.ls 的逐文件
     -- 推断 (BaseDocumentLifeCycleHandler.inferInvisibleProjectSourceRoot 在
     -- getInvisibleProjectSourcePaths() != null 时直接 return), 所以注入的列表
@@ -107,7 +133,7 @@ M.defaults = {
     -- 两个**不同**问题, 别合并成一个谓词:
     --   根是 AOSP 根  <=>  mode ~= "project"   (aosp 与 infer 都成立)
     --   开启注入      <=>  mode == "aosp"      (只有 aosp 成立)
-    mode = "aosp",
+    mode = "project",
     -- [v9] 累积到的源码根**自动**增量注入运行中的 jdtls 工作区
     -- (java.project.addToSourcePath, 见 java/source_apply.lua)。
     -- 关掉就退回旧行为: 只累积 + 提示, 手动 :Aosp!。
@@ -125,7 +151,7 @@ M.defaults = {
     -- 给得越多首次索引越重 —— 实测 frameworks/base/core/java (4638 文件) 让
     -- 首次索引从 154s/2.1G 变为 183s/5.0G, 建议只放最常跳转的目标。
     core_source_roots = {
-      "frameworks/base/core/java",          -- android.* (framework.jar)
+      "frameworks/base/core/java", -- android.* (framework.jar)
       "frameworks/base/services/core/java", -- com.android.server.* (services.jar)
     },
     -- [v8] 累积的 .git 项目数上限 (LRU 淘汰; 0 = 不限)。每个项目会把它的源码根
@@ -169,6 +195,10 @@ M.defaults = {
     make_jar_priority = { "classes.jar", "classes-header.jar", "javalib.jar" },
     -- Make 构建排除的 intermediates 目录名
     make_blacklist = { "android_stubs_current_intermediates" },
+    -- [v16b] BufEnter 到一个有 pending 源码根的模块时, 去抖 20s 后自动只补该模块
+    -- (逐条 addToSourcePath, 模块根数少时代价可控)。关掉则等下次启动经
+    -- initialize 一次性生效, 或手动 :Aosp! 全量注入 (代价大, 不推荐)。
+    auto_project_apply = true,
     -- [v8] DEPRECATED / 已失效: 浅层 source root 扫描 (旧 java/source_paths.lua)
     -- 已删除, 本键不再有任何效果 (设置时提示一次)。
     -- 要注入源码根请用上面的 core_source_roots / source_paths。
@@ -192,21 +222,22 @@ M.defaults = {
     --   java/com/** 下模块 (如 textclassifier_flags_lib, 属无害缺失)
     -- make 树(Android 14-)取 pattern 最后一个无通配符分量作 <stem>*_intermediates 匹配
     curated_modules = {
-      "frameworks/base/framework",                    -- Activity/Context/View
+      "frameworks/base/framework", -- Activity/Context/View
       "frameworks/base/framework-minus-apex",
-      "libcore/core-all",                             -- java.* 核心库 (带方法体)
+      "libcore/core-all", -- java.* 核心库 (带方法体)
       -- "libcore/core-oj*": core-oj 只有 apex31 变体且脚本排除 apex, 匹配不到;
       --   java.* 解析由 core-all 提供, 无需此条
       "external/icu/android_icu4j/core-icu4j",
       "external/icu/android_icu4j/core-repackaged-icu4j",
-      "frameworks/base/services/core/*",              -- system_server
+      "frameworks/base/services/core/*", -- system_server
       "frameworks/base/ext",
-      "frameworks/base/packages/SystemUI/**",         -- 上游 SystemUI
-      "external/dagger2/dagger2", "external/dagger2/hilt*", -- SystemUI DI 依赖
+      "frameworks/base/packages/SystemUI/**", -- 上游 SystemUI
+      "external/dagger2/dagger2",
+      "external/dagger2/hilt*", -- SystemUI DI 依赖
       -- Kotlin 运行时 (AOSP framework/SystemUI Kotlin 代码的依赖):
       -- kotlin-stdlib 不加: mason KLS 自带 stdlib 已前置 classpath 首位, 同 FQN 必胜
-      "external/kotlinc/kotlin-parcelize-runtime",  -- @Parcelize (kotlinx.parcelize.*)
-      "external/kotlinc/kotlin-reflect",            -- kotlin.reflect.*
+      "external/kotlinc/kotlin-parcelize-runtime", -- @Parcelize (kotlinx.parcelize.*)
+      "external/kotlinc/kotlin-reflect", -- kotlin.reflect.*
       -- 设备变体只有 turbine-combined (API 签名无方法体), 补全/跳转签名可用
       "external/kotlinx.coroutines/kotlinx_coroutines",
     },
@@ -225,8 +256,11 @@ M.defaults = {
 
 -- [v10] java.mode 合法值 (取代旧的 workspace_mode + source_paths_mode):
 --   aosp    = 工作区根 = AOSP 根 + sourcePaths 注入 (默认)
---   infer   = 工作区根 = AOSP 根, 不注入 (jdt.ls 逐文件推断源码根)
---   project = 工作区根 = 项目 .git/.project 目录, 不注入
+--   project = 工作区根 = 当前 buffer 所属项目目录, 注入本项目自己的源码根;
+--             换项目自动重导入 (v11)
+--   infer   = 工作区根 = AOSP 根, 不注入 (jdt.ls 逐文件推断源码根) —— [v11] 保留但
+--             不宣传: 索引范围与 aosp 相同, 无速度优势; 见上面 mode 键的注释。
+-- 三个值都合法 (infer 仍需通过校验, 老配置不能报错), 但 README 只写前两个。
 local JAVA_MODES = { aosp = true, infer = true, project = true }
 
 -- [v10] 日志阈值合法值
@@ -246,7 +280,9 @@ local function drop_legacy_keys(user_opts)
     j.exclude_self_jars = nil
     j.source_patterns = nil
   end
-  if user_opts.clang ~= nil then user_opts.clang = nil end
+  if user_opts.clang ~= nil then
+    user_opts.clang = nil
+  end
 end
 
 --- 校验配置
@@ -267,9 +303,13 @@ function M.validate(cfg)
   -- 一个写错的枚举值不该让 setup 放弃整个插件 (连 jar 收集都不做)。
   if cfg.log_level ~= nil and not LOG_LEVELS[cfg.log_level] then
     local bad = tostring(cfg.log_level)
-    log.warn(("log_level = %q is not a valid value, falling back to 'warn' "
-      .. "(one of: debug|info|warn|error|off)"):format(bad),
-      { once = true, id = "log_level:" .. bad })
+    log.warn(
+      (
+        "log_level = %q is not a valid value, falling back to 'warn' "
+        .. "(one of: debug|info|warn|error|off)"
+      ):format(bad),
+      { once = true, id = "log_level:" .. bad }
+    )
     cfg.log_level = "warn"
   end
 
@@ -281,50 +321,71 @@ function M.validate(cfg)
   end
 
   -- exclude_merge 合法值
-  if cfg.java and cfg.java.exclude_merge
-      and cfg.java.exclude_merge ~= "append" and cfg.java.exclude_merge ~= "replace" then
+  if
+    cfg.java
+    and cfg.java.exclude_merge
+    and cfg.java.exclude_merge ~= "append"
+    and cfg.java.exclude_merge ~= "replace"
+  then
     return false, "java.exclude_merge must be 'append' or 'replace'"
   end
 
   -- [v10] java.mode 归一 (同上策略: 只降级提示, 绝不 return false)。
-  -- 不认识的 mode 回落 "aosp", 并通过 log.warn 只提示一次 —— 不是每次启动弹窗。
+  -- 不认识的 mode 回落默认值 ("project"), 并通过 log.warn 只提示一次 —— 不是每次启动弹窗。
   if cfg.java then
     local m = cfg.java.mode
     if m == nil then
-      cfg.java.mode = "aosp"
+      cfg.java.mode = "project"
     elseif not JAVA_MODES[m] then
-      log.warn(("java.mode = %q is not a valid value, falling back to 'aosp' "
-        .. "(one of: 'aosp' | 'infer' | 'project')")
-        :format(tostring(m)), { once = true, id = "java_mode:" .. tostring(m) })
-      cfg.java.mode = "aosp"
+      -- 提示里**只列 README 记的那两个值**: infer 是内部基线, 不引导用户去配它
+      -- (它仍在 JAVA_MODES 里合法通过校验, 只是不作为"可选项"被宣传)。
+      log.warn(
+        (
+          "java.mode = %q is not a valid value, falling back to 'project' "
+          .. "(one of: 'project' | 'aosp')"
+        ):format(tostring(m)),
+        { once = true, id = "java_mode:" .. tostring(m) }
+      )
+      cfg.java.mode = "project"
     end
 
     -- [v8] source_paths_max_projects 须为非负数字 (旧 normalize_modes 的行为, 保留)
     local mx = cfg.java.source_paths_max_projects
     if mx ~= nil and (type(mx) ~= "number" or mx < 0) then
-      log.warn(("java.source_paths_max_projects = %s is not a non-negative number, "
-        .. "falling back to 8"):format(tostring(mx)),
-        { once = true, id = "max_projects:" .. tostring(mx) })
+      log.warn(
+        (
+          "java.source_paths_max_projects = %s is not a non-negative number, "
+          .. "falling back to 8"
+        ):format(tostring(mx)),
+        { once = true, id = "max_projects:" .. tostring(mx) }
+      )
       cfg.java.source_paths_max_projects = 8
     end
-
   end
 
   -- [v7] import_exclusions_ttl 必须是数字 (秒)
-  if cfg.java and cfg.java.import_exclusions_ttl ~= nil
-      and type(cfg.java.import_exclusions_ttl) ~= "number" then
+  if
+    cfg.java
+    and cfg.java.import_exclusions_ttl ~= nil
+    and type(cfg.java.import_exclusions_ttl) ~= "number"
+  then
     return false, "java.import_exclusions_ttl must be a number (seconds)"
   end
 
   -- [v10] import_exclusions_scan 在 enabled=false 时完全失效: 默认值 enabled=true /
   -- scan=true, 用户只要设 enabled=false 就会静默落入这个组合 (scan 保持默认),
   -- 于是"扫描"什么也不做。只提示一次, 不做硬报错。
-  if cfg.java and cfg.java.import_exclusions_enabled == false
-      and cfg.java.import_exclusions_scan ~= false then
-    log.warn("java.import_exclusions_scan has no effect: the scan is skipped when "
-      .. "import_exclusions_enabled=false; set enabled back to true to turn it on, "
-      .. "or set scan to false to silence this message",
-      { once = true, id = "scan_inert" })
+  if
+    cfg.java
+    and cfg.java.import_exclusions_enabled == false
+    and cfg.java.import_exclusions_scan ~= false
+  then
+    log.warn(
+      "java.import_exclusions_scan has no effect: the scan is skipped when "
+        .. "import_exclusions_enabled=false; set enabled back to true to turn it on, "
+        .. "or set scan to false to silence this message",
+      { once = true, id = "scan_inert" }
+    )
   end
 
   -- kotlin 段校验 (kotlin 启用时)
@@ -332,7 +393,10 @@ function M.validate(cfg)
     if cfg.kotlin.jar_mode ~= "curated" and cfg.kotlin.jar_mode ~= "all" then
       return false, "kotlin.jar_mode must be 'curated' or 'all'"
     end
-    if cfg.kotlin.jar_mode == "curated" and (not cfg.kotlin.curated_modules or #cfg.kotlin.curated_modules == 0) then
+    if
+      cfg.kotlin.jar_mode == "curated"
+      and (not cfg.kotlin.curated_modules or #cfg.kotlin.curated_modules == 0)
+    then
       return false, "kotlin.curated_modules must not be empty in curated mode"
     end
     if not cfg.kotlin.soong_tag_priority or #cfg.kotlin.soong_tag_priority == 0 then

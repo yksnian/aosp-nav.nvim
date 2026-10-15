@@ -10,7 +10,7 @@
 
 local M = {}
 
-M._timer = nil            -- 孤儿巡检 timer
+M._timer = nil -- 孤儿巡检 timer
 M._fallback_baseline = nil -- 非 Linux 平台的快照 (fallback 用)
 M._fallback_active = false
 
@@ -20,10 +20,14 @@ local IS_LINUX = (vim.uv.os_uname().sysname == "Linux")
 --- 读 /proc/<pid>/cmdline, 返回以空格拼接的完整命令行 (失败返回 nil)
 local function read_cmdline(pid)
   local f = io.open(("/proc/%d/cmdline"):format(pid), "r")
-  if not f then return nil end
+  if not f then
+    return nil
+  end
   local data = f:read("*a")
   f:close()
-  if not data or data == "" then return nil end
+  if not data or data == "" then
+    return nil
+  end
   -- cmdline 是 \0 分隔的参数数组
   return (data:gsub("%z", " "))
 end
@@ -31,7 +35,9 @@ end
 --- 读 /proc/<pid>/status 的 PPid (失败/进程已死返回 nil)
 local function read_ppid(pid)
   local f = io.open(("/proc/%d/status"):format(pid), "r")
-  if not f then return nil end
+  if not f then
+    return nil
+  end
   local content = f:read("*a")
   f:close()
   return content:match("PPid:%s*(%d+)")
@@ -41,13 +47,14 @@ end
 local function list_kls()
   local pids = {}
   local ok, out = pcall(vim.fn.system, { "pgrep", "-f", "org[.]javacs[.]kt[.]MainKt" })
+  -- pgrep 无匹配时 exit 1 (不是错误); 非 0 一律视为"没有"
   if not ok or vim.v.shell_error ~= 0 or not out or out == "" then
     return pids
   end
-  if vim.v.shell_error == 0 and out ~= "" then
-    for _, tok in ipairs(vim.split(vim.trim(out), "\n", { plain = true })) do
-      local pid = tonumber(tok)
-      if pid and pid ~= vim.uv.os_getpid() then pids[pid] = true end
+  for _, tok in ipairs(vim.split(vim.trim(out), "\n", { plain = true })) do
+    local pid = tonumber(tok)
+    if pid and pid ~= vim.uv.os_getpid() then
+      pids[pid] = true
     end
   end
   return pids
@@ -59,10 +66,16 @@ local function is_ours(pid)
   local cur = pid
   for _ = 1, 8 do
     local ppid = read_ppid(cur)
-    if not ppid then return false end          -- 进程已死/不可读
+    if not ppid then
+      return false
+    end -- 进程已死/不可读
     ppid = tonumber(ppid)
-    if ppid == mypid then return true end      -- 父进程是本 nvim ✓
-    if ppid <= 1 then return false end         -- 到 init 了, 不是我们的
+    if ppid == mypid then
+      return true
+    end -- 父进程是本 nvim ✓
+    if ppid <= 1 then
+      return false
+    end -- 到 init 了, 不是我们的
     cur = ppid
   end
   return false
@@ -73,22 +86,35 @@ end
 --- MainKt 这个入口类别的 daemon 化 java 进程极少, 误伤面可接受。
 local function is_orphan(pid)
   local ppid = read_ppid(pid)
-  if not ppid or tonumber(ppid) ~= 1 then return false end
+  if not ppid or tonumber(ppid) ~= 1 then
+    return false
+  end
   local cmdline = read_cmdline(pid)
-  if not cmdline or not cmdline:find("MainKt", 1, true) then return false end
-  return true   -- PPid=1 的 MainKt: 孤儿 (KLS 非 daemon)
+  if not cmdline or not cmdline:find("MainKt", 1, true) then
+    return false
+  end
+  return true -- PPid=1 的 MainKt: 孤儿 (KLS 非 daemon)
 end
 
---- 杀单个 pid: TERM → 等 500ms → 存活则 KILL
+--- 杀单个 pid: TERM -> 等最长 500ms -> 仍存活则 KILL。
+--- [#9] 全程 libuv (uv.kill + 轮询 uv.kill(pid, 0)), 不再 fork `kill` 子进程、
+--- 不再 uv.sleep 硬等 —— 死了立刻返回, 存活才继续等; 巡检 timer 路径上不再
+--- 为每个 pid 付 5 次进程创建 + 500ms 固定阻塞。
+--- @param pid number
+--- @return boolean true = 已确认死亡
 local function terminate(pid)
-  vim.fn.system({ "kill", tostring(pid) })
-  -- 分段短等待, 最多 500ms, 进程死了立刻返回
+  local ok = pcall(vim.uv.kill, pid, "sigterm")
+  if not ok then
+    return true
+  end -- 进程已不存在, 视作完成
   for _ = 1, 5 do
     vim.uv.sleep(100)
-    vim.fn.system({ "kill", "-0", tostring(pid) })
-    if vim.v.shell_error ~= 0 then return true end   -- 已死, 免 KILL
+    local alive = pcall(vim.uv.kill, pid, 0) -- signal 0 = 只探活
+    if not alive then
+      return true
+    end
   end
-  vim.fn.system({ "kill", "-9", tostring(pid) })
+  pcall(vim.uv.kill, pid, "sigkill")
   return true
 end
 
@@ -142,19 +168,27 @@ end
 --- configure() 时调用: Linux 下启动孤儿巡检 timer; 非 Linux 记录快照
 function M.setup()
   if IS_LINUX then
-    if M._timer then return end
+    if M._timer then
+      return
+    end
     -- 每 10 分钟顺带清扫孤儿 (本会话开着 KLS 时; 其它情况为 0 成本空扫)
     M._timer = vim.uv.new_timer()
-    M._timer:start(10 * 60 * 1000, 10 * 60 * 1000, vim.schedule_wrap(function()
-      -- 仅在当前会话存在 KLS client 时执行 (避免无 KLS 用户的无谓扫描)
-      if #vim.lsp.get_clients({ name = "kotlin_language_server" }) > 0 then
-        pcall(function()
-          for pid in pairs(list_kls()) do
-            if is_orphan(pid) then terminate(pid) end
-          end
-        end)
-      end
-    end))
+    M._timer:start(
+      10 * 60 * 1000,
+      10 * 60 * 1000,
+      vim.schedule_wrap(function()
+        -- 仅在当前会话存在 KLS client 时执行 (避免无 KLS 用户的无谓扫描)
+        if #vim.lsp.get_clients({ name = "kotlin_language_server" }) > 0 then
+          pcall(function()
+            for pid in pairs(list_kls()) do
+              if is_orphan(pid) then
+                terminate(pid)
+              end
+            end
+          end)
+        end
+      end)
+    )
   else
     M._fallback_baseline = list_kls()
   end
@@ -168,18 +202,13 @@ function M.mark_session_active()
   -- Linux 下祖先链无需标记
 end
 
---- LspDetach(kotlin) 时调用: 停掉巡检 (会话不再使用 KLS)
+--- LspDetach(kotlin) 时调用。
+--- [v18.11] **不再销毁巡检 timer** —— 旧实现停掉 + close + 置 nil, 依赖"重新 attach
+--- 时 M.setup() 再建", 但 setup 只在 configure (spec 求值) 时调用一次: :LspRestart
+--- 或最后一个 .kt buffer detach 后再开新的, 巡检整会话静默失效 (孤儿 KLS 永不清)。
+--- timer 改为常驻: 空扫成本为零 (有 KLS client 才扫描), 每 10 分钟一次可忽略。
 function M.on_detach()
-  -- 保留 timer (会话可能重新打开 kt); 仅在关闭前清理时统一停
-end
-
---- 插件彻底停用/teardown 时调用 (当前无调用点, 预留)
-function M.teardown()
-  if M._timer then
-    M._timer:stop()
-    M._timer:close()
-    M._timer = nil
-  end
+  -- 保留 timer (见上); 无需任何动作
 end
 
 return M

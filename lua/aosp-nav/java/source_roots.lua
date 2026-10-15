@@ -37,13 +37,16 @@ local log = require("aosp-nav.util.log")
 -- v6: header 第 2 行改成 java.source_root_exclude 的指纹 (# exclude=, 对齐 jar 侧
 --     的 # filters=), stats 行挪到第 3 行并增加 excl=; 缓存失效的判据从"只有版本"
 --     变成"版本 + 排除配置"
-local CACHE_VERSION = "v6"
+-- v7: [#8] header 第 3 行加 # root=<项目目录> 并在读侧校验 —— 缓存键旧版不单射
+--     (/work/a/b 与 /work/a-b 同键), 两棵树的缓存文件会互相覆盖; 布局变了, bump
+--     版本让旧缓存整体作废重扫
+local CACHE_VERSION = "v7"
 
 -- 剪枝阈值。这些是算法的一部分而非使用偏好, 故为模块常量: 唯一的用户裁剪
 -- 入口是 java.source_root_exclude (Lua 模式, 同 exclude_globs 语义, 带精选默认值,
 -- 其内容会进缓存指纹 —— 改一条模式缓存立即失效重扫)。
-local SHADOW_RATIO = 0.5      -- 自有 FQN 被遮蔽比例 >= 此值 -> 整根剔掉
-local JDK_SHADOW_RATIO = 0.5  -- 包名落在 JDK 命名空间的比例 >= 此值 -> 整根剔掉
+local SHADOW_RATIO = 0.5 -- 自有 FQN 被遮蔽比例 >= 此值 -> 整根剔掉
+local JDK_SHADOW_RATIO = 0.5 -- 包名落在 JDK 命名空间的比例 >= 此值 -> 整根剔掉
 
 -- 模块级缓存 (按 root)
 local _list = nil
@@ -51,7 +54,7 @@ local _root = nil
 local _stats = nil
 local _cold_notified = false
 local _stale_notified = {}
-local _scanning = {}  -- root -> true, 同一项目同时只允许一个后台扫描
+local _scanning = {} -- root -> true, 同一项目同时只允许一个后台扫描
 
 --- 获取当前配置
 local function get_cfg()
@@ -61,15 +64,29 @@ end
 -- 排序用: 影子树的路径特征 (仅用于决定剪枝时谁是赢家)
 local STUB_HINTS = { "fake", "stub", "ravenwood" }
 local TEST_SEGS = {
-  test = true, tests = true, androidtest = true, robotests = true,
-  cts = true, hostside = true, integration = true, benchmarks = true, tck = true,
+  test = true,
+  tests = true,
+  androidtest = true,
+  robotests = true,
+  cts = true,
+  hostside = true,
+  integration = true,
+  benchmarks = true,
+  tck = true,
 }
 
 -- JDK 命名空间: 这些包在 JRE 容器里已经有一份, 而 JRE 容器排在 classpath
 -- **最前面** (con 在 src 之前), 所以源码根里的同名包永远被遮蔽 —— 注入它们
 -- 一个字节都解析不到, 却要 JDT 从头编译一遍 JDK。实测占注入文件数的 7%。
 local JRE_PREFIXES = {
-  "java.", "javax.", "sun.", "jdk.", "com.sun.", "org.w3c.", "org.xml.", "netscape.",
+  "java.",
+  "javax.",
+  "sun.",
+  "jdk.",
+  "com.sun.",
+  "org.w3c.",
+  "org.xml.",
+  "netscape.",
 }
 
 --- FQN 是否落在 JDK 命名空间
@@ -77,7 +94,9 @@ local JRE_PREFIXES = {
 --- @return boolean
 local function is_jdk_namespace(fqn)
   for _, p in ipairs(JRE_PREFIXES) do
-    if fqn:sub(1, #p) == p then return true end
+    if fqn:sub(1, #p) == p then
+      return true
+    end
   end
   return false
 end
@@ -87,10 +106,14 @@ end
 --- @param n integer
 --- @return string|nil
 local function strip_segments(dir, n)
-  if n <= 0 then return dir end
+  if n <= 0 then
+    return dir
+  end
   for _ = 1, n do
     local parent = dir:match("^(.*)/[^/]+$")
-    if not parent then return nil end
+    if not parent then
+      return nil
+    end
     dir = parent
   end
   return dir
@@ -103,7 +126,9 @@ local function is_stub(rel)
   for seg in rel:gmatch("[^/]+") do
     local s = seg:lower()
     for _, h in ipairs(STUB_HINTS) do
-      if s:find(h, 1, true) then return true end
+      if s:find(h, 1, true) then
+        return true
+      end
     end
   end
   return false
@@ -114,7 +139,9 @@ end
 --- @return boolean
 local function is_test(rel)
   for seg in rel:gmatch("[^/]+") do
-    if TEST_SEGS[seg:lower()] then return true end
+    if TEST_SEGS[seg:lower()] then
+      return true
+    end
   end
   return false
 end
@@ -128,9 +155,17 @@ end
 --- @return table cmd
 local function grep_cmd(root)
   return {
-    "grep", "-r", "-m1", "-H", "--include=*.java",
-    "--exclude-dir=out", "--exclude-dir=.repo", "--exclude-dir=.git",
-    "-e", "^package ", root,
+    "grep",
+    "-r",
+    "-m1",
+    "-H",
+    "--include=*.java",
+    "--exclude-dir=out",
+    "--exclude-dir=.repo",
+    "--exclude-dir=.git",
+    "-e",
+    "^package ",
+    root,
   }
 end
 
@@ -140,18 +175,30 @@ end
 --- @return string|nil rel_root, string|nil fqn
 local function parse_line(line, root)
   local path, pkg = line:match("^(.-):package%s+([%w_%.]+)%s*;")
-  if not path or pkg == "" then return nil end
+  if not path or pkg == "" then
+    return nil
+  end
   local prefix = root .. "/"
-  if path:sub(1, #prefix) ~= prefix then return nil end
+  if path:sub(1, #prefix) ~= prefix then
+    return nil
+  end
   local rel = path:sub(#prefix + 1)
   local dir = rel:match("^(.*)/[^/]+$")
-  if not dir then return nil end
+  if not dir then
+    return nil
+  end
   local class = rel:match("([^/]+)%.java$")
-  if not class then return nil end
+  if not class then
+    return nil
+  end
   local ncomp = 0
-  for _ in pkg:gmatch("[^.]+") do ncomp = ncomp + 1 end
+  for _ in pkg:gmatch("[^.]+") do
+    ncomp = ncomp + 1
+  end
   local src_root = strip_segments(dir, ncomp)
-  if not src_root or src_root == "" then return nil end
+  if not src_root or src_root == "" then
+    return nil
+  end
   return src_root, pkg .. "." .. class
 end
 
@@ -168,11 +215,16 @@ local function analyze(root, lines)
     if src_root then
       files[src_root] = (files[src_root] or 0) + 1
       local t = root_fqns[src_root]
-      if not t then t = {} root_fqns[src_root] = t end
+      if not t then
+        t = {}
+        root_fqns[src_root] = t
+      end
       t[#t + 1] = fqn
     end
   end
-  if not next(files) then return nil, nil end
+  if not next(files) then
+    return nil, nil
+  end
 
   -- 2. 剪枝 1: A 是 B 的严格祖先且 A 自身文件更少 -> 丢 A
   --    (成因是包名与路径对不上的个别文件, 会派生出 build/ 、frameworks/base
@@ -183,9 +235,13 @@ local function analyze(root, lines)
     local p = rel
     while true do
       local parent = p:match("^(.*)/[^/]+$")
-      if not parent then break end
+      if not parent then
+        break
+      end
       if files[parent] and (files[parent] < n or (files[parent] == n and #parent < #rel)) then
-        if not drop[parent] then n_ancestor = n_ancestor + 1 end
+        if not drop[parent] then
+          n_ancestor = n_ancestor + 1
+        end
         drop[parent] = true
       end
       p = parent
@@ -201,7 +257,9 @@ local function analyze(root, lines)
     for rel in pairs(files) do
       for _, pat in ipairs(exclude) do
         if rel:match(pat) then
-          if not drop[rel] then n_exclude = n_exclude + 1 end
+          if not drop[rel] then
+            n_exclude = n_exclude + 1
+          end
           drop[rel] = true
           break
         end
@@ -225,7 +283,9 @@ local function analyze(root, lines)
       local p = rel
       while true do
         local parent = p:match("^(.*)/[^/]+$")
-        if not parent then break end
+        if not parent then
+          break
+        end
         if files[parent] and not drop[parent] then
           drop[rel] = true
           n_nested = n_nested + 1
@@ -251,7 +311,9 @@ local function analyze(root, lines)
     if not drop[rel] and #t > 0 then
       local n = 0
       for _, fqn in ipairs(t) do
-        if is_jdk_namespace(fqn) then n = n + 1 end
+        if is_jdk_namespace(fqn) then
+          n = n + 1
+        end
       end
       if n / #t >= JDK_SHADOW_RATIO then
         drop[rel] = true
@@ -263,12 +325,20 @@ local function analyze(root, lines)
   -- 5. 排序 (仅用于决定剪枝时谁是赢家; jdt.ls 会打乱注入顺序, 不影响解析)
   local kept = {}
   for rel in pairs(files) do
-    if not drop[rel] then kept[#kept + 1] = rel end
+    if not drop[rel] then
+      kept[#kept + 1] = rel
+    end
   end
   table.sort(kept, function(a, b)
-    if is_stub(a) ~= is_stub(b) then return not is_stub(a) end
-    if is_test(a) ~= is_test(b) then return not is_test(a) end
-    if files[a] ~= files[b] then return files[a] > files[b] end
+    if is_stub(a) ~= is_stub(b) then
+      return not is_stub(a)
+    end
+    if is_test(a) ~= is_test(b) then
+      return not is_test(a)
+    end
+    if files[a] ~= files[b] then
+      return files[a] > files[b]
+    end
     return a < b
   end)
 
@@ -282,7 +352,9 @@ local function analyze(root, lines)
       local t = root_fqns[rel] or {}
       local shadowed = 0
       for _, fqn in ipairs(t) do
-        if seen[fqn] then shadowed = shadowed + 1 end
+        if seen[fqn] then
+          shadowed = shadowed + 1
+        end
       end
       if #t > 0 and shadowed / #t >= SHADOW_RATIO then
         n_shadow = n_shadow + 1
@@ -302,7 +374,9 @@ local function analyze(root, lines)
   for _, rel in ipairs(kept) do
     for _, fqn in ipairs(root_fqns[rel] or {}) do
       if owner[fqn] then
-        if owner[fqn] == 1 then dup = dup + 1 end
+        if owner[fqn] == 1 then
+          dup = dup + 1
+        end
         owner[fqn] = 2
       else
         owner[fqn] = 1
@@ -338,8 +412,12 @@ end
 function M.scan(root)
   local out = vim.fn.systemlist(grep_cmd(root))
   -- grep 无匹配时退出码 1 (out 为 { "" } 之类的空表)
-  if vim.v.shell_error ~= 0 and vim.v.shell_error ~= 1 then return nil, nil end
-  if #out == 0 or (#out == 1 and out[1] == "") then return nil, nil end
+  if vim.v.shell_error ~= 0 and vim.v.shell_error ~= 1 then
+    return nil, nil
+  end
+  if #out == 0 or (#out == 1 and out[1] == "") then
+    return nil, nil
+  end
   return analyze(root, out)
 end
 
@@ -349,8 +427,12 @@ end
 --- @param cb fun(roots: table|nil, stats: table|nil)
 --- @return boolean started
 function M.scan_async(root, cb)
-  if not root or root == "" or vim.fn.isdirectory(root) ~= 1 then return false end
-  if _scanning[root] then return false end
+  if not root or root == "" or vim.fn.isdirectory(root) ~= 1 then
+    return false
+  end
+  if _scanning[root] then
+    return false
+  end
   _scanning[root] = true
 
   vim.system(grep_cmd(root), { text = true }, function(res)
@@ -373,14 +455,19 @@ function M.scan_async(root, cb)
 end
 
 --- 缓存文件路径。**必须**与 jars 的缓存不同名: jars.lua 用的是
---- <cache_dir>/<key>.txt, 同名会互相覆盖。
+--- <cache_dir>/<key>.source-roots.txt; 键规则与 jars/import_exclusions 一致
+--- ([#8] 单射: 旧 gsub("/", "-") 下两个不同项目可同键互相覆盖)
 --- @param root string
 --- @return string|nil
 function M.cache_file(root)
   local cfg = get_cfg()
-  if not cfg.cache_dir or not root or root == "" then return nil end
-  local key = root:gsub("/", "-"):gsub("^-", "")
-  return cfg.cache_dir .. "/" .. key .. ".source-roots.txt"
+  if not cfg.cache_dir or not root or root == "" then
+    return nil
+  end
+  return cfg.cache_dir
+    .. "/"
+    .. require("aosp-nav.util.path").cache_key(root)
+    .. ".source-roots.txt"
 end
 
 --- 排除配置指纹 (写进缓存第 2 行): 与 jar 侧的 # filters= 同一个算法,
@@ -396,18 +483,26 @@ end
 --- @return table|nil roots, table|nil stats
 function M.load(root)
   local f = M.cache_file(root)
-  if not f or vim.fn.filereadable(f) ~= 1 then return nil end
+  if not f or vim.fn.filereadable(f) ~= 1 then
+    return nil
+  end
   local lines = vim.fn.readfile(f)
   local head = lines[1] or ""
   if not head:find("# aosp%-nav%.nvim source%-roots " .. CACHE_VERSION, 1) then
     return nil
   end
   -- 排除配置变了 -> 缓存里的根列表已经不成立, 必须重扫 (整行相等才算命中)
-  if (lines[2] or "") ~= "# exclude=" .. exclude_hash() then return nil end
+  if (lines[2] or "") ~= "# exclude=" .. exclude_hash() then
+    return nil
+  end
+  -- [#8] 树根必须匹配: 键不单射时另一棵树/另一个项目的缓存可能写到同一文件
+  if (lines[3] or "") ~= "# root=" .. root then
+    return nil
+  end
   local stats = { shadow_ratio = SHADOW_RATIO }
   local roots = {}
   for i, l in ipairs(lines) do
-    if i == 3 then
+    if i == 4 then
       -- 逐字段匹配而不是整行一个 pattern: 统计字段会随版本增删 (v2 加过
       -- test=/jre=)。整行匹配时多一个/少一个字段就整体解析失败, 统计全变成
       -- 0 —— 而列表本身是好的, 白白误导人。缺的字段留 nil, 显示层用 `or 0`。
@@ -427,12 +522,16 @@ function M.load(root)
       stats.dup_fqn = num("dup")
       stats.files = num("files")
       local rt = l:match("# stats .*ratio=([%d%.]+)")
-      if rt then stats.shadow_ratio = tonumber(rt) end
+      if rt then
+        stats.shadow_ratio = tonumber(rt)
+      end
     elseif l ~= "" and l:sub(1, 1) ~= "#" then
       roots[#roots + 1] = l
     end
   end
-  if #roots == 0 then return nil end
+  if #roots == 0 then
+    return nil
+  end
   return roots, stats
 end
 
@@ -442,18 +541,31 @@ end
 --- @param stats table
 function M.save(root, roots, stats)
   local f = M.cache_file(root)
-  if not f then return end
+  if not f then
+    return
+  end
   vim.fn.mkdir(vim.fn.fnamemodify(f, ":h"), "p")
   local out = {
     "# aosp-nav.nvim source-roots " .. CACHE_VERSION,
     -- 排除配置指纹, 与 jar 缓存第 2 行 (# filters=) 同构
     "# exclude=" .. exclude_hash(),
-    ("# stats roots=%d files=%d ancestor=%d nested=%d test=%d jre=%d shadow=%d dup=%d "
-      .. "excl=%d ratio=%.2f")
-      :format(#roots, stats.files or 0, stats.ancestor_dropped or 0,
-        stats.nested_dropped or 0, stats.test_dropped or 0, stats.jre_dropped or 0,
-        stats.shadow_dropped or 0, stats.dup_fqn or 0, stats.exclude_dropped or 0,
-        stats.shadow_ratio or 0),
+    -- [#8] 扫描基准 (项目目录) 记进头里, 读侧校验 —— 键不单射时防串台
+    "# root=" .. root,
+    (
+      "# stats roots=%d files=%d ancestor=%d nested=%d test=%d jre=%d shadow=%d dup=%d "
+      .. "excl=%d ratio=%.2f"
+    ):format(
+      #roots,
+      stats.files or 0,
+      stats.ancestor_dropped or 0,
+      stats.nested_dropped or 0,
+      stats.test_dropped or 0,
+      stats.jre_dropped or 0,
+      stats.shadow_dropped or 0,
+      stats.dup_fqn or 0,
+      stats.exclude_dropped or 0,
+      stats.shadow_ratio or 0
+    ),
   }
   vim.list_extend(out, roots)
   vim.fn.writefile(out, f)
@@ -468,9 +580,13 @@ end
 --- @return boolean
 function M.stale(root)
   local f = M.cache_file(root)
-  if not f or vim.fn.filereadable(f) ~= 1 then return false end
+  if not f or vim.fn.filereadable(f) ~= 1 then
+    return false
+  end
   local ninja = root .. "/out/soong/build.ninja"
-  if vim.fn.filereadable(ninja) ~= 1 then return false end
+  if vim.fn.filereadable(ninja) ~= 1 then
+    return false
+  end
   return vim.fn.getftime(ninja) > vim.fn.getftime(f)
 end
 
@@ -481,15 +597,17 @@ end
 --- @param root string 项目目录
 --- @param opts table|nil { no_cache = boolean }
 --- @return table|nil roots, table|nil stats
-function M.find(root, opts)
-  if not root or root == "" then return nil end
+--- 读缓存 / 冷扫描 / 写缓存 —— M.find 与 M.find_for_project 共用的**全部**实体逻辑。
+--- 模式闸门在各自的入口, 不在这里 (这里只认"哪个目录", 不认模式)。
+--- @param root string 扫描基准目录 (绝对路径)
+--- @param opts table|nil { no_cache = boolean }
+--- @return table|nil roots, table|nil stats
+local function scan_cached(root, opts)
   opts = opts or {}
-  -- 源码根是给 sourcePaths 注入用的: 只有 mode == "aosp" 才注入。
-  -- "infer"/"project" 都不注入, 故都不提供源码根 (见 config 契约的 infer 陷阱:
-  -- "工作区根是 AOSP 根" ≠ "注入 sourcePaths", 此处问的是后者)
-  if get_cfg().java.mode ~= "aosp" then return nil end
 
-  if not opts.no_cache and _root == root and _list then return _list, _stats end
+  if not opts.no_cache and _root == root and _list then
+    return _list, _stats
+  end
 
   if not opts.no_cache then
     local list, stats = M.load(root)
@@ -499,8 +617,10 @@ function M.find(root, opts)
         _stale_notified[root] = true
         -- 缓存可能过期属 TTL/缓存记账 (例行), 且默认模型下 stale() 是 no-op
         -- 不点名 :LspRestart (可选命令, 用户配置里不一定有); 重建之后直接重开 .java 文件即可
-        log.debug("source-root cache may be stale — run :AospRescan to refresh, then "
-          .. ":AospCleanWorkspace and reopen the .java file to apply")
+        log.debug(
+          "source-root cache may be stale — run :AospRescan to refresh, then "
+            .. ":AospCleanWorkspace and reopen the .java file to apply"
+        )
       end
       return list, stats
     end
@@ -511,17 +631,69 @@ function M.find(root, opts)
     -- 不承诺时长: 热缓存 ~0.5 s, 冷缓存 (首次开机后) 可能数秒。这里是主循环
     -- 同步阻塞。按通知策略, 这类例行启动进度是 log.info (默认阈值下不可见),
     -- 不占用 log.user 的五个席位之一 (那个席位给"排除项冷扫描")
-    log.info("first source-root scan (a full-tree grep, usually <1 s, "
-      .. "a few seconds on a cold page cache; cached afterwards)...")
+    log.info(
+      "first source-root scan (a full-tree grep, usually <1 s, "
+        .. "a few seconds on a cold page cache; cached afterwards)..."
+    )
   end
   local list, stats = M.scan(root)
   if not list or #list == 0 then
-    log.warn("source-root scan failed (grep unavailable?); falling back to jdt.ls inference — "
-      .. "cross-module jumps will land in jars")
+    log.warn(
+      "source-root scan failed (grep unavailable?); falling back to jdt.ls inference — "
+        .. "cross-module jumps will land in jars"
+    )
     return nil
   end
   M.save(root, list, stats)
   _list, _root, _stats = list, root, stats
+  return list, stats
+end
+
+function M.find(root, opts)
+  if not root or root == "" then
+    return nil
+  end
+  -- 整树那条路 (核心集 + 按项目累积) 的源码根: 只有 mode == "aosp" 才注入。
+  -- "infer" 不注入 (靠推断); "project" 注入的是**本项目自己的**根 —— 那条路走
+  -- M.find_for_project (见下), 不从这里出, 所以这里仍然只认 aosp。
+  if get_cfg().java.mode ~= "aosp" then
+    return nil
+  end
+  return scan_cached(root, opts)
+end
+
+--- [v11] mode == "project" 用的源码根: **该 project 目录自己的**源码根 (相对该项目)。
+---
+--- 为什么需要单独一条路: project 模式下 workspace 根就是项目目录, 而项目里的 .java
+--- 默认只有"打开过的"才会被 jdt.ls 逐文件推断出源码根 —— 于是从本项目 A 类跳到同项目
+--- 里**没打开过**的 B 类, 仍会落到反编译 jar。那是该模式自己的核心承诺失效 (用户实测
+--- 面板里 `preset core: 2 active` 却没下发, 正是这个问题的可见面)。
+--- 注入本项目自己的根即可修好: 它们**本来就是**该项目 workspace 下的相对路径, 不需要
+--- 跨根解析, 也不扩大索引 —— 索引的仍只有这一个模块。
+---
+--- 与 M.find 的区别: 那个是整树模式 (核心集 + 跨项目累积), 只在 aosp 下返回; 这个与
+--- aosp 无关, 只在 project 下返回, 且**不累积** (只答"当前这一个项目")。
+--- @param project_root string 项目目录 (绝对路径)
+--- @param opts table|nil { no_cache = boolean } 语义同 M.find
+--- @return table|nil roots 相对 project_root 的源码根, table|nil stats
+function M.find_for_project(project_root, opts)
+  if not project_root or project_root == "" then
+    return nil
+  end
+  if get_cfg().java.mode ~= "project" then
+    return nil
+  end
+  -- 余下逻辑与 M.find 完全一致 (读缓存 / 冷扫描 / 写缓存), 共用同一份实现 ——
+  -- 只有上面的模式闸门不同。
+  local list, stats = scan_cached(project_root, opts)
+  if not list then
+    return nil, nil
+  end
+  -- 空列表绝不能下发: 注入空 sourcePaths 会**整体关闭** jdt.ls 的逐文件推断
+  -- 而没有替代 (见 config.lua 的机制注释)。宁可不下发, 让推断照旧兜底。
+  if #list == 0 then
+    return nil, nil
+  end
   return list, stats
 end
 
@@ -539,7 +711,9 @@ end
 function M.reset(root, opts)
   local r = root or _root
   _list, _root, _stats = nil, nil, nil
-  if not (opts and opts.delete_file) then return nil end
+  if not (opts and opts.delete_file) then
+    return nil
+  end
   local f = r and M.cache_file(r)
   if f and vim.fn.filereadable(f) == 1 then
     vim.fn.delete(f)

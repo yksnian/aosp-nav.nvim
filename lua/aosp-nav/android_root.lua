@@ -9,12 +9,18 @@ local M = {}
 
 local path_util = require("aosp-nav.util.path")
 
--- 兄弟子项目优先级 (文件不在自带 out 的子项目内时, 在顶层根下按此顺序查找)
--- 越靠前越优先; 按需调整
-local sibling_project_order = {
-  "soc/qcom/qssi",
-  "google/aosp",
-}
+-- 兄弟子项目优先级: 配置 sibling_projects (缺省 = 这份历史默认; 顶层根下按此顺序
+-- 查找, 越靠前越优先)。[v13] 从写死改为配置 —— 别家厂商布局不必再改插件源码。
+local function sibling_order()
+  local ok, cfg = pcall(function()
+    return require("aosp-nav").config
+  end)
+  local list = ok and cfg and cfg.sibling_projects
+  if type(list) == "table" and #list > 0 then
+    return list
+  end
+  return { "soc/qcom/qssi", "google/aosp" }
+end
 
 --- 判断目录是否自带 out 产物 (含 jar 源)
 --- @param dir string 目录路径
@@ -41,11 +47,13 @@ function M.find_android_platform_root(fname, opts)
   -- "直接把 AOSP 根目录作为起点"(从根目录打开): 此时 fname 是目录而非文件。
   -- 绝对化后循环里的 :h 上溯与 "/" 终止判定才可靠。
   local path = vim.fn.fnamemodify(path_util.start_dir(fname), ":p"):gsub("/+$", "")
-  if path == "" then path = "/" end
+  if path == "" then
+    path = "/"
+  end
 
   -- fallback 候选, 越靠后越弱
-  local fallback_mk = nil    -- build/make/core/main.mk 存在 = android 源码根 (可能未编译)
-  local fallback_repo = nil  -- .repo 存在 = repo 管理的 AOSP 顶层
+  local fallback_mk = nil -- build/make/core/main.mk 存在 = android 源码根 (可能未编译)
+  local fallback_repo = nil -- .repo 存在 = repo 管理的 AOSP 顶层
 
   while path ~= "/" do
     -- 优先: 当前层自带 out 产物 -> 这就是 android_root
@@ -61,7 +69,9 @@ function M.find_android_platform_root(fname, opts)
       fallback_repo = path
     end
     local parent = vim.fn.fnamemodify(path, ":h")
-    if parent == path then break end
+    if parent == path then
+      break
+    end
     path = parent
   end
 
@@ -69,7 +79,7 @@ function M.find_android_platform_root(fname, opts)
   -- 在最近的顶层根下, 按优先级查找兄弟子项目
   local top = fallback_mk or fallback_repo
   if top and allow_sibling then
-    for _, sub in ipairs(sibling_project_order) do
+    for _, sub in ipairs(sibling_order()) do
       local cand = top .. "/" .. sub
       if M.has_jar_source(cand) then
         return cand
@@ -78,7 +88,9 @@ function M.find_android_platform_root(fname, opts)
   end
 
   -- 兄弟子项目也没 out: 回退到最近的源码根, 再回退到 .repo 顶层
-  if fallback_mk then return fallback_mk end
+  if fallback_mk then
+    return fallback_mk
+  end
   return fallback_repo
 end
 

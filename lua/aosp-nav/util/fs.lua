@@ -25,10 +25,14 @@ local function find_cmd(base_dir, find_path_globs)
   for _, g in ipairs(find_path_globs or {}) do
     patterns[#patterns + 1] = "-path " .. vim.fn.shellescape(g)
   end
-  if #patterns == 0 then return nil end
-  local bs = string.char(92)  -- backslash
+  if #patterns == 0 then
+    return nil
+  end
+  local bs = string.char(92) -- backslash
   return table.concat({
-    "find", vim.fn.shellescape(base_dir), "-type f",
+    "find",
+    vim.fn.shellescape(base_dir),
+    "-type f",
     bs .. "( " .. table.concat(patterns, " -o ") .. " " .. bs .. ")",
     "2>/dev/null",
   }, " ")
@@ -41,7 +45,9 @@ end
 --- @return table|nil matches 文件路径列表 (未排序), nil 表示失败
 --- @return string|nil tool 实际使用的工具 "fd" / "find"
 function M.scan_files(base_dir, fd_regex, find_path_globs)
-  if vim.fn.isdirectory(base_dir) ~= 1 then return nil end
+  if vim.fn.isdirectory(base_dir) ~= 1 then
+    return nil
+  end
 
   -- fd 优先, 失败 (如 fd 版本不支持 -p) 再退回 find
   if vim.fn.executable("fd") == 1 then
@@ -75,14 +81,18 @@ end
 ---           matches=nil 表示失败或目录不存在
 --- @return boolean started 是否真的起了进程
 function M.scan_files_async(base_dir, fd_regex, find_path_globs, cb)
-  if vim.fn.isdirectory(base_dir) ~= 1 then return false end
+  if vim.fn.isdirectory(base_dir) ~= 1 then
+    return false
+  end
   local cmd, tool
   if vim.fn.executable("fd") == 1 then
     cmd, tool = fd_cmd(base_dir, fd_regex), "fd"
   elseif vim.fn.executable("find") == 1 then
     cmd, tool = find_cmd(base_dir, find_path_globs), "find"
   end
-  if not cmd then return false end
+  if not cmd then
+    return false
+  end
 
   vim.system(cmd, { text = true }, function(res)
     local matches = nil
@@ -90,7 +100,9 @@ function M.scan_files_async(base_dir, fd_regex, find_path_globs, cb)
       matches = vim.split(res.stdout, "\n", { plain = true })
     end
     -- on_exit 在 fast event 上下文, 回主循环再交给调用方
-    vim.schedule(function() cb(matches, matches and tool or nil) end)
+    vim.schedule(function()
+      cb(matches, matches and tool or nil)
+    end)
   end)
   return true
 end

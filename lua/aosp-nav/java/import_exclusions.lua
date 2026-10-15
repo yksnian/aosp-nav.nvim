@@ -61,13 +61,16 @@ function M.escape_glob(s)
 end
 
 --- 缓存文件路径: <cache_dir>/import_exclusions-<root 扁平化>.txt
---- key 规则沿用 java/jars.lua 的缓存命名约定
+--- 键规则与 jars/source_roots 一致 ([#8] 单射: 旧 gsub("/", "-") 下 /work/a/b 与
+--- /work/a-b 同键, 两棵树的缓存互相覆盖)
 --- @param root string
 --- @return string
 local function cache_path(root)
   local cfg = get_cfg()
-  local key = root:gsub("/", "-"):gsub("^-", "")
-  return cfg.cache_dir .. "/import_exclusions-" .. key .. ".txt"
+  return cfg.cache_dir
+    .. "/import_exclusions-"
+    .. require("aosp-nav.util.path").cache_key(root)
+    .. ".txt"
 end
 
 --- 扫描结果有效时长 (秒); <= 0 表示永不过期 (仅 :AospImportExclusions 强制重扫)
@@ -76,18 +79,28 @@ local function ttl_seconds()
   return cfg.java and cfg.java.import_exclusions_ttl or 604800
 end
 
---- 读取扫描缓存, 不判新鲜度 (只校验版本)。
+--- 读取扫描缓存, 校验版本**与树根** (不判新鲜度)。
 --- 过期缓存也照常注入 —— 陈旧的排除项仍远好于没有排除; 新鲜度只决定是否
---- 在后台重扫 (M.is_stale), 这样重扫期间也不会出现"排除真空期"
+--- 在后台重扫 (M.is_stale), 这样重扫期间也不会出现"排除真空期"。
+--- [#8] 树根必须匹配: 缓存键旧版不单射, 头部 root 不符说明这份文件是别的树写的。
 --- @param root string
---- @return table|nil patterns 模式列表; nil = 无缓存/版本不符
+--- @return table|nil patterns 模式列表; nil = 无缓存/版本不符/别的树的缓存
 function M.cached(root)
-  if not root or root == "" then return nil end
+  if not root or root == "" then
+    return nil
+  end
   local p = cache_path(root)
-  if vim.fn.filereadable(p) ~= 1 then return nil end
+  if vim.fn.filereadable(p) ~= 1 then
+    return nil
+  end
 
   local lines = vim.fn.readfile(p)
-  if lines[1] ~= "# version=" .. CACHE_VERSION then return nil end
+  if lines[1] ~= "# version=" .. CACHE_VERSION then
+    return nil
+  end
+  if lines[2] ~= "# root=" .. root then
+    return nil
+  end
   local out = {}
   for _, line in ipairs(lines) do
     if line ~= "" and line:sub(1, 1) ~= "#" then
@@ -101,11 +114,17 @@ end
 --- @param root string
 --- @return boolean stale
 function M.is_stale(root)
-  if not root or root == "" then return true end
+  if not root or root == "" then
+    return true
+  end
   local p = cache_path(root)
-  if vim.fn.filereadable(p) ~= 1 then return true end
+  if vim.fn.filereadable(p) ~= 1 then
+    return true
+  end
   local ttl = ttl_seconds()
-  if ttl <= 0 then return false end
+  if ttl <= 0 then
+    return false
+  end
   local age = os.time() - vim.fn.getftime(p)
   -- age < 0 (时钟回拨) 也视为过期, 避免永久复用陈旧结果
   return age < 0 or age > ttl
@@ -115,7 +134,9 @@ end
 --- @param root string
 --- @param patterns table 模式列表
 function M.save(root, patterns)
-  if not root or root == "" then return end
+  if not root or root == "" then
+    return
+  end
   local cfg = get_cfg()
   vim.fn.mkdir(cfg.cache_dir, "p")
   local lines = {
@@ -133,7 +154,9 @@ end
 --- 删除 root 的扫描缓存 (内存侧无状态, 下次 configure 会重新扫描)
 --- @param root string
 function M.invalidate(root)
-  if not root or root == "" then return end
+  if not root or root == "" then
+    return
+  end
   vim.fn.delete(cache_path(root))
 end
 
@@ -152,14 +175,20 @@ local _cold_done = {}
 --- 缓存缺失时同步扫描一次并落盘 (幂等, 每 root 每会话最多扫一次)
 --- @param root string 扫描基准目录 (jdtls root_dir)
 function M.ensure_cached(root)
-  if not root or root == "" or _cold_done[root] then return end
+  if not root or root == "" or _cold_done[root] then
+    return
+  end
   _cold_done[root] = true
-  if M.cached(root) ~= nil then return end
+  if M.cached(root) ~= nil then
+    return
+  end
   -- 通知策略席位 5: 首次(冷缓存)排除项扫描是同步阻塞 (数秒), 必须先让用户知道,
   -- 免得看着像卡死。这是 log.user 的五个指定场景之一, 其余地方不得滥用。
-  log.user("first run: scanning for leftover Eclipse project dirs (exclusion cache, a few "
-    .. "seconds)...",
-    { once = true, id = "exclusions_cold_scan" })
+  log.user(
+    "first run: scanning for leftover Eclipse project dirs (exclusion cache, a few "
+      .. "seconds)...",
+    { once = true, id = "exclusions_cold_scan" }
+  )
   -- 空结果也要落盘 (cached() 返回空表而非 nil): 否则每次开 java 文件都重扫
   M.save(root, M.scan_sync(root))
 end
@@ -205,10 +234,13 @@ end
 local function scan_cmd(root)
   if vim.fn.executable("fd") == 1 then
     local cmd = {
-      "fd", "-t", "f",          -- 只要文件
-      "-H",                     -- 匹配隐藏文件 (.classpath 本身是隐藏文件)
-      "-I",                     -- 不理会 .gitignore (AOSP out/ 常被 ignore)
-      "--max-depth", tostring(MAX_DEPTH),
+      "fd",
+      "-t",
+      "f", -- 只要文件
+      "-H", -- 匹配隐藏文件 (.classpath 本身是隐藏文件)
+      "-I", -- 不理会 .gitignore (AOSP out/ 常被 ignore)
+      "--max-depth",
+      tostring(MAX_DEPTH),
     }
     for _, d in ipairs(SKIP_DIRS) do
       cmd[#cmd + 1] = "-E"
@@ -222,10 +254,14 @@ local function scan_cmd(root)
 
   if vim.fn.executable("find") == 1 then
     local cmd = {
-      "find", root,
-      "-maxdepth", tostring(MAX_DEPTH),
-      "-type", "f",
-      "-name", ".classpath",
+      "find",
+      root,
+      "-maxdepth",
+      tostring(MAX_DEPTH),
+      "-type",
+      "f",
+      "-name",
+      ".classpath",
     }
     for _, d in ipairs(SKIP_DIRS) do
       cmd[#cmd + 1] = "-not"
@@ -265,11 +301,17 @@ end
 --- @param root string 扫描基准目录
 --- @return table patterns
 function M.scan_sync(root)
-  if not root or root == "" or vim.fn.isdirectory(root) ~= 1 then return {} end
+  if not root or root == "" or vim.fn.isdirectory(root) ~= 1 then
+    return {}
+  end
   local cmd = scan_cmd(root)
-  if not cmd then return {} end
+  if not cmd then
+    return {}
+  end
   local files = vim.fn.systemlist(cmd)
-  if vim.v.shell_error ~= 0 then return {} end
+  if vim.v.shell_error ~= 0 then
+    return {}
+  end
   return to_patterns(files)
 end
 
@@ -283,10 +325,16 @@ local _refresh_started = {}
 --- @param cb fun(patterns: table)
 --- @return boolean started 是否真的启动了扫描
 function M.scan_async(root, cb)
-  if not root or root == "" or vim.fn.isdirectory(root) ~= 1 then return false end
-  if _refresh_started[root] then return false end
+  if not root or root == "" or vim.fn.isdirectory(root) ~= 1 then
+    return false
+  end
+  if _refresh_started[root] then
+    return false
+  end
   local cmd = scan_cmd(root)
-  if not cmd then return false end
+  if not cmd then
+    return false
+  end
   _refresh_started[root] = true
 
   vim.system(cmd, { text = true }, function(res)
@@ -295,7 +343,9 @@ function M.scan_async(root, cb)
       files = vim.split(res.stdout, "\n", { plain = true })
     end
     -- on_exit 在 fast event 上下文, vim.fn 调用必须回到主循环
-    vim.schedule(function() cb(to_patterns(files)) end)
+    vim.schedule(function()
+      cb(to_patterns(files))
+    end)
   end)
   return true
 end

@@ -34,8 +34,7 @@ local function not_dot(fname, label)
   local ok, root = pcall(root_mod.aosp_root, fname)
   H.check(ok, "aosp_root(" .. label .. ") 不抛异常: " .. tostring(root))
   H.check(root ~= ".", "aosp_root(" .. label .. ") 不是 '.' (got " .. tostring(root) .. ")")
-  H.check(root == nil or type(root) == "string",
-    "aosp_root(" .. label .. ") 返回 string|nil")
+  H.check(root == nil or type(root) == "string", "aosp_root(" .. label .. ") 返回 string|nil")
 end
 
 not_dot(nil, "nil")
@@ -46,7 +45,8 @@ not_dot(vim.fn.getcwd(), "cwd")
 -- ---------------------------------------------------------------------------
 -- 有真树时的验收
 -- ---------------------------------------------------------------------------
-local LIVE = "/home/yangwj12/project/aosp"
+-- 真树路径由 $HOME 拼出 (~ 在 Lua 字符串里不会展开), 不写死任何用户名
+local LIVE = (vim.env.HOME or "") .. "/project/aosp"
 local HANDLER = LIVE .. "/frameworks/base/core/java/android/os/Handler.java"
 local saved_cwd = vim.fn.getcwd()
 
@@ -72,8 +72,9 @@ if vim.env.AOSPNAV_LIVE_TEST == "1" and vim.fn.isdirectory(LIVE) == 1 then
 
   vim.fn.chdir(saved_cwd)
 else
-  io.write("SKIP: live root-from-cwd checks "
-    .. "(set AOSPNAV_LIVE_TEST=1 with " .. LIVE .. " present)\n")
+  io.write(
+    "SKIP: live root-from-cwd checks " .. "(set AOSPNAV_LIVE_TEST=1 with " .. LIVE .. " present)\n"
+  )
 end
 
 H.finish("t_root_from_cwd")

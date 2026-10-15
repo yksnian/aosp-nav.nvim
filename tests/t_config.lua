@@ -11,7 +11,7 @@ local D = config.defaults
 -- ---------------------------------------------------------------------------
 -- d. 新键的默认值
 -- ---------------------------------------------------------------------------
-H.eq(D.java.mode, "aosp", "java.mode 默认 'aosp'")
+H.eq(D.java.mode, "project", "java.mode 默认 'project' ([v18.8] 每项目一台)")
 H.eq(D.log_level, "warn", "log_level 默认 'warn'")
 H.eq(D.java.source_apply_auto, true, "java.source_apply_auto 保持默认 true")
 -- [v10] 单批上限是 source_apply.lua 的模块常量 MAX_AUTO_ROOTS, **不是**配置键
@@ -31,9 +31,11 @@ H.check(D.clang == nil, "顶层 clang stub 已从 defaults 移除")
 -- ---------------------------------------------------------------------------
 local cfg = config.merge({ java = { mode = "bogus" } })
 local ok
-H.capture_notify(function() ok = config.validate(cfg) end)
+H.capture_notify(function()
+  ok = config.validate(cfg)
+end)
 H.check(ok == true, "未知 java.mode: validate 返回 true (got " .. tostring(ok) .. ")")
-H.eq(cfg.java.mode, "aosp", "未知 java.mode 降级为 'aosp'")
+H.eq(cfg.java.mode, "project", "未知 java.mode 降级为 'project'")
 
 -- ---------------------------------------------------------------------------
 -- [v10] 旧键**静默丢弃**: 不映射到 java.mode, 也不提示。
@@ -41,13 +43,15 @@ H.eq(cfg.java.mode, "aosp", "未知 java.mode 降级为 'aosp'")
 -- ---------------------------------------------------------------------------
 local legacy = config.merge({ java = { workspace_mode = "project" } })
 local ok2
-H.capture_notify(function() ok2 = config.validate(legacy) end)
+H.capture_notify(function()
+  ok2 = config.validate(legacy)
+end)
 H.check(ok2 == true, "旧 workspace_mode 配置: validate 返回 true (不打断 setup)")
-H.eq(legacy.java.mode, "aosp", "workspace_mode 被丢弃, java.mode 仍是默认值")
+H.eq(legacy.java.mode, "project", "workspace_mode 被丢弃, java.mode 仍是默认值")
 H.check(legacy.java.workspace_mode == nil, "workspace_mode 不出现在合并结果里")
 
 local legacy2 = config.merge({ java = { source_paths_mode = "infer" } })
-H.eq(legacy2.java.mode, "aosp", "source_paths_mode 被丢弃, 不影响 java.mode")
+H.eq(legacy2.java.mode, "project", "source_paths_mode 被丢弃, 不影响 java.mode")
 H.check(legacy2.java.source_paths_mode == nil, "source_paths_mode 不出现在合并结果里")
 
 -- 旧键不得干扰用户显式给的新值
@@ -73,7 +77,7 @@ H.eq(nav.config.kotlin.jar_mode, "all", "setup(opts) 后 kotlin.jar_mode 生效"
 H.eq(D.kotlin.jar_mode, "curated", "前置条件: 代码默认值仍是 curated")
 
 local prev = nav.config
-nav.setup()                                   -- 命令回调里的空参调用
+nav.setup() -- 命令回调里的空参调用
 H.eq(nav.config.kotlin.jar_mode, "all", "空参 setup() 之后 jar_mode 仍是用户值")
 H.eq(nav.config.log_level, "debug", "空参 setup() 之后 log_level 仍是用户值")
 H.check(nav.config ~= prev, "setup 仍产出新表 (不就地改旧表)")
@@ -89,9 +93,11 @@ H.eq(nav.config.log_level, "debug", "第二次 setup 不丢上一次的 log_leve
 -- 排除名单的 append 语义照旧 (base 换了也不许回归)
 nav.setup({ java = { exclude_jars = { "my-jar" } } })
 H.check(vim.tbl_contains(nav.config.java.exclude_jars, "my-jar"), "用户排除项在")
-H.check(vim.tbl_contains(nav.config.java.exclude_jars, D.java.exclude_jars[1]),
-  "默认排除项与用户项并存 (append 语义未回归)")
-nav.setup({})                                 -- 空表与 nil 同样不能清空用户配置
+H.check(
+  vim.tbl_contains(nav.config.java.exclude_jars, D.java.exclude_jars[1]),
+  "默认排除项与用户项并存 (append 语义未回归)"
+)
+nav.setup({}) -- 空表与 nil 同样不能清空用户配置
 H.eq(nav.config.kotlin.jar_mode, "all", "空表 setup({}) 之后 jar_mode 仍是用户值")
 
 -- ---------------------------------------------------------------------------
@@ -112,6 +118,9 @@ H.check(D.kotlin.jar_mode == "curated", "就地改合并结果不污染 defaults
 local a = nav.config
 nav.setup()
 H.check(not rawequal(a.java, nav.config.java), "两次 setup 的 config 不共享 java 子表")
-H.check(not rawequal(a.kotlin, nav.config.kotlin), "两次 setup 的 config 不共享 kotlin 子表")
+H.check(
+  not rawequal(a.kotlin, nav.config.kotlin),
+  "两次 setup 的 config 不共享 kotlin 子表"
+)
 
 H.finish("t_config")

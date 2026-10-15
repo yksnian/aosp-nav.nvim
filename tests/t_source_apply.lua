@@ -25,7 +25,7 @@ local proj = TMP .. "/aosp_deadbeef"
 vim.fn.mkdir(proj, "p")
 local lines = {
   '<?xml version="1.0" encoding="UTF-8"?>',
-  '<classpath>',
+  "<classpath>",
   '\t<classpathentry kind="con" path="org.eclipse.jdt.launching.JRE_CONTAINER"/>',
   '\t<classpathentry kind="src" path="_/packages/modules/X/src"/>',
   -- 重复条目必须被去重
@@ -35,7 +35,7 @@ local lines = {
   '\t\t\texcluding="test/**"/>',
   '\t<classpathentry kind="lib" path="/home/u/out/x.jar"/>',
   '\t<classpathentry kind="output" path="bin"/>',
-  '</classpath>',
+  "</classpath>",
 }
 local f = io.open(proj .. "/.classpath", "w")
 f:write(table.concat(lines, "\n"), "\n")
@@ -43,12 +43,18 @@ f:close()
 
 local got = sa.installed(TMP, { "aosp_deadbeef" })
 check(got ~= nil, "installed reads the fixture .classpath")
-check(got and #got == 2, "installed keeps only src entries, deduped (got " .. tostring(got and #got) .. ")")
+check(
+  got and #got == 2,
+  "installed keeps only src entries, deduped (got " .. tostring(got and #got) .. ")"
+)
 check(got and got[1] == "packages/modules/X/src", "installed strips the '_/' link prefix")
 check(got and got[2] == "frameworks/base/core/java", "installed keeps the multi-line entry's path")
 
 -- 第二个候选名字命中时也能读到 (workspace_root / aosp_root 两种基准)
-check(sa.installed(TMP, { "nope_0000", "aosp_deadbeef" }) ~= nil, "installed tries every candidate name")
+check(
+  sa.installed(TMP, { "nope_0000", "aosp_deadbeef" }) ~= nil,
+  "installed tries every candidate name"
+)
 -- 读不到时返回 nil, 不能假装"什么都没有" (那会导致把核心集整批重灌)
 check(sa.installed(TMP, { "does_not_exist" }) == nil, "installed returns nil when unreadable")
 check(sa.installed(nil, { "x" }) == nil, "installed tolerates a nil workspace dir")
@@ -60,7 +66,8 @@ vim.fn.delete(TMP, "rf")
 -- 本仓库的硬约束禁止触碰该目录, 因此默认不跑; 需要端到端集成覆盖时显式
 --     AOSPNAV_LIVE_TEST=1 bash tests/run.sh
 -- 开启 (此时代码会读该目录, 由运行者自行确认合适)。
-local LIVE = "/home/yangwj12/project/aosp"
+-- 真树路径由 $HOME 拼出 (~ 在 Lua 字符串里不会展开), 不写死任何用户名
+local LIVE = (vim.env.HOME or "") .. "/project/aosp"
 local HANDLER = LIVE .. "/frameworks/base/core/java/android/os/Handler.java"
 if vim.env.AOSPNAV_LIVE_TEST == "1" and vim.fn.filereadable(HANDLER) == 1 then
   local pending, err = sa.pending(HANDLER)
@@ -70,17 +77,23 @@ if vim.env.AOSPNAV_LIVE_TEST == "1" and vim.fn.filereadable(HANDLER) == 1 then
     local installed = sa.installed(ws_dir, names)
     if installed then
       local have = {}
-      for _, r in ipairs(installed) do have[r] = true end
+      for _, r in ipairs(installed) do
+        have[r] = true
+      end
       local overlap = 0
       for _, r in ipairs(pending) do
-        if have[r] then overlap = overlap + 1 end
+        if have[r] then
+          overlap = overlap + 1
+        end
       end
       check(overlap == 0, "pending never proposes a root already in .classpath")
       -- 排序稳定, 便于诊断输出
       local sorted, is_sorted = vim.deepcopy(pending), true
       table.sort(sorted)
       for i = 1, #sorted do
-        if sorted[i] ~= pending[i] then is_sorted = false end
+        if sorted[i] ~= pending[i] then
+          is_sorted = false
+        end
       end
       check(is_sorted, "pending is sorted")
     else
@@ -96,19 +109,33 @@ if vim.env.AOSPNAV_LIVE_TEST == "1" and vim.fn.filereadable(HANDLER) == 1 then
     if roots and #roots > 0 then
       local ws, names2 = sa.workspace(HANDLER)
       local have = {}
-      for _, r in ipairs(sa.installed(ws, names2) or {}) do have[r] = true end
+      for _, r in ipairs(sa.installed(ws, names2) or {}) do
+        have[r] = true
+      end
       local pend = {}
-      for _, r in ipairs(pending) do pend[r] = true end
+      for _, r in ipairs(pending) do
+        pend[r] = true
+      end
       local dropped = {}
       for _, r in ipairs(roots) do
         local full = "packages/modules/Wifi/" .. r
-        if not have[full] and not pend[full] then dropped[#dropped + 1] = full end
+        if not have[full] and not pend[full] then
+          dropped[#dropped + 1] = full
+        end
       end
-      check(#dropped == 0, "accumulated roots are installed or pending, never dropped ("
-        .. table.concat(dropped, ", ") .. ")")
+      check(
+        #dropped == 0,
+        "accumulated roots are installed or pending, never dropped ("
+          .. table.concat(dropped, ", ")
+          .. ")"
+      )
       -- 已装 + 待装 = 不重复: 同一个根不能既在 .classpath 里又在 pending 里
       local dup = 0
-      for r in pairs(pend) do if have[r] then dup = dup + 1 end end
+      for r in pairs(pend) do
+        if have[r] then
+          dup = dup + 1
+        end
+      end
       check(dup == 0, "installed and pending are disjoint (got " .. dup .. " overlaps)")
     else
       io.write("SKIP: no accumulated source-root cache for packages/modules/Wifi\n")
@@ -119,17 +146,20 @@ else
 end
 
 -- 注入关闭时必须拒绝 (那条路的 sourcePaths 由导入期注入负责)。
--- source_apply 只读 java.mode (source_paths_mode 已被静默丢弃, 读它没有意义)。
+-- source_apply 只读 java.mode。 [v18.6] project 也走运行期注入了; 仍拒绝的只剩 infer。
 local saved_mode = nav.config.java.mode
-nav.config.java.mode = "project"
+nav.config.java.mode = "infer"
 local p2, e2 = sa.pending("/tmp/x.java")
-check(p2 == nil and type(e2) == "string" and e2:find("mode", 1, true) ~= nil,
-  "pending refuses when injection is off (reason names the mode field)")
+check(
+  p2 == nil and type(e2) == "string" and e2:find("mode", 1, true) ~= nil,
+  "pending refuses when injection is off (reason names the mode field)"
+)
 nav.config.java.mode = saved_mode
 
 -- ---------- classify: 三种真实返回值 ----------
 local ok1, c1 = pcall(sa._classify, {
-  status = true, sourcePaths = { "a" },
+  status = true,
+  sourcePaths = { "a" },
   message = "Successfully added 'x' to the project p's source path.",
 })
 check(ok1 and c1 == "added", "classify: Successfully added -> added")
@@ -154,8 +184,10 @@ check(ok5 and c5 == "failed", "classify: nil result -> failed")
 -- 没有 jdtls client 时必须是 "no-client", 不能去碰 .classpath
 check(sa.client() == nil or true, "client() tolerates no server")
 local st = sa.auto({})
-check(st == "off" or st == "no-client",
-  "auto() is inert without a live jdtls (got " .. tostring(st) .. ")")
+check(
+  st == "off" or st == "no-client",
+  "auto() is inert without a live jdtls (got " .. tostring(st) .. ")"
+)
 
 -- 配置关掉 -> "off" (静默, 不提示)
 local saved_auto = nav.config.java.source_apply_auto
@@ -163,16 +195,53 @@ nav.config.java.source_apply_auto = false
 check(sa.auto({}) == "off", "auto() returns off when source_apply_auto = false")
 nav.config.java.source_apply_auto = saved_auto
 
--- report() 每会话只提示一次
+-- report() 每**棵树**只提示一次 (分区键 = client 的 workspace 根)。
+-- 不是"每会话一次": 多树会话里两棵树各有自己的累积, 两棵树各说一次才讲得清。
+-- (util/log 的 _seen 也按 id 去重, 故 id 必须带 key, 否则第二棵树被静默吞掉。)
+-- 注意它走 log.info: 默认阈值 (warn) 下**不可见**, 这里先把阈值调到 info。
+local logl = require("aosp-nav.util.log")
+local saved_level = logl.get_level()
+logl.set_level("info")
 local notes = {}
 local real_notify = vim.notify
-vim.notify = function(msg) notes[#notes + 1] = msg end
-sa.report("no-client", nil)
-sa.report("toomany", 99)
+vim.notify = function(msg)
+  notes[#notes + 1] = msg
+end
+sa.report("no-client", nil, "/aosp/A")
+sa.report("not-ready", nil, "/aosp/A") -- 同一棵树: 被闸住 (返回 nil)
+sa.report("no-client", nil, "/aosp/B") -- 另一棵树: 放行
 vim.notify = real_notify
-check(#notes == 1, "report() notifies at most once per session (got " .. #notes .. ")")
--- 具体命令名随重构变化 (:AospApplySourceRoots -> :Aosp!), 只断言"指向一条 Aosp 命令"
-check(type(notes[1]) == "string" and notes[1]:find("Aosp", 1, true) ~= nil,
-  "the single report points at an :Aosp command")
+logl.set_level(saved_level)
+check(#notes == 2, "report() 每棵树至多一次 (got " .. #notes .. ")")
+
+-- 文案契约 (2026-10-12 改): 它讲的是一次**自动失败**的后果与自愈, 不是故障。
+-- 刻意**不再指向 :Aosp!** —— 运行期 addToSourcePath 是整条 classpath 重建, 批量大
+-- 会把堆顶上 -Xmx 触发 OOM (实测把 jdtls 杀掉), 不该在自动失败的提示里劝人去敲。
+-- 必须说清"本次退回 jar"与"下次自动生效"。
+local msg = notes[1]
+check(
+  type(msg) == "string" and msg:find("Aosp", 1, true) == nil,
+  "the report no longer suggests :Aosp! (got " .. tostring(msg) .. ")"
+)
+check(
+  msg and msg:find("jars", 1, true) ~= nil,
+  "the report says jumps fall back to jars this session"
+)
+check(
+  msg and msg:find("next start", 1, true) ~= nil,
+  "the report promises automatic apply on next start"
+)
+
+-- 默认阈值 (warn) 下它必须**不可见** —— 这是它相对旧 warn 版的核心变化:
+-- "无需动作"的提示不该顶着 warn 的音量。用一个全新 key 避免上面那条 id 已登记。
+logl.reset()
+logl.set_level("warn")
+local quiet = {}
+vim.notify = function(m)
+  quiet[#quiet + 1] = m
+end
+sa.report("not-ready", nil, "/aosp/C")
+vim.notify = real_notify
+check(#quiet == 0, "report() is silent at the default (warn) threshold (got " .. #quiet .. ")")
 
 H.finish("t_source_apply")

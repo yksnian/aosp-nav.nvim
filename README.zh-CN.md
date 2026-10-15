@@ -90,7 +90,7 @@ require("aosp-nav").setup({
   log_level = "warn",  -- "debug" | "info" | "warn" | "error" | "off"
   java = {
     jar_fallback_dir = "~/.usr/android_jars",
-    mode = "aosp",  -- "aosp" | "infer" | "project"; 见 "导航模式"
+    mode = "project",  -- "project" (默认) | "aosp" | "infer" (不推荐); 见 "导航模式"
     core_source_roots = {
       "frameworks/base/core/java",
       "frameworks/base/services/core/java",
@@ -128,11 +128,21 @@ return {
 
 单个键 `java.mode` 同时决定 jdtls 的工程根 (Eclipse workspace 的 `root_dir`) 在哪, 以及是否注入 Java 源码根。
 
-| `java.mode` | 工作区根 | 源码根 | 效果 |
-| ----------- | -------- | ------ | ---- |
-| `aosp` (默认) | AOSP 根 | 注入 (预置核心集 + 项目累积) | 跨模块跳转到真实 `.java` |
-| `infer` | AOSP 根 | 不注入 —— jdt.ls 逐文件推断 | 索引尽可能轻, 接受跨模块跳转打开反编译 jar |
-| `project` | 每个项目的 `.git`/`.project` 目录 | 不注入 | 每个模块一个 jdtls 工作区 (本插件接管之前的行为) |
+| `java.mode` | 工作区根 | 源码根 | 效果 | 换项目 |
+| ----------- | -------- | ------ | ---- | ------ |
+| `project` (默认) | **当前文件所属项目**的目录 | 注入 (**仅该项目自己**的源码根) | 只索引这一个模块; 模块内跳转落真实 `.java`, 模块外一律打开 jar | **每项目一台** jdtls |
+| `aosp` | AOSP 根 | 注入 (预设核心集 + 访问过的项目累积) | 跨模块跳转落真实 `.java` | 无需切换 |
+| `infer` (不推荐) | AOSP 根 | 不注入 —— 由 jdt.ls 在文件首次打开时自己猜源码根 | 插件完全不插手, 但 AOSP 的目录结构经常让它猜错, 跳转还是落到 jar | 无需切换 |
+
+两种模式都要索引一整块 workspace 并把结果持久化, 区别只在**索引范围**: `aosp` 是整棵树, `project` 是一个模块 (换来更小的首次导入)。按你更在意"跨模块跳转"还是"开得快"来选。
+
+`project` 也注入源码根 —— 但只注入**你所在的这个项目的**, 这样该项目里没打开过的类也会落到真实源码而不是 jar; `aosp` 注入的是共享核心集加上你访问过的每个项目。
+
+`project` 模式下每个项目各跑一台 jdtls: 切到别的项目就为新项目再起一台 (旧的那台闲置了会自动关掉), 各自维护自己模块的索引。让一台 jdtls 在运行中切换工作区是行不通的 —— 它不会为新目录建索引工程, 所以只能每个项目一台。每个项目第一次导入要一分钟左右, 之后走缓存几秒就能用 (导入期间面板会显示 `importing...`)。在同一个项目里切换文件没有任何开销。
+
+**什么时候值得用 `aosp`**: 整天在模块之间来回跳、到处都要跳到真实源码, 且付得起一次重度导入。代价也在这里 —— 首次导入覆盖整棵树 (大树上一次往往要十几分钟); 所有东西挤在一台 JVM 里, 堆要给大 (8G 以上); 运行期发现新模块的根时, 每条都会重建一次整条 classpath (自动、去抖), 然后还要一轮重排才能排到 jar 前面 (同样自动, 十来秒, 内存消耗大 —— 宿主内存紧张时会自动跳过等下次启动)。这些都不用手动操作, 但这正是默认用 `project` 的原因: 大多数人日常就在一两个模块里, 每项目一台的体验明显更好。
+
+`infer` 保留下来, 只是给"什么都想让 jdt.ls 自己来"的场景, 或者用来对比插件托管和裸跑的差别 —— 在真正的 AOSP 树上, 它一般比不过前两种模式。
 
 旧的 `java.workspace_mode` / `java.source_paths_mode` 已删除 —— 请使用 `java.mode`。
 
@@ -151,6 +161,7 @@ return {
 | ---- | ---- |
 | `:Aosp` | 打开信息面板 (会话状态 + 诊断清单 + 已注入源码根, 合并到同一个 scratch buffer) |
 | `:Aosp!` | 强制注入全部已累积源码根, 越过每会话自动上限 |
+| `:AospDebug` (或 `!`) | 直读正在运行的 jdtls 的活 JVM: 堆 / GC / 线程 (`:AospDebug!` 另落一份 thread dump) |
 | `:AospRescan [dir]` | 作废 jar 缓存并重扫, 同时刷新 `import.exclusions` |
 | `:AospCleanWorkspace` (或 `!`) | 删除 jdtls/Eclipse workspace 目录使其重新导入 (破坏性; `:AospCleanWorkspace!` 跳过确认) |
 | `:AospCollectJars` | 收集 AOSP jar 到 fallback 目录 |
@@ -159,18 +170,36 @@ return {
 
 一个面板, 两部分:
 
-- **diagnostics** —— 一份检查清单, 逐项带 `v`/`!` 标记与下一步动作提示: 插件版本 / jdtls 客户端与其 root_dir / JVM `-Xmx` 是否够用 (按数值而非字符串判断) / `referencedLibraries` 条数 / `java.project.sourcePaths` 是否被注入 (`mode == "aosp"` 时期望"已注入", 缺失即故障) / `java.import.exclusions` 条数 / gradle+maven 是否关闭 / AOSP 根与工作区根及当前模式 / 会话 phase / jar 缓存新鲜度 / Eclipse 残留 blockers / jdtls workspace 目录与 "jdtls index" 行 / Kotlin 脚本归属与 KLS 客户端数 / 是否有外部 jdtls 共用同一 `-data`。
+- **diagnostics** —— 一份检查清单, 逐项带 `v`/`!` 标记与下一步动作提示: 插件版本 / jdtls 客户端与其 root_dir / `referencedLibraries` 条数 / `java.project.sourcePaths` 是否被注入 (两种模式都期望"已注入", 缺失即故障) / `java.import.exclusions` 条数 / gradle+maven 是否关闭 / AOSP 根与工作区根及当前模式 / 会话 phase / jar 缓存新鲜度 / Eclipse 残留 blockers / jdtls workspace 目录与 "jdtls index" 行 / Kotlin 脚本归属与 KLS 客户端数 / 是否有外部 jdtls 共用同一 `-data` 以及它属于谁 (`nvim <pid>` 还是孤儿) / `jdtls contract` 一行 (对正在运行的 jdt.ls 的内部契约自检: invisible project 命名与 `addToSourcePath` 返回文案 —— 不匹配意味着 jdt.ls 改了本插件依赖的实现细节)。**JVM `-Xmx` 检查不在这里** —— 已搬到 `:AospDebug` (见下), 那里读的是活进程而不是启动命令行。
 - **source roots** —— 当前注入 `java.project.sourcePaths` 的全部源码根: 配置的核心集 (存在磁盘上的条目标 `x`), 以及每个已累积项目的源码根 (按 LRU 顺序)。当跳转落到同名类的意外实现时用来看清来源。
 
 出问题时先跑这个。
 
-`phase` 是活状态: `idle` (尚未配置) / `indexing` (AOSP 树, 已找到 jar, jdt.ls 仍在导入与构建 —— 状态栏显示 `AOSP:n(idx)`) / `ready` (jdt.ls 已报 `ServiceReady`) / `no-out` (AOSP 树里没有编译产物, 走的 fallback) / `failed` (非 AOSP 文件)。
+`phase` 是活状态: `idle` (尚未配置) / `indexing` (AOSP 树, 已找到 jar, jdt.ls 仍在导入与构建 —— 状态栏显示 `AOSP:n(idx)`) / `ready` (jdt.ls 已报 `ServiceReady`) / `no-out` (AOSP 树里没有编译产物, 走的 fallback)。非 AOSP 文件**没有** phase —— 状态栏对它们保持空串, 面板的 `aosp root` 行显示 `<not an AOSP file>`。
+
+### :AospDebug
+
+报告**正在运行的** jdtls 究竟在干什么 —— 用 `jcmd` 只读直读 JVM: 堆、GC、线程。
+`:Aosp` 看的是启动命令行写了什么, 那里的 `-Xmx` 正确
+**不等于**进程健康。
+
+- **看什么** —— pid 与实际用到的 `jcmd` / uptime / RSS 与线程数 / GC 策略与 GC 占墙钟的比例 / young 与 full GC 的次数及真实平均间隔 / 每次 young GC 的晋升量 / 新生代与老年代的 used-committed-max / 上次 full GC 实测的存活集 / 原样的 `GC.heap_info` / `vm flags`。
+- **查什么** —— 启动命令行里的 `-Xmx` (按数值判; 这一行已从 `:Aosp` 搬来), 以及它是否比宿主物理内存还大 (堆上限高过整机时 JVM 够不着自己的天花板, 先被 OOM 杀掉), 外加活进程的病态形态: 新生代被自适应策略压到远小于堆 / GC 吃掉墙钟 / 每几秒一次 full GC / 存活集放不进老年代 / RSS 超过 `-Xmx`。
+- **判定** 只标出需要动手的; "偏高但在导入期正常"的形态另列, 每条都给具体建议。
+- **`:AospDebug!`** 另外落一份 thread dump 到 `~/.cache/nvim/aosp_nav/` 并给出路径 —— 界面像卡住时用它; 抓完读文件, 不必占着 nvim。
+- **按树** —— 头部写明是哪棵树及其 `-data`, 一个会话里有两套 AOSP 检出时知道报的是谁。
+- **没有 jdtls** —— 一行说明; JVM、`jcmd` 或 `/proc` 读不到时一并给出原因。
+- **只读** —— 从不写 jdtls 工作区; thread dump 落在插件自己的缓存目录。
 
 ### :Aosp!
 
-把已累积的源码根重新注入**正在运行**的 jdtls —— 自动注入触发每会话上限时的手动兜底。
+把已累积的源码根重新注入**正在运行**的 jdtls —— 自动注入被上限截断、或一直没等到就绪窗口时的兜底。
+
+只有 `java.mode = "aosp"` 下它才有事可做 —— 只有这个模式会随浏览积累源码根 (其他模式下面板干脆不显示这条命令)。`project` 模式的根在导入时就注入完了, 没有可强推的累积。
 
 自动注入每会话做一次, 单次最多 5 条; 想关掉设 `java.source_apply_auto = false`。`:Aosp!` 越过上限, 立即注入当前全部累积。
+
+**优先重启 jdtls。** 累积的源码根会在下次启动经 `initialize.sourcePaths` 一次性注入 —— 更省内存, 且顺序排在 jar 之前。`:Aosp!` 每注入一条就重建一次整条 classpath, 批量大时会把 JVM 堆 (`-Xmx`) 撑爆而被 OOM 杀掉。只在**现在就要**用上这些根时才敲它。
 
 ### :AospRescan
 
@@ -184,7 +213,7 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 
 ### :AospCleanWorkspace [!]
 
-删除当前 jdtls 的 Eclipse workspace 目录并停掉客户端, 下次打开 java 文件时全量重新导入。
+删除当前 jdtls 的 Eclipse workspace 目录, 停掉客户端, 并**自动重启 jdtls** (当前缓冲是 `.java` 文件时) 让它从零重新导入 —— 不用你自己重开文件。
 
 什么时候需要:
 
@@ -214,7 +243,7 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 { function() return require("aosp-nav").statusline() end }
 ```
 
-`statusline()` 在非 AOSP 场景返回 `""`, 可以常驻状态栏。
+`statusline()` 在非 AOSP 场景返回 `""` —— 包括普通 (非 AOSP) Java 工程, 它们什么都不显示而不是报错 —— 可以常驻状态栏。同一个会话里开着两棵 AOSP 树时, 状态栏始终反映**当前 buffer 所属树**的状态。
 
 `status()` 字段: `phase`、`root`、`android_root`、`jars`、`cache_origin`、`jdtls_clients`、`mode`、`source_roots`、`source_projects`。
 
@@ -223,6 +252,7 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 | 项                                | 默认                                                         | 说明                                                         |
 | --------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
 | android_root                      | nil                                                          | nil=自动检测, 或指定 AOSP 根目录                             |
+| sibling_projects                  | {soc/qcom/qssi, google/aosp}                                 | 兄弟子项目布局: 打开的文件祖先里没有 `out/` 时, 在最近的顶层根下按此顺序找兄弟项目的 `out/` (根探测与 KLS classpath 脚本共用) |
 | cache_dir                         | ~/.cache/nvim/aosp_nav                                       | jar 列表缓存目录                                             |
 | log_level                         | warn                                                         | 消息阈值 (`debug`/`info`/`warn`/`error`/`off`); 低于阈值的一律静默丢弃。见 [消息与通知](#消息与通知) |
 | java.enabled                      | true                                                         | 启用 java 子模块                                             |
@@ -234,7 +264,7 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 | java.exclude_merge | append | 排除类列表 (exclude_jars/paths/globs/import_exclusions) 的合并语义: append=用户项追加到默认值后 (推荐); replace=整体替换默认值 |
 | java.make_jar_priority            | {classes.jar, classes-header.jar, javalib.jar}               | Make 构建系统 jar 优先级                                     |
 | java.make_blacklist               | {android_stubs_current_intermediates}                        | Make 构建排除目录                                            |
-| java.mode | aosp | `aosp` = 工作区根为 AOSP 根**且**注入 sourcePaths (默认); `infer` = 工作区根为 AOSP 根, **不**注入 sourcePaths (jdt.ls 逐文件推断); `project` = 工作区根为每个项目的 `.git`/`.project` 目录, 不注入 sourcePaths |
+| java.mode | project | `project` (默认) = **每个项目一台 jdtls**: 工作区根为**当前文件所属项目**的目录, sourcePaths 为**该项目自己**的源码根; `aosp` = 工作区根为 AOSP 根**且**注入 sourcePaths (整树共享一份索引, 跨模块跳转到真实源码) |
 | java.source_apply_auto | true | 累积到新源码根时 (以及 jdtls attach 补存量时) 自动增量注入运行中的工作区。每会话最多一次, 且内部单次上限 5 条; 只在 `mode == "aosp"` 且 jdtls 在跑时生效 |
 | java.core_source_roots | {frameworks/base/core/java, frameworks/base/services/core/java} | 预置源码根 (相对 AOSP 根), 从首次导入起就注入。整表替换默认值 (同 `kotlin.curated_modules` 语义); 磁盘上不存在的条目自动跳过。给得越多首次索引越重 |
 | java.source_paths_max_projects | 8 | 累积的 `.git` 项目数上限 (LRU 淘汰, `0` = 不限)。上限与累积集合都会跨会话保留 |
@@ -246,6 +276,7 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 | java.import_exclusions            | {}                                                           | 追加的 jdt.ls glob 排除模式, 排在默认值之后; `!` 开头 = 反向放行 (顺序敏感) |
 | java.import_exclusions_scan       | true                                                         | 是否后台扫描源码树里残留的 `.project`+`.classpath` 目录并自动排除 |
 | java.import_exclusions_ttl        | 604800                                                       | 扫描结果缓存有效期 (秒); ≤0 = 永不过期, 仅 `:AospRescan` 强制重扫 |
+| java.kill_orphan_jdtls            | true                                                         | 启动时 SIGTERM 掉"孤儿"jdtls —— 上一个 nvim 已经退出、却还占着同一份 `-data` 的那台 (之后每个会话都要跟它抢索引)。只杀"确实是孤儿"**且** `-data` 在本插件缓存根之下的; 设 `false` 只报告不杀 |
 | java.inlay_hints_mode             | auto                                                         | auto=有jar强制off/无jar all, 或 off/all                      |
 | kotlin.enabled                    | true                                                         | 启用 kotlin 子模块 (KLS)                                     |
 | kotlin.jar_mode                   | curated                                                      | curated=精选核心模块, all=全量 (实验性)                      |
@@ -296,11 +327,11 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 
 说明 jdt.ls 从 jar 而不是源码解析了这个类型。依次检查:
 
-1. `:Aosp` 面板的 `sourcePaths` 一行必须是 `injected (N entries)`。如果 `java.mode = "aosp"` 却显示 "NOT injected", 说明 `java.core_source_roots` 在磁盘上没解析出来 (AOSP 版本不同或写错了) —— 源码根一栏会给存在的条目标 `x`。
-2. 同一页的 `source projects` 一行形如 `core=N projects=N installed=N pending=N`。`pending > 0` 表示累积的源码根还没进当前工作区, 见下一条。
+1. `:Aosp` 面板的 `sourcePaths` 一行必须是 `injected (N entries)`。`java.mode = "aosp"` 时若显示 "NOT injected", 说明 `java.core_source_roots` 在磁盘上没解析出来 (AOSP 版本不同或写错了) —— 源码根一栏会给存在的条目标 `x`; `project` 模式若显示 "NOT injected", 说明当前项目目录下没扫出源码根。
+2. 同一页的 `source projects` 一行形如 `core=N projects=N installed=N pending=N`。`pending > 0` 表示累积的源码根还没进当前工作区, 见下一条。`project` 模式下这一栏改为 `project :` / `src roots : N root(s) of this project injected`。
 3. `:Aosp` 源码根一栏 —— 如果这个类所属项目不在列表里, 打开该项目下任意一个 `.java` 文件一次, 它的源码根会在后台扫出来并写进缓存。若该项目被 `source_paths_max_projects` 挤掉了, 提高上限或再打开一次它的文件 (`:AospRescan` 清空累积)。
-4. `pending > 0` 时插件会自动应用 (每会话一次, 最多 5 条); 若仍未生效, 跑 `:Aosp!` 强制注入。
-5. 想让新源码根也排到 jar **之前** → `:AospCleanWorkspace` 后重开。这条路的代价是整库重新索引, 且只重启 LSP 客户端不够 —— jdt.ls 会跳过它已经认识的工程。
+4. `pending > 0` 时插件会自动应用 (每会话一次, 最多 5 条); 若仍未生效, **重启 nvim** —— 下次启动会一次性注入。`:Aosp!` 能立刻强行注入, 但它每注入一条就重建一次 classpath, 批量大时可能把 JVM 撑到 OOM。
+5. 想让新源码根也排到 jar **之前** → `:AospCleanWorkspace` (会自动重新导入)。这条路的代价是整库重新索引, 且只重启 LSP 客户端不够 —— jdt.ls 会跳过它已经认识的工程。
 
 注意**构建生成**的类 (AIDL/proto/aconfig 的 Stub/Proxy, 例如 `INetworkOfferCallback`) 在源码树里根本没有 `.java`, jar 是它们的唯一来源, 落到反编译视图是正确结果。
 
@@ -318,7 +349,7 @@ AIDL/proto/aconfig 类 (Stub/Proxy) 由构建系统生成到 `out/`, **源码树
 
 ### jdtls workspace 缓存路径与首次索引耗时
 
-默认模式下工作区根是 AOSP 根, 所以 Eclipse workspace 只有一个: `~/.cache/nvim/jdtls/<AOSP 根目录名>/workspace` (如 `~/.cache/nvim/jdtls/aosp/workspace`)。`mode = "project"` 时每个模块各有一个这样的目录。首次索引很耗 CPU, 耗时取决于树的大小与注入的源码根数量; 索引会持久化, 之后重开为增量加载。**索引期间请勿关闭/重启 jdtls**。
+`mode = "project"` (默认) 下每个模块各有一个 jdtls workspace: `~/.cache/nvim/jdtls/<项目目录名>/workspace` —— 同模块的 buffer 共享一台, 打开其他模块自动另起一台 (新台启动前会自动回收无 buffer 的闲置实例)。`mode = "aosp"` 时工作区根是 AOSP 根, 整棵树只有一个 workspace (如 `~/.cache/nvim/jdtls/aosp/workspace`)。首次索引很耗 CPU, 耗时取决于树的大小与注入的源码根数量; 索引会持久化, 之后重开为增量加载。**索引期间请勿关闭/重启 jdtls**。`mode = "project"` 下切换项目会重导入并重建索引, 这是预期行为 (提示里说的"约 1 分钟"), 不是故障。
 
 配置改动不生效、跳转异常时, 重建 workspace:
 
@@ -332,6 +363,10 @@ AIDL/proto/aconfig 类 (Stub/Proxy) 由构建系统生成到 `out/`, **源码树
 rm -rf ~/.cache/nvim/jdtls
 ```
 
+### 两个 nvim 打开同一棵树
+
+Eclipse workspace 的路径只由 AOSP 根目录名决定, 所以同一棵树上的第二个 nvim 本来会指向**同一份** `-data` —— 于是两个 JVM 抢同一份索引 (反复删除重建), **先开的那个窗口卡死**。第二个窗口打开时插件会自动检测到这一点: 给这个窗口**一份独立的索引** (`<名字>-nvim<pid>`), 且**不**向它注入源码根与 jar。这个窗口照样能用 (jdtls 自己推断源码根、跳转退回 jar), 但跨模块跳转可能落进 jar —— 会有提示说明; 该窗口退出时这份隔离索引会被删掉。要完整功能, 请在第一个窗口工作, 或关掉它后重开本窗口。
+
 ### jar 缓存清除
 
 AOSP 重新编译后:
@@ -340,7 +375,7 @@ AOSP 重新编译后:
 :AospRescan
 ```
 
-之后重启 LSP 客户端让刷新后的 jar 列表生效; 累积的源码根由插件自动应用, 或用 `:Aosp!` 越过上限强制注入。
+之后重启 LSP 客户端让刷新后的 jar 列表生效; 累积的源码根由插件自动应用 (重启 nvim 则会一次性注入)。
 
 ### Kotlin 跳转到测试 stub 文件
 

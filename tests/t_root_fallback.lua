@@ -29,8 +29,12 @@ local root_mod = require("aosp-nav.java.root")
 local clients = {}
 local real_get_clients = vim.lsp.get_clients
 vim.lsp.get_clients = function(filter)
-  if type(filter) ~= "table" or not filter.name then return clients end
-  return vim.tbl_filter(function(c) return c.name == filter.name end, clients)
+  if type(filter) ~= "table" or not filter.name then
+    return clients
+  end
+  return vim.tbl_filter(function(c)
+    return c.name == filter.name
+  end, clients)
 end
 
 local function fake(root, attached)
@@ -48,7 +52,7 @@ local KLS_JAVA = "/tmp/kotlinlangserver1001608865164611311/Handler15214233643908
 local tmp = vim.fn.tempname()
 vim.fn.mkdir(tmp, "p")
 local loose_java = tmp .. "/Loose.java"
-vim.fn.writefile({ "class Loose {}" }, loose_java)          -- 真实存在, 但没有工程
+vim.fn.writefile({ "class Loose {}" }, loose_java) -- 真实存在, 但没有工程
 local proj = tmp .. "/proj"
 vim.fn.mkdir(proj .. "/.git", "p")
 vim.fn.mkdir(proj .. "/src", "p")
@@ -79,7 +83,7 @@ H.eq(root_mod.reuse_root(), AOSP, "kls 的 /tmp/…java (普通路径, buftype='
 -- 没有自己的根的真实文件也一样: 它没有可用的根, 与其另起一台, 不如挂到在跑的
 -- workspace 里 (jdt.ls 会把它放进 jdt.ls-java-project, 与另起一台结果相同)
 vim.api.nvim_set_current_buf(bufs[1])
-vim.api.nvim_set_current_buf(bufs[2])            -- 于是 bufnr('#') == bufs[1]
+vim.api.nvim_set_current_buf(bufs[2]) -- 于是 bufnr('#') == bufs[1]
 H.eq(vim.bo.buftype, "", "前置条件: 当前是普通 (有文件) 的缓冲")
 H.eq(root_mod.reuse_root(), AOSP, "树外真实文件 (无工程标记) -> 复用, 不另起一台")
 
@@ -91,44 +95,97 @@ H.eq(root_mod.reuse_root(), AOSP, "树外真实文件 (无工程标记) -> 复�
 -- 会抛错、被 jdtls_root_fn 的 pcall 吞掉, 于是"用户答不上来"与"用户答了"两种情况
 -- 长得一模一样 —— 旧版测试就因此假通过过。
 local user_root = function(fname)
-  if type(fname) ~= "string" or fname == "" or fname:find("://", 1, true) then return nil end
+  if type(fname) ~= "string" or fname == "" or fname:find("://", 1, true) then
+    return nil
+  end
   local dir = vim.fs.dirname(fname)
-  if vim.fn.isdirectory(dir) == 0 then return nil end          -- 名字不是真路径 -> 答不上来
+  if vim.fn.isdirectory(dir) == 0 then
+    return nil
+  end -- 名字不是真路径 -> 答不上来
   return vim.fs.root(dir, { ".project", ".git" })
 end
 local rf = root_mod.jdtls_root_fn(user_root)
+-- [v18] 默认已是 project; 本节的期望 (树外工程听用户的 root_dir / 反编译视图复用
+-- AOSP 根) 是 **aosp 模式**的语义, 显式设回 aosp 才能继续当回归测试。
+nav.config.java.mode = "aosp"
 
 H.eq(rf(JDT_URI), AOSP, "aosp 模式: jdt:// -> AOSP 根 (Neovim 才会复用而不是新起 JVM)")
-H.eq(rf(KLS_JAVA), AOSP, "aosp 模式: kls 的 /tmp/…java -> 也是 AOSP 根 (本次复测的回归点)")
-H.eq(rf(proj_java), proj, "aosp 模式: 树外**有** .git 的工程 -> 听用户的, 不被拽进 AOSP")
-H.eq(rf(loose_java), AOSP, "aosp 模式: 树外无工程标记的真实文件 -> 复用在跑的那台")
+H.eq(
+  rf(KLS_JAVA),
+  AOSP,
+  "aosp 模式: kls 的 /tmp/…java -> 也是 AOSP 根 (本次复测的回归点)"
+)
+H.eq(
+  rf(proj_java),
+  proj,
+  "aosp 模式: 树外**有** .git 的工程 -> 听用户的, 不被拽进 AOSP"
+)
+H.eq(
+  rf(loose_java),
+  AOSP,
+  "aosp 模式: 树外无工程标记的真实文件 -> 复用在跑的那台"
+)
 
 -- 用户的 root_dir 给出了答案时, 一律听用户的 (哪怕名字看着像虚拟缓冲)
-local fixed = function() return "/home/u/pinned" end
+local fixed = function()
+  return "/home/u/pinned"
+end
 local rf2 = root_mod.jdtls_root_fn(fixed)
-H.eq(rf2(JDT_URI), "/home/u/pinned", "用户 root_dir 有结果 -> 优先用户 (虚拟名也让位)")
+H.eq(
+  rf2(JDT_URI),
+  "/home/u/pinned",
+  "用户 root_dir 有结果 -> 优先用户 (虚拟名也让位)"
+)
 H.eq(rf2(KLS_JAVA), "/home/u/pinned", "用户 root_dir 有结果 -> 优先用户")
 
 -- 用户函数答不上来 (nil) 时, 兜底才生效
-local nil_user = function() return nil end
+local nil_user = function()
+  return nil
+end
 local rf3 = root_mod.jdtls_root_fn(nil_user)
 H.eq(rf3(KLS_JAVA), AOSP, "用户 root_dir 返回 nil -> 复用现有 client")
 
 -- 用户函数抛错时不该炸, 同样落到兜底
-local boom = function() error("boom") end
+local boom = function()
+  error("boom")
+end
 H.eq(root_mod.jdtls_root_fn(boom)(KLS_JAVA), AOSP, "用户 root_dir 抛错 -> 仍能复用")
+
+-- [v18.8] 回到新默认 (project): **每项目一台** —— 树内文件返回其所属项目目录
+-- (即便已有别的项目在跑; 用户 root_dir 让位), 由 root_dir fn 里的闲置回收与内存闸
+-- 控制 JVM 数量。树外无标记的文件仍走 live 复用兜底。
+nav.config.java.mode = "project"
+-- [v18.12] 内存闸读真实 /proc/meminfo: 宿主可用 <4GB 时 (测试机常态) 闸转 live 复用,
+-- 断言翻转。注入 nil (放行) —— root.lua 明示 _mem_avail_kb 可注入供测试。
+local real_mem = root_mod._mem_avail_kb
+root_mod._mem_avail_kb = function()
+  return nil
+end
+H.eq(rf(proj_java), proj, "project 模式: 树内文件 -> 其所属项目目录 (每项目一台)")
+H.eq(
+  rf2(proj_java),
+  proj,
+  "project 模式: 树内文件 p 命中 -> 项目目录优先 (每项目一台)"
+)
+H.eq(
+  rf2(JDT_URI),
+  "/home/u/pinned",
+  "project 模式: jdt:// 无项目归属 -> 用户 root_dir 有解 -> 听用户"
+)
+H.eq(rf(JDT_URI), AOSP, "project 模式: jdt:// (nil_user) -> live 复用兜底")
+root_mod._mem_avail_kb = real_mem
 
 -- ---------------------------------------------------------------------------
 -- 4. 多台 client: 优先"上一个 buffer 挂着的那个"(跳转出发方), 否则用最新的
 --    口径与 nvim-jdtls open_classfile 挑 client 一致
 -- ---------------------------------------------------------------------------
 vim.api.nvim_set_current_buf(bufs[1])
-vim.api.nvim_set_current_buf(bufs[2])            -- 于是 bufnr('#') == bufs[1]
+vim.api.nvim_set_current_buf(bufs[2]) -- 于是 bufnr('#') == bufs[1]
 clients = { fake(AOSP, { [bufs[1]] = true }), fake(OTHER) }
 H.eq(vim.fn.bufnr("#", -1), bufs[1], "前置条件: bufnr('#') 是先前那个 buffer")
 H.eq(root_mod.reuse_root(), AOSP, "上一个 buffer 挂着的 client 优先")
 
-clients = { fake(AOSP), fake(OTHER) }            -- 谁都没挂 -> 用最后(最新)那台
+clients = { fake(AOSP), fake(OTHER) } -- 谁都没挂 -> 用最后(最新)那台
 H.eq(root_mod.reuse_root(), OTHER, "没有线索时用最新的一台")
 
 -- 没有 root_dir 的 client 要跳过, 不能返回 nil 把它交给 LazyVim
@@ -149,8 +206,6 @@ clients = { fake(AOSP) }
 local rf4 = root_mod.jdtls_root_fn(nil)
 H.eq(rf4(JDT_URI), AOSP, "project 模式: jdt:// 也复用现有 client")
 H.eq(rf4(KLS_JAVA), AOSP, "project 模式: kls 的 /tmp/…java 也复用")
-nav.config.java.mode = "aosp"
-
 vim.lsp.get_clients = real_get_clients
 vim.fn.delete(tmp, "rf")
 H.finish("t_root_fallback")
