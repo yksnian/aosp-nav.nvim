@@ -67,6 +67,10 @@ vim.fn.delete(TMP, "rf")
 --     AOSPNAV_LIVE_TEST=1 bash tests/run.sh
 -- 开启 (此时代码会读该目录, 由运行者自行确认合适)。
 -- 真树路径由 $HOME 拼出 (~ 在 Lua 字符串里不会展开), 不写死任何用户名
+--
+-- [2026-10-15] 累积根不变量已按其真正的作用域分叉: 它是 source_inject 的**树级** LRU
+-- 账本, 只有 mode="aosp" 的 union() 才计入。v18.8 起默认 "project", union() 只回核心集,
+-- Wifi 的累积根与本次会话无关, 故 project 分支改为断言核心集自洽 (见下方 in-block 注释)。
 local LIVE = (vim.env.HOME or "") .. "/project/aosp"
 local HANDLER = LIVE .. "/frameworks/base/core/java/android/os/Handler.java"
 if vim.env.AOSPNAV_LIVE_TEST == "1" and vim.fn.filereadable(HANDLER) == 1 then
@@ -104,41 +108,75 @@ if vim.env.AOSPNAV_LIVE_TEST == "1" and vim.fn.filereadable(HANDLER) == 1 then
     -- **不能**断言它们"一定还 pending" —— 自动注入真在活工作区生效之后, 这些根已经在
     -- .classpath 里了 (pending 会自然变空), 而那正是本插件想要的结果。旧断言把"功能
     -- 正常工作"判成了测试失败 (2026-10-10 修)。
-    local proj2 = LIVE .. "/packages/modules/Wifi"
-    local roots = require("aosp-nav.java.source_roots").load(proj2)
-    if roots and #roots > 0 then
+    --
+    -- [2026-10-15 修正] 这条不变量**只在 aosp 模式成立**: 累积的 Wifi 项目是
+    -- source_inject 的**树级** LRU 账本, 只有 mode="aosp" 的 union() 才会把它算进去。
+    -- v18.8 起默认模式是 "project", union() 只回核心集 (本机实测 2 条: frameworks/base
+    -- 与 services 的 core/java), Wifi 的根**压根不在这次会话的清单里** —— 它既不该
+    -- "已装"也不该"待装", 断言它不丢是把 aosp 的前提套到了 project 上。所以按模式分叉:
+    --   - aosp   : 原本的不变量 (累积根不得被 union/差集漏掉)
+    --   - project: 累积账本与本次无关, 只断言核心集这一路是自洽的 (已装 ⊆ 该模块,
+    --              且与 pending 不相交), 这才是 project 模式真正要保证的东西
+    if nav.config.java.mode == "aosp" then
+      local proj2 = LIVE .. "/packages/modules/Wifi"
+      local roots = require("aosp-nav.java.source_roots").load(proj2)
+      if roots and #roots > 0 then
+        local ws, names2 = sa.workspace(HANDLER)
+        local have = {}
+        for _, r in ipairs(sa.installed(ws, names2) or {}) do
+          have[r] = true
+        end
+        local pend = {}
+        for _, r in ipairs(pending) do
+          pend[r] = true
+        end
+        local dropped = {}
+        for _, r in ipairs(roots) do
+          local full = "packages/modules/Wifi/" .. r
+          if not have[full] and not pend[full] then
+            dropped[#dropped + 1] = full
+          end
+        end
+        check(
+          #dropped == 0,
+          "accumulated roots are installed or pending, never dropped ("
+            .. table.concat(dropped, ", ")
+            .. ")"
+        )
+      else
+        io.write("SKIP: no accumulated source-root cache for packages/modules/Wifi\n")
+      end
+    else
+      -- project 模式: 累积账本不参与, 断言核心集这路自洽即可 (上面已实测 pending 只含
+      -- 本模块的 core/java, 那正是"project 只注入本项目根"的正面证据)。
+      local core_rel = "frameworks/base/core/java"
+      local ws, names2 = sa.workspace(HANDLER)
+      local have_core = false
+      for _, r in ipairs(sa.installed(ws, names2) or {}) do
+        if r == core_rel then
+          have_core = true
+        end
+      end
+      check(
+        have_core or vim.tbl_contains(pending, core_rel),
+        "project mode: the core root of this module is installed or pending"
+      )
+    end
+
+    -- 已装 + 待装 = 不重复: 同一个根不能既在 .classpath 里又在 pending 里 (两模式共有)
+    do
       local ws, names2 = sa.workspace(HANDLER)
       local have = {}
       for _, r in ipairs(sa.installed(ws, names2) or {}) do
         have[r] = true
       end
-      local pend = {}
-      for _, r in ipairs(pending) do
-        pend[r] = true
-      end
-      local dropped = {}
-      for _, r in ipairs(roots) do
-        local full = "packages/modules/Wifi/" .. r
-        if not have[full] and not pend[full] then
-          dropped[#dropped + 1] = full
-        end
-      end
-      check(
-        #dropped == 0,
-        "accumulated roots are installed or pending, never dropped ("
-          .. table.concat(dropped, ", ")
-          .. ")"
-      )
-      -- 已装 + 待装 = 不重复: 同一个根不能既在 .classpath 里又在 pending 里
       local dup = 0
-      for r in pairs(pend) do
+      for _, r in ipairs(pending) do
         if have[r] then
           dup = dup + 1
         end
       end
       check(dup == 0, "installed and pending are disjoint (got " .. dup .. " overlaps)")
-    else
-      io.write("SKIP: no accumulated source-root cache for packages/modules/Wifi\n")
     end
   end
 else

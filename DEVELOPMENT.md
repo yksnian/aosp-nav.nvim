@@ -1267,6 +1267,53 @@ workspace 无直接效果。
 (EOF) —— 必须判空返回, 否则后续 `h.split(...)[1]` 抛 `IndexError`, 把"服务器已退出"
 伪装成一个无关的解析崩溃。
 
+### 2.17.1 16GB 宿主上的 global OOM, 与"单台复用"方案的两度未通过 (2026-10-15, 方案已弃)
+
+**症状 (用户反馈)**: 打开 `frameworks/base` 的文件时 nvim 报
+`Client jdtls quit with exit code 0 and signal 9`。**`exit code 0` + signal 9 = 进程被
+外部 SIGKILL**, 不是 jdtls 自己崩 —— 它没报错也没主动退出。
+
+**取证 (dmesg)**: 宿主 16 GB, SwapFree 只剩 11 MB。三分钟内连杀三台 java:
+
+```
+13:46:14  Killed process 299714 (java)  anon-rss:2555008kB
+13:48:33  Killed process 300481 (java)  anon-rss:2574040kB
+13:49:12  Killed process 300931 (java)  anon-rss:2587040kB
+```
+
+**单台只吃 2.5 GB, 远没到 `-Xmx8G`** —— 不是"某台 jdtls 自己撑爆", 而是**好几台同时
+活着把宿主填满**。连杀三台、杀一台缓不过来, 正是这个特征。两个 nvim 窗口 × 每项目一台,
+叠加 VSCode 的 jdtls (`-Xmx16G`), 必然触发。
+
+**磁盘侧同一个结论**: `~/.cache/nvim/jdtls/` 下有
+`base/ Connectivity/ NetworkStack/ Wifi/ aosp/` 五个完整索引 (~3.7 GB), 每个背后一台
+独立 JVM, 各只养自己的**核心**不可见工程:
+
+```
+Connectivity/workspace → Connectivity_6ab51fcc, jdt.ls-java-project
+Wifi/workspace         → Wifi_e774a2a
+aosp/workspace         → aosp_3f7ad7da      (10-13 旧默认模式的遗留, 现已无法再生成)
+base/workspace         → base_93614236
+```
+
+**试过的方案 (已弃)**: 加一个 `java.project_instances = "single"`, 让整个会话只留一台
+jdtls、复用它的 workspace 根 (即 v18.7 `65f6516` 的那两行 `reuse_root` 优先)。判别器只有
+`root.jdtls_root_fn` 的 project 分支一处, 且放在 `find_project_root` **之前**。
+
+**为什么弃 —— 两度未过**:
+
+1. **换根机制被证伪 (v18.6/v18.7 时期)**: 单台要能用, 得让 jdt.ls 随 buffer 把那台的
+   可见根换到目标模块。两条路都走不通 —— `didChangeWorkspaceFolders` 不为 added folder
+   建 invisible project (§2.17a), `addToSourcePath` 只认 `rootPaths` 边界内的路径 (§2.17)。
+   于是 project 模式 + 单台 = **跨模块跳转必然落 jar, 无补救路径**。
+2. **真机实测仍有较多问题 (2026-10-15, 用户反馈)**: 即使用户接受"跨模块落 jar"这个代价,
+   真跑起来问题依然多。方案**回退, 不再研究**。
+
+**留给后来者的方向**: 要"省内存" + "跨模块跳转可用", 正确的选择是 `java.mode = "aosp"`
+(它本就是单台, 根 = AOSP 根), **不是**在 project 模式下做单台。两者不可兼得的原因见上面
+第 1 条。本节的取证 (dmesg / 五个 `-data` / 每台只养核心工程) 是复现这个 OOM 的完整线索,
+重新拾起这个方向时先读这里。
+
 ### 2.18 `:AospCleanWorkspace` 删完自动重启 jdtls (2026-10-13)
 
 **症状 (用户反馈)**: 敲完 `:AospCleanWorkspace`, 界面停在"没有 LSP"的状态, 用户得自己
@@ -2248,7 +2295,7 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | 套件 | 断言 | 覆盖 |
 | ---- | ---- | ---- |
 | `t_commands.lua` | 16 | 命令面冻结契约: 恰好 5 个 `:Aosp*` 命令 (含 `:AospDebug`), 且删掉的那 7 个一个都不在; `:Aosp`/`:AospDebug` 都是 bang 命令 |
-| `t_conflict.lua` | 37 | 会话隔离 (§2.16.1): `session_conflict.check` 四种情形 (有**主的**别的 jdtls 占同一 `-data` → 冲突 / 无 → 不冲突 / 只剩孤儿 → 不冲突 / `-data` 在别处 → 不冲突; 全部注入假依赖, 不碰真 `/proc`) 且同一 `ws_dir` 只扫一次 (结果按会话缓存, configure 与 project_name 包装器共用同一判定) / 算不出 `-data` 时不扫 foreign 且不冲突 / `isolation_name` = `base.."-nvim"..pid`, 同 base 换 pid 换名字 (隔离成立的前提)、同会话稳定、空/nil base → nil / `cleanup` 的归属闸 (`isolation_dir_owned`): 缓存根之下 + **本进程** `-nvim<pid>` 后缀才认, 隔离根与其 `workspace/` 子目录两形态都认; 共用 `qssi/workspace`、别人的后缀、别处 `-data`、`/`、nil、空串、`<cache_root>-evil` 兄弟目录一律判否 / `isolation_root` 归约 (workspace 子路径 → 根) / **端到端**: 只剩 `config/` 的泄漏目录被 `cleanup(不存在的 workspace)` 整个删掉 (回归 2026-10-13 泄漏), 共用的 `qssi/workspace` 不动 / **`configure` 集成回归闸**: 无冲突时 `opts.project_name` **逐引用相同**、照旧返回 basename —— "不影响单 nvim 正常路径"的证据 / **收尾回归闸**: 全程把 `SC.set_cache_root` 指向临时目录, 断言真缓存根里没被写进任何 `-nvim<pid>` 目录 (回归 2026-10-13 "测试在真缓存里留下 `qssi-nvim<pid>`"; 真树那块需 `AOSPNAV_LIVE_TEST=1`) |
+| `t_conflict.lua` | 41 | 会话隔离 (§2.16.1): `session_conflict.check` 四种情形 (有**主的**别的 jdtls 占同一 `-data` → 冲突 / 无 → 不冲突 / 只剩孤儿 → 不冲突 / `-data` 在别处 → 不冲突; 全部注入假依赖, 不碰真 `/proc`) 且同一 `ws_dir` 只扫一次 (结果按会话缓存, configure 与 project_name 包装器共用同一判定) / 算不出 `-data` 时不扫 foreign 且不冲突 / `isolation_name` = `base.."-nvim"..pid`, 同 base 换 pid 换名字 (隔离成立的前提)、同会话稳定、空/nil base → nil / `cleanup` 的归属闸 (`isolation_dir_owned`): 缓存根之下 + **本进程** `-nvim<pid>` 后缀才认, 隔离根与其 `workspace/` 子目录两形态都认; 共用 `qssi/workspace`、别人的后缀、别处 `-data`、`/`、nil、空串、`<cache_root>-evil` 兄弟目录一律判否 / `isolation_root` 归约 (workspace 子路径 → 根) / **端到端**: 只剩 `config/` 的泄漏目录被 `cleanup(不存在的 workspace)` 整个删掉 (回归 2026-10-13 泄漏), 共用的 `qssi/workspace` 不动 / **`configure` 集成回归闸**: 无冲突时 `opts.project_name` **逐引用相同**、照旧返回 basename —— "不影响单 nvim 正常路径"的证据 / **收尾回归闸**: 全程把 `SC.set_cache_root` 指向临时目录, 断言真缓存根里没被写进任何 `-nvim<pid>` 目录 (回归 2026-10-13 "测试在真缓存里留下 `qssi-nvim<pid>`"; 真树那块需 `AOSPNAV_LIVE_TEST=1`) / **真树块**: 冲突时 `project_name` 变隔离名 + `state.get(<AOSP 根>).limited == true` **且** `state.get().limited == false` (钉住 §2.15 `#3` 的"状态按树分区"契约; 2026-10-15 修) |
 | `t_config.lua` | 37 | 本轮重构引入/删除的键: 死键静默丢弃 (不映射、不告警) / `merge` 不改调用方的表 / `source_apply_max_roots` 不再是配置键 / **重复 setup 不得打回默认值** (见 §2.14): 空参 `setup()` 后 `kotlin.jar_mode`·`log_level` 仍是用户值 / 第二次带参 setup 不丢上一次的键 / 新表产出且旧表不被就地改写 / 排除名单 append 语义未回归 / **合并结果不与 `M.defaults` 共享子表**, 就地改它不污染默认值 (标量+列表) |
 | `t_jvm.lua` | 127 | `util/jvm.assess` (此前**完全没有**测试): `-Xmx6G` 判否 / `--jvm-arg=` 前缀剥离 / 重复 `-Xmx` 后者胜 / `UseParallelGC` 识别 / 无值·无键·nil cmd 不崩 / **`xmx_over_host`** (§8.1.2): `-Xmx16G` 在 512G 宿主静默·在 15G 宿主报警且建议**调小** (不得误报 `xmx_small`) / 80% 边界恰好不报·超过才报 / `MemTotal` 读不到时跳过该检查 / `host_mem_total()` 真读 `/proc/meminfo` (正数或 nil, 不崩)。`util/jvm_live` (**活进程遥测**, §8.1.1): PerfCounter 解析 (去引号、值含 `=`、缺键) / uptime 与 `/proc/<pid>/status` (读不到是 nil 而非 0) / heap_info 三种形态 / young·major 按**名字**分类 (G1 的第三个 collector **不得**算 major) / 间隔按 `uptime/invocations` **自算**(不信 `avg*IntervalTime`) / 五条 fixture 的判定 (实测形态 → 三条 info 且零 warn; 6G 死亡螺旋 → 三条 warn; 健康 G1 → 零 finding; **G1 但新生代 <5% → 仍零 finding**, `young_gen_tiny` 只对 ParallelGC 报; 空快照不崩) / `find_jcmd` 三条回退路径 (注入式, 不碰 `/proc`) / jcmd 对死 pid 的失败路径 (退出码不可靠, 空 stdout 必须自己判失败) / `render` 的每一项都不得含换行 (`nvim_buf_set_lines` 会直接抛) |
 | `t_log.lua` | 54 | `util/log.lua`: 四档阈值比较 / `log.user` 绕过阈值 / 会话内 `once` 去重 / `once` 被阈值挡下时**不消费**登记 / 消息前缀 |
@@ -2260,16 +2307,31 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_root_from_cwd.lua` | 20 | 痛点 4 的**端到端**回归: 起在 AOSP 根、不打开任何 `.java` 文件时 `aosp_root(nil/"")` 仍拿到树根 (真树断言部分需 `AOSPNAV_LIVE_TEST=1`) |
 | `t_phase.lua` | 19 | `phase` 是活状态的冻结契约: `ui.statusline()` 对 `idle`/`ready`/`indexing`/`no-out`/`failed` 五态各自的渲染 (`indexing` 必须带 `(idx)`) / `install_phase_handler` **链式**调用原有 handler (不吞掉 nvim-jdtls 的 status 消息) / 只有 `ServiceReady` 翻牌, 其余 `ServiceStatus` 不动 / `no-out`/`failed` 不被覆盖 / `err` 非空不翻牌 / 非 jdtls client 不包装 |
 | `t_source_roots.lua` | 27 | `java/source_roots` 两个入口的**模式闸门** (§5.1): `find` 只在 `mode="aosp"` 给结果、`find_for_project` 只在 `mode="project"` 给结果, 另一个一律 nil / 两者共用同一份扫描 (假项目里同样 2 条根) / 结果**全是相对项目目录**的路径, 无绝对路径 (§2.7 的硬要求) / **空项目在两处都返回 nil 而不是空表** (§2.3: 空 `sourcePaths` 会整体关闭 jdt.ls 推断, 比不注入还糟) / `nil`·`""` 入参退化不抛错 / 二次调用命中缓存结果一致。**`root.project_dir` 一节** (§3 的地雷回归): 两个不同项目给出不同根 / **绝不等于 AOSP 根** (旧 bug 的正面回归) / 树内无项目标记 → nil 不猜 / `workspace_root` 在 project 模式仍返回 nil (旧契约) / 非 project 模式退让 / 项目源码根是**项目相对**而非树相对。全部临时目录造假项目, 零 LSP |
-| `t_source_apply.lua` | 27 | `java/source_apply.lua`: `abs_of` 归一 / `installed` 解析 `.classpath` (去重、带 `excluding`、剥 `_/` 前缀、读不到返回 nil 而非空集) / 真机 `pending` 与磁盘 src 交集为 0 且有序 / 累积根"要么已装要么待装, 绝不丢弃" / 已装与待装不相交 / 非 core 模式拒绝 / `classify` 三类真实返回值 / 无 client 时 `auto()` 惰性 / `source_apply_auto=false` → `off` / `report()` 每**棵树**只提示一次 (分区键 = workspace 根; §2.15) / **报告文案契约 (2026-10-12)**: 不再出现 `:Aosp!`, 必说"本次退回 jar"与"下次启动自动生效", 且**默认阈值 (warn) 下不可见** (§2.10.1) |
+| `t_source_apply.lua` | 31 | `java/source_apply.lua`: `abs_of` 归一 / `installed` 解析 `.classpath` (去重、带 `excluding`、剥 `_/` 前缀、读不到返回 nil 而非空集) / 真机 `pending` 与磁盘 src 交集为 0 且有序 / 累积根"要么已装要么待装, 绝不丢弃" (**仅 aosp 模式** —— 累积账本是树级的, 只有 aosp 的 `union()` 计入; project 模式改断言核心集自洽, 2026-10-15 修) / 已装与待装不相交 (两模式共有) / 非 core 模式拒绝 / `classify` 三类真实返回值 / 无 client 时 `auto()` 惰性 / `source_apply_auto=false` → `off` / `report()` 每**棵树**只提示一次 (分区键 = workspace 根; §2.15) / **报告文案契约 (2026-10-12)**: 不再出现 `:Aosp!`, 必说"本次退回 jar"与"下次启动自动生效", 且**默认阈值 (warn) 下不可见** (§2.10.1) |
 | `t_root_fallback.lua` | 22 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 |
 | `t_workspace.lua` | 40 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 / **`clean_workspace` 删完自动重启** (§2.18): 缓存根之外的 dir 被拒 / 非 java 缓冲只删不重启 / java 缓冲删完重放一次 `FileType` (自动重启) / **命令后窗口切走: 目录仍被删且当前缓冲跑完被还原** (`start_or_attach` 读的是 `nvim_get_current_buf()`, 不摆好窗口就重放不出来 = "清完没重启") / `buftype~=''` 的 java 缓冲不重启 (挡 §2.13 的第二台 jdtls) —— 注入 `dir`/`cache_root`/`defer=false`, 临时目录, 零 LSP | 
 
 合计 **561** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
 `t_jvm` 127 / `t_root_from_cwd` 13 / `t_source_apply` 25 / `t_conflict` 37, 共 **545**)。
+2026-10-15 本机实测默认 **544** / live **561**, 两个跑法均 16/16 全绿 (差值是各套真机块
+按"真树齐备 + 真 jdtls 在跑"的有无整段 SKIP, 非不变量)。
 
-> 只有 `t_jvm` (127/127)、`t_root_from_cwd` (20/13)、`t_source_apply` (31/25) 和
-> `t_conflict` (40/37) 四个套件的条数**随环境而变** (真树块整段 SKIP 时不计数),
-> 所以 561/545 是当前环境的实测值而非不变量; 其余 12 个套件两种跑法条数相同。
+> **[2026-10-15] 真树块两条夹具缺陷已修** (两条都是**夹具**问题, 产品代码无缺陷):
+>
+> - `t_conflict.lua`: 旧夹具用无 key 的 `state.get()` 断言 `limited`, 而 `limited` 的
+>   写入方 `configure` 是**按树分区**写 (`state.set({...}, jar_root_found)`, §2.15 的
+>   `#3` 重构) —— 无 key 读落 `"_"` 兜底槽, 恒为 false (实测 `get()=false` /
+>   `get(<AOSP 根>)=true`)。面板 (`ui.lua`) 读的是带 key 的那份, 产品正确。现改读带 key
+>   的状态, 并**额外加一条断言钉住这条分区契约** (无 key 读不到是设计使然)。
+> - `t_source_apply.lua`: "累积根绝不丢弃"不变量写于默认模式还是 `aosp` 的年代, 它隐含
+>   读 `aosp/workspace/aosp_3f7ad7da/.classpath`。v18.8 起默认 `"project"`, `union()` 只
+>   回核心集 (本机 2 条), Wifi 的累积根**本就是 aosp 模式的树级账本**, 与 project 会话
+>   无关 —— 断言它不丢是把 aosp 的前提套到了 project 上。现按模式分叉: aosp 保持原不变量,
+>   project 改断言核心集自洽 + 两模式共有"已装与待装不相交"。
+
+> 只有 `t_jvm` (127/127)、`t_root_from_cwd` (20/13)、`t_source_apply` (30/25) 和
+> `t_conflict` (39/37) 四个套件的条数**随环境而变** (真树块整段 SKIP 时不计数),
+> 所以 573/553 是当前环境的实测值而非不变量; 其余 12 个套件两种跑法条数相同。
 > 特别注意 `t_jvm` 的真机块: 它要**真有 jdtls 在跑**才算数, 只设 `AOSPNAV_LIVE_TEST=1`
 > 是不够的 (本机 2026-10-10 就出现过"采样时在跑、跑测试时已退出"→ 静默少几条;
 > 2026-10-12 记 §2.10.1 那件事之后 jdtls 被 OOM 杀掉没在跑, 真机块整段 SKIP)。
