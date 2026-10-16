@@ -260,16 +260,30 @@ function M.jdtls_root_fn(user_root)
         end
         -- 3. 宿主内存闸: 可用内存不足时退回已有台 (宁可本 buffer 跳 jar, 不让宿主
         --    global OOM —— 2026-10-14 15:44 实测过教训)。
+        --    [2026-10-16] 提示从 log.info 提到 log.warn: 这不是"插件刚做完一件自动的
+        --    事, 无话可说"那一类 —— 它是一次**可见的功能降级** (用户开了新项目却
+        --    没有新实例, 跨模块跳转静默变落 jar), 且发生在打开文件的副作用里, 用户
+        --    无从预期。log.info 在默认阈值 (warn) 下不可见, 于是这种"按设计如此"被
+        --    误判成 bug (用户原话)。warn 档正合它的语义: "确实出了问题, 但不必这一秒
+        --    动手" (DEVELOPMENT §2.10 的四档表)。仍**不占** log.user 的 must-see 席位:
+        --    用户此刻不需要做任何决定 (放内存 / 关窗口 / 什么也不做都行) —— 那条纪律
+        --    见 §2.10, 别借这次改动去动席位表。
         local avail = M._mem_avail_kb and M._mem_avail_kb() or nil
         local live = M.reuse_root()
         if avail and avail < M.PROJECT_NEW_MIN_AVAIL_KB and live then
-          log.info(
+          log.warn(
             (
-              "new jdtls for %s skipped: %.1f GB memory available (need >= 4.0); "
-              .. "this buffer rides on the existing instance, cross-module jumps "
-              .. "land in jars"
-            ):format(vim.fn.fnamemodify(p, ":t"), avail / 1048576),
-            { once = true, id = "memgate:" .. p }
+              "no new jdtls for %s: only %.1f GB memory available (need >= 4.0). "
+              .. "This buffer rides on the existing instance for \"%s\", so jumps "
+              .. "to other modules land in jars. Free some memory, or open %s in its "
+              .. "own nvim, to get a full index for it."
+            ):format(
+              vim.fn.fnamemodify(p, ":t"),
+              avail / 1048576,
+              vim.fn.fnamemodify(live, ":t"),
+              vim.fn.fnamemodify(p, ":t")
+            ),
+            { once = true, id = "memgate:" .. p, timeout = 15000 }
           )
           return live
         end

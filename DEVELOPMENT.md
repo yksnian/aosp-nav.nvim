@@ -850,12 +850,14 @@ exclusions/gradle 禁用) 的 jdtls; 每跳一次攒一个 ~45 MB 的垃圾工�
    —— 因为 kls 反编译出的 `android.os.Handler` 与 jar 里的同名类在 invisible project 里
    撞了同一个路径。**这是 jdt.ls 自己的噪声, 无害**, 与另起一台时它干的是同一件事。
 
-覆盖: `tests/t_root_fallback.lua` (22 条) —— 把 `vim.lsp.get_clients` 换成假 client,
+覆盖: `tests/t_root_fallback.lua` (30 条) —— 把 `vim.lsp.get_clients` 换成假 client,
 断言: 两条真实触发路径 (jdt:// 与 kls 的 `/tmp/…java`, 逐字取自实测) 都复用现有根 /
 无 client 时一律不接管 / **有 `.git` 的树外工程听用户的** / 树外无工程标记的真实文件
 也复用 (它没有可用的根) / 用户 `root_dir` 有结果时一律让位 / 用户函数抛错时不炸 /
 多台 client 的优先级 / 无根 client 跳过 / `mode="project"` 同样挡住 (`jdtls_root_fn` 的
-`project` 分支先走 `reuse_root`, 所以取不到根的缓冲照样复用现有 client)。不启任何进程。
+`project` 分支先走 `reuse_root`, 所以取不到根的缓冲照样复用现有 client) /
+**内存闸 (§2.13.1)**: 可用内存 < 4 GB 时退回已有台且出一次警告 / 同项目只提示一次 /
+内存恢复后照旧起新台。不启任何进程。
 
 > 写这条测试时踩过一个坑, 记下来免得再犯: 最初用
 > `require("lspconfig.util").root_pattern(...)` 当假 `root_dir`, 而 headless 测试的
@@ -863,6 +865,37 @@ exclusions/gradle 禁用) 的 jdtls; 每跳一次攒一个 ~45 MB 的垃圾工�
 > "用户答不上来"与"用户答了"两种情况长得一模一样, 于是断言假通过 (旧版
 > `t_virtual_root.lua` 的"真实文件不劫持"那一组就是这么绿的)。现在用
 > `vim.fs.root` + `isdirectory` 自足实现, 并单独断言抛错的情形。
+
+### 2.13.1 内存不足时不起新实例 —— 必须出声, 否则像 bug (2026-10-16)
+
+**症状 (用户反馈)**: project 模式下在同一个 nvim 窗口打开**另一个** project, 不会起第二台
+jdtls —— 跨模块跳转于是静默落 jar, 看起来"插件没工作 / 坏了"。
+
+**这其实是设计行为**: `root.jdtls_root_fn` 的 project 分支第 3 步是**宿主内存闸** ——
+可用内存 < `M.PROJECT_NEW_MIN_AVAIL_KB` (4 GB) **且**已有台在跑时, 直接复用那台, 不起新的。
+理由见 §2.17.1: 每项目一台在 16 GB 宿主上叠加会触发 global OOM (实测把 jdtls 杀掉),
+"宁可本 buffer 跳 jar, 不让宿主 OOM"。
+
+**问题不在闸, 在它不出声**: 原实现走 `log.info`, 而默认阈值是 `warn` —— 于是这条
+"我按设计降级了" 对用户**完全不可见**, 就被读成了 bug。这与 §2.10 那句判例同构
+("跳到 jar" 的提示用户此刻不需要做决定), 但**严重一档**: 它不是"某次跳转落在 jar",
+而是"你刚打开的这个项目根本没有自己的索引, 跨模块全落 jar" —— 一次可见的功能降级,
+且发生在打开文件的**副作用**里, 用户无从预期。
+
+**改法**: `log.info` → `log.warn`。四档表里 `warn` 的定义正是"确实出了问题, 但不必这
+一秒动手"; 默认阈下可见, 仍按项目 `once` 去重 (`id = "memgate:" .. p`)。文案给足判据:
+还差多少内存、现在挂在谁那台、怎么才能拿到完整索引 (放内存 / 单独开 nvim)。
+
+**刻意不占 `log.user` 席位** (§2.10 的"恰好四个主动席位"纪律): 用户此刻不需要做任何
+决定 —— 放内存、关窗口、什么也不做都行。借这次改动去动席位表是不对的。
+
+> 测试上的坑 (记下来): 这条闸此前**没有任何覆盖** —— `t_root_fallback.lua` §3 的
+> project 断言全部把 `_mem_avail_kb` 注入 `nil` (放行), 只为测"每项目一台"的主路径。
+> 新增的 §6 反过来把可用内存压到阈值下, 并**断言发出的是 warn** (若哪天有人降回 info,
+> 这条会红 —— 已验证: 手动改回 `log.info` 时它报 29/30)。
+> 另一个坑: 闸只在"拿得到项目目录 `p` **且**已有台 live"时才落, 所以夹具必须用真 fixture
+> (`proj_java`, 带 `.git`), 不能编一个不存在的路径 —— `find_project_root` 算不出 `p`,
+> 会静默绕开整条闸, 让测试假通过。
 
 ### 2.14 重复 setup 会把用户配置打回默认值 (`M.merge` 的 `base`)
 
@@ -1070,8 +1103,17 @@ That is the JVM started for a buffer with no project root (DEVELOPMENT.md §2.13
 
 **时机**: 跑在 `configure` 里, 也就是 client 启动**之前** —— 赶在两个 JVM 打架之前
 清场。SIGTERM 之后**等它自己退场**(上限 3 秒): jdt.ls 收到 SIGTERM 会走 shutdown hook
-落一次索引, 等它写完再起我们这台, 既不互相覆盖、还白捡一份现成的索引。这一步会阻塞
-调用方, 但只在真有孤儿时发生 (正常情况这里是空的)。
+落一次索引, 等它写完再起我们这台, 既不互相覆盖、还白捡一份现成的索引。
+
+> **[2026-10-16] 这个"等"已改为非阻塞** (原来用 `vim.wait(3000, ..., 100)` 蹲满主
+> 线程)。症状: 上次 nvim 崩过/被 `kill -9` 之后, 每次打开 java 文件都卡 —— 实测
+> `vim.wait` 峰值 **3004 ms**, 期间 UI 完全不重绘, 而它跑在 `configure` 里, 打开
+> java 文件/切项目都经过那条路。改法: `vim.defer_fn` 自轮询 (每 `min(100, wait_ms)`
+> 一次, deadline 到或全部退场即停)。语义不变 (仍最多跟 3 秒), 但主线程随时可重绘;
+> 实测同样条件从 **3000 ms → 0.0 ms** 返回。
+> **返回语义随之微调**: 返回值 = "已发过 SIGTERM 的 pid", 不再保证"已经退场" ——
+> 调用方 (`init.lua` 的日志 + `instances_message` 的 `reaped`) 只把它当"我发过信号"
+> 用, 不依赖进程已消失, 故无需改。`wait_ms <= 0` 时完全不排轮询 (测试全用 `0`)。
 
 **为什么值得开自动**: 就是 §2.10 那句指导原则的推论 —— "插件能自动做掉的事就自动做
 掉"。孤儿没有任何需要用户拍板的地方, 它与第 13(a) 步的**空壳工程自清**同构
@@ -2308,12 +2350,12 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_phase.lua` | 19 | `phase` 是活状态的冻结契约: `ui.statusline()` 对 `idle`/`ready`/`indexing`/`no-out`/`failed` 五态各自的渲染 (`indexing` 必须带 `(idx)`) / `install_phase_handler` **链式**调用原有 handler (不吞掉 nvim-jdtls 的 status 消息) / 只有 `ServiceReady` 翻牌, 其余 `ServiceStatus` 不动 / `no-out`/`failed` 不被覆盖 / `err` 非空不翻牌 / 非 jdtls client 不包装 |
 | `t_source_roots.lua` | 27 | `java/source_roots` 两个入口的**模式闸门** (§5.1): `find` 只在 `mode="aosp"` 给结果、`find_for_project` 只在 `mode="project"` 给结果, 另一个一律 nil / 两者共用同一份扫描 (假项目里同样 2 条根) / 结果**全是相对项目目录**的路径, 无绝对路径 (§2.7 的硬要求) / **空项目在两处都返回 nil 而不是空表** (§2.3: 空 `sourcePaths` 会整体关闭 jdt.ls 推断, 比不注入还糟) / `nil`·`""` 入参退化不抛错 / 二次调用命中缓存结果一致。**`root.project_dir` 一节** (§3 的地雷回归): 两个不同项目给出不同根 / **绝不等于 AOSP 根** (旧 bug 的正面回归) / 树内无项目标记 → nil 不猜 / `workspace_root` 在 project 模式仍返回 nil (旧契约) / 非 project 模式退让 / 项目源码根是**项目相对**而非树相对。全部临时目录造假项目, 零 LSP |
 | `t_source_apply.lua` | 31 | `java/source_apply.lua`: `abs_of` 归一 / `installed` 解析 `.classpath` (去重、带 `excluding`、剥 `_/` 前缀、读不到返回 nil 而非空集) / 真机 `pending` 与磁盘 src 交集为 0 且有序 / 累积根"要么已装要么待装, 绝不丢弃" (**仅 aosp 模式** —— 累积账本是树级的, 只有 aosp 的 `union()` 计入; project 模式改断言核心集自洽, 2026-10-15 修) / 已装与待装不相交 (两模式共有) / 非 core 模式拒绝 / `classify` 三类真实返回值 / 无 client 时 `auto()` 惰性 / `source_apply_auto=false` → `off` / `report()` 每**棵树**只提示一次 (分区键 = workspace 根; §2.15) / **报告文案契约 (2026-10-12)**: 不再出现 `:Aosp!`, 必说"本次退回 jar"与"下次启动自动生效", 且**默认阈值 (warn) 下不可见** (§2.10.1) |
-| `t_root_fallback.lua` | 22 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 |
+| `t_root_fallback.lua` | 30 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 / **内存闸 (§2.13.1)**: 可用内存 < 4 GB 时退回已有台, 且发出的**必须是 warn** (默认档可见; 降回 info 则测试变红)、同项目 `once` 去重、内存恢复后照旧起新台 (闸不粘) |
 | `t_workspace.lua` | 40 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 / **`clean_workspace` 删完自动重启** (§2.18): 缓存根之外的 dir 被拒 / 非 java 缓冲只删不重启 / java 缓冲删完重放一次 `FileType` (自动重启) / **命令后窗口切走: 目录仍被删且当前缓冲跑完被还原** (`start_or_attach` 读的是 `nvim_get_current_buf()`, 不摆好窗口就重放不出来 = "清完没重启") / `buftype~=''` 的 java 缓冲不重启 (挡 §2.13 的第二台 jdtls) —— 注入 `dir`/`cache_root`/`defer=false`, 临时目录, 零 LSP | 
 
-合计 **561** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
-`t_jvm` 127 / `t_root_from_cwd` 13 / `t_source_apply` 25 / `t_conflict` 37, 共 **545**)。
-2026-10-15 本机实测默认 **544** / live **561**, 两个跑法均 16/16 全绿 (差值是各套真机块
+合计 **565** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
+`t_jvm` 127 / `t_root_from_cwd` 13 / `t_source_apply` 25 / `t_conflict` 37, 共 **548**)。
+2026-10-16 本机实测默认 **548** / live **565**, 两个跑法均 16/16 全绿 (差值是各套真机块
 按"真树齐备 + 真 jdtls 在跑"的有无整段 SKIP, 非不变量)。
 
 > **[2026-10-15] 真树块两条夹具缺陷已修** (两条都是**夹具**问题, 产品代码无缺陷):
@@ -2330,8 +2372,8 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 >   project 改断言核心集自洽 + 两模式共有"已装与待装不相交"。
 
 > 只有 `t_jvm` (127/127)、`t_root_from_cwd` (20/13)、`t_source_apply` (30/25) 和
-> `t_conflict` (39/37) 四个套件的条数**随环境而变** (真树块整段 SKIP 时不计数),
-> 所以 573/553 是当前环境的实测值而非不变量; 其余 12 个套件两种跑法条数相同。
+> `t_conflict` (41/37) 四个套件的条数**随环境而变** (真树块整段 SKIP 时不计数),
+> 所以 565/548 是当前环境的实测值而非不变量; 其余 12 个套件两种跑法条数相同。
 > 特别注意 `t_jvm` 的真机块: 它要**真有 jdtls 在跑**才算数, 只设 `AOSPNAV_LIVE_TEST=1`
 > 是不够的 (本机 2026-10-10 就出现过"采样时在跑、跑测试时已退出"→ 静默少几条;
 > 2026-10-12 记 §2.10.1 那件事之后 jdtls 被 OOM 杀掉没在跑, 真机块整段 SKIP)。
