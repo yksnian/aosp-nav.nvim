@@ -160,8 +160,13 @@ end
 --- 第 2 条是安全闸: 别的编辑器也用 jdtls, 只认"孤儿"就杀等于越界。
 ---
 --- 杀完等它自己退场 (上限 3 秒): jdt.ls 收到 SIGTERM 会走 shutdown hook 落一次
---- 索引, 等它写完再起我们这台 —— 既不互相覆盖, 还白捡一份现成的索引。这一步会
---- 阻塞调用方, 但只在真有孤儿时发生 (正常情况这里是空的)。
+--- 索引, 等它写完再起我们这台 —— 既不互相覆盖, 还白捡一份现成的索引。
+--- [2026-10-16] 这个等待**不再阻塞调用方**: 原实现用 vim.wait(3000) 蹲满主线程
+--- (实测峰值 3004 ms, 期间 UI 完全不重绘), 而它跑在 configure 里 —— 打开 java
+--- 文件/切项目都经过那条路, 于是"上次 nvim 崩过"之后每次开文件卡 3 秒。改成
+--- vim.defer_fn 自轮询: 语义相同 (仍最多跟 3 秒), 但主线程随时可重绘。
+--- 注意**返回**语义随之变化: 返回的是"已发过 SIGTERM 的 pid", 不再保证"已经退场"
+--- (调用方只把它用于日志/报告, 不依赖进程已消失)。
 --- 这是全仓唯一杀进程的地方, 也是"只报不杀"那条老规矩唯一的例外。
 --- @param records table M.jdtls_inventory 的结果
 --- @param opts table|nil { enabled = boolean, kill = fun(pid)|nil, wait_ms = number }
@@ -197,15 +202,26 @@ function M.reap_orphan_jdtls(records, opts)
   if wait_ms == nil then
     wait_ms = 3000
   end
-  if wait_ms > 0 then
-    vim.wait(wait_ms, function()
+  -- [2026-10-16] 非阻塞轮询 (原来是 vim.wait(wait_ms, ..., 100), 会蹲满主线程)。
+  -- vim.defer_fn 每次让出主循环, UI 照常重绘; deadline 到了或全部退场就停。
+  -- wait_ms <= 0 时完全不排轮询 —— 与旧的 `if wait_ms > 0` 一致 (测试全用 0)。
+  if wait_ms > 0 and #out > 0 then
+    local step = math.min(100, wait_ms)
+    local deadline = vim.uv.now() + wait_ms
+    local function poll()
+      local alive = false
       for _, pid in ipairs(out) do
         if vim.fn.isdirectory("/proc/" .. pid) == 1 then
-          return false
+          alive = true
+          break
         end
       end
-      return true
-    end, 100)
+      if not alive or vim.uv.now() >= deadline then
+        return
+      end
+      vim.defer_fn(poll, step)
+    end
+    vim.defer_fn(poll, step)
   end
   return out
 end

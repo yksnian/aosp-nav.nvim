@@ -435,6 +435,150 @@ function M.configure(opts, ctx)
     })
   end
 
+  -- [v18.14] jdt:// 空内容自动重试: 新台导入收尾窗口里 classFileContents 返回空,
+  -- 反编译缓冲只有一行 —— snacks 之类跳转 UI 往空缓冲 set cursor 报 "Invalid
+  -- cursor line", 且用户必须手动再跳一次。这里每 3s 检查缓冲, 仍空就**重放
+  -- BufReadCmd** (nvim-jdtls 的 handler 会重新请求 classFileContents), 退避至多
+  -- 10 次 —— 导入收尾通常几十秒内完成, 内容到达后缓冲自动填好, 用户无感。
+  -- _retrying 短路重放路径里本插件自己的 callback, 防检查链叠加。
+  do
+    local group = vim.api.nvim_create_augroup("aosp_nav_jdt_uri_retry", { clear = true })
+    local _retrying = {}
+    vim.api.nvim_create_autocmd("BufReadCmd", {
+      group = group,
+      pattern = "jdt://*",
+      callback = function(args)
+        local buf = args.buf
+        if _retrying[buf] then
+          return
+        end
+        _retrying[buf] = true
+        local tries = 0
+        local function check()
+          if not vim.api.nvim_buf_is_valid(buf) then
+            _retrying[buf] = nil
+            return
+          end
+          if vim.api.nvim_buf_line_count(buf) > 1 then
+            _retrying[buf] = nil
+            return
+          end
+          tries = tries + 1
+          if tries > 10 then
+            _retrying[buf] = nil
+            require("aosp-nav.util.log").debug(
+              "jdt:// still empty after retries (jdtls import may be unusually slow)"
+            )
+            return
+          end
+          vim.api.nvim_exec_autocmds("BufReadCmd", { buffer = buf, modeline = false })
+          vim.defer_fn(check, 3000)
+        end
+        vim.defer_fn(check, 3000)
+      end,
+    })
+  end
+
+  -- [v18.14b] jdt:// 内容加载接管: nvim-jdtls 的 open_classfile 按 **alternate
+  -- buffer** 挑 client (fallback = 第一台), 多台并存 (project 模式) 下把请求发给
+  -- 没有该工程上下文的台 —— classFileContents 返回空 (jdt.ls 侧记 code 969
+  -- "X does not exist"), 跳转 UI 报 "Invalid cursor line", 只能靠重试碰运气。
+  -- 这里按 URI 的 ?=<project> 段反查拥有该工程的台, 精确发请求。
+  -- 空缓冲的 3s 重试 (v18.14) 继续作为最后防线。
+  do
+    -- 摘除 nvim-jdtls (plugin/jdtls.lua, augroup "jdtls") 的全部 BufReadCmd 注册。
+    -- **不限 pattern**: 它注册了 "jdt://*" 和 "*.class" 两个, 而实测 (v18.14c 上线后
+    -- 仍残留的 969) 证明 "*.class" 也会命中 jdt:// URI —— snacks 的 lsp picker 在
+    -- locations_to_items 里 bufload 反编译缓冲, 只要 URI 以 .class 结尾 (无 query
+    -- 段) 就落进它手里, 同样错台 + 30s 同步 vim.wait。只按 event+group 摘, 幂等。
+    pcall(function()
+      for _, ac in ipairs(vim.api.nvim_get_autocmds({ event = "BufReadCmd", group = "jdtls" })) do
+        vim.api.nvim_del_autocmd(ac.id)
+      end
+    end)
+    local group = vim.api.nvim_create_augroup("aosp_nav_jdt_uri_load", { clear = true })
+    vim.api.nvim_create_autocmd("BufReadCmd", {
+      group = group,
+      pattern = "jdt://*",
+      callback = function(args)
+        local buf, fname = args.buf, args.match
+        -- 占位一行: 内容是异步回填的, snacks 等 jump UI 会在回填前就对缓冲
+        -- nvim_win_set_cursor —— 0 行缓冲直接报 "Invalid cursor line"。先垫一行
+        -- 把光标落点撑住 (内容到达后覆盖)。
+        if vim.api.nvim_buf_line_count(buf) == 0 then
+          vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
+        end
+        -- 与 nvim-jdtls open_classfile 同款的缓冲三件套。nofile: 退出不问保存、:w
+        -- 不往 URI 落盘。filetype **必须显式给 java**: URI 带 query 段, nvim 的按名
+        -- 检测匹配不上 *.java; 缺了它 jar 无语法高亮、LazyVim 的 gd/LSP 链路不把它
+        -- 当 java 缓冲 (v18.14d 实测: 无颜色且无法二次跳转)。
+        vim.bo[buf].buftype = "nofile"
+        vim.bo[buf].swapfile = false
+        vim.bo[buf].filetype = "java"
+        local q = fname:match("%?=(.+)$") or ""
+        local proj = vim.uri_decode(q:match("^(.-)/") or q)
+        local ws = require("aosp-nav.java.workspace")
+        local rm = require("aosp-nav.java.root")
+        local client
+        for _, c in ipairs(vim.lsp.get_clients({ name = "jdtls" })) do
+          local r = rm.client_root(c)
+          if r and ws.invisible_project_name(r) == proj then
+            client = c
+            break
+          end
+        end
+        if not client then
+          -- 反查有 query 段才可能精确; 无 query 段的 URI (jar 内部引用, 以 .class
+          -- 结尾) 或归属台未起时退第一台 —— jdt.ls 按 jar 路径解析, 仍能反编译。
+          -- 仍由本 handler 填充 (nvim-jdtls 的 handler 已摘除, 见上)。
+          client = vim.lsp.get_clients({ name = "jdtls" })[1]
+          if not client then
+            return
+          end
+        end
+        vim.lsp.buf_attach_client(buf, client.id)
+        local function load()
+          if not vim.api.nvim_buf_is_valid(buf) then
+            return
+          end
+          client:request("java/classFileContents", { uri = fname }, function(err, result)
+            if err or not result or not vim.api.nvim_buf_is_valid(buf) then
+              return
+            end
+            vim.bo[buf].modifiable = true
+            vim.api.nvim_buf_set_lines(
+              buf,
+              0,
+              -1,
+              false,
+              vim.split(result:gsub("\r\n", "\n"), "\n", { plain = true })
+            )
+            vim.bo[buf].modifiable = false
+          end, buf)
+        end
+        load()
+        -- 首次加载同步等一小段: snacks 的 lsp picker 在 locations_to_items 里
+        -- bufload 后**立即**读行并 set cursor (预览与跳转都是) —— 内容纯异步回填时
+        -- 缓冲只有占位一行, 行号越界报 "Invalid cursor line: out of range"
+        -- (v18.14c 上线后实测残留)。vim.wait 会泵事件循环, 响应回调在等待期间执行;
+        -- 归属台本地反编译通常 <500ms, 超时落回下面的异步兜底。只等首次: 3s 重试的
+        -- 重放路径 (exec_autocmds 再触发本 handler) 不再阻塞主循环。
+        if not vim.b[buf].aosp_nav_jdt_waited then
+          vim.b[buf].aosp_nav_jdt_waited = true
+          vim.wait(1500, function()
+            return not vim.api.nvim_buf_is_valid(buf) or vim.api.nvim_buf_line_count(buf) > 1
+          end, 50)
+        end
+        -- 兜底: 空填充若晚到覆盖了内容, 1.5s 后校验重填
+        vim.defer_fn(function()
+          if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_line_count(buf) <= 1 then
+            load()
+          end
+        end, 1500)
+      end,
+    })
+  end
+
   -- 7. 构造 AOSP 特化 settings
   -- sourcePaths 只在确有内容时才出现: 注入这个 key 会关闭 jdt.ls 的逐文件
   -- source root 推断 (见 config.lua java.mode 注释)
@@ -708,6 +852,18 @@ function M.configure(opts, ctx)
     local workspace = require("aosp-nav.java.workspace")
     local instances = require("aosp-nav.java.instances")
     local ws_dir = workspace.workspace_dir(bufname)
+    -- [v18.13] blockers 只在 ws_dir 确实属于 root_path 时检查。configure 常在
+    -- "新项目第一台还没起"时重入运行, 此时 workspace_dir() 的 client 兜底会落到
+    -- **已有旧台**的 -data —— 旧台自己的 invisible project 被当成 blocker, 每开
+    -- 一个新项目误报一次 (2026-10-16 实测: NetworkStack 的 configure 弹出
+    -- "Connectivity_6ab51fcc exists")。
+    local norm = function(p)
+      return p and (vim.fn.fnamemodify(p, ":p"):gsub("/+$", "")) or nil
+    end
+    local expected = root_path and workspace.expected_workspace_dir(root_path) or nil
+    if not (expected and norm(ws_dir) == norm(expected)) then
+      ws_dir = nil -- 归属对不上: 本轮不做 blockers 检查 (下次正确配对时再说)
+    end
     local blockers = workspace.workspace_blockers(ws_dir, root_path)
 
     -- (a) 空壳自清 (静默; 结果只进日志, 用户不需要知道插件替他扫了地)

@@ -4,6 +4,10 @@
 -- 全部走**注入的假依赖** (workspace_dir / foreign), 不碰真 /proc: 真起两台 jdtls
 -- 才能测的话, 这个套件就只在"恰好有人开着第二个 nvim"的机器上才算数 —— 而它要测的
 -- 恰恰是那种状态, 没法按需复现 (同 t_instances 的理由)。
+--
+-- [2026-10-15] 真树块的 state.limited 断言已修: limited 由 configure **按树分区**写
+-- (state.set({...}, jar_root_found), §2.15 的 #3), 旧夹具用无 key 的 state.get() 读,
+-- 落 "_" 兜底槽故恒为 false。现改为读带 key 的那份, 并额外钉住这条分区契约。
 local here = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h")
 local PLUGIN = vim.fn.fnamemodify(here .. "/..", ":p"):gsub("/$", "")
 vim.opt.runtimepath:prepend(PLUGIN)
@@ -272,9 +276,24 @@ if vim.env.AOSPNAV_LIVE_TEST == "1" and vim.fn.isdirectory(LIVE) == 1 then
       type(name) == "string" and name:find("-nvim" .. vim.fn.getpid(), 1, true) ~= nil,
       "冲突: project_name 被换成本会话的隔离名 (got " .. tostring(name) .. ")"
     )
-    -- 隔离名必须**不同于**原名 (否则 -data 还是那份共用的)
-    local st = require("aosp-nav.state").get()
-    H.check(st.limited == true, "冲突: state.limited 被置真 (面板据此解释)")
+    -- 隔离名必须**不同于**原名 (否则 -data 还是那份共用的) —— 上面那条已断言。
+    --
+    -- [2026-10-15 修正] 原来这里断言 `state.get().limited == true`, 那在真树下**必然
+    -- 失败**: limited 的写入方 configure 是**按树分区**写的 (state.set({...},
+    -- jar_root_found), 见 §2.15 的 #3 重构), 而无 key 的 get() 落 "_" 兜底槽 —— 实测
+    -- get() = false / get(<AOSP 根>) = true。面板 (ui.lua) 读的正是带 key 的那份, 所以
+    -- 产品是对的, 是夹具把"哪棵树的状态"读错了。
+    -- 这里改读**带 key** 的状态, 并顺带钉住这条分区契约本身 (无 key 读不到是设计使然)。
+    local state = require("aosp-nav.state")
+    local aosp_root = require("aosp-nav.java.root").aosp_root(LIVE)
+    H.check(
+      state.get(aosp_root).limited == true,
+      "冲突: 本树分区里的 state.limited 被置真 (面板据此解释)"
+    )
+    H.check(
+      state.get().limited == false,
+      "冲突: limited 写在按树分区的槽里, 无 key 兜底槽读不到 (分区契约)"
+    )
   else
     io.write("SKIP: live conflict checks (Handler.java not found under " .. LIVE .. ")\n")
   end

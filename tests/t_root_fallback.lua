@@ -206,6 +206,62 @@ clients = { fake(AOSP) }
 local rf4 = root_mod.jdtls_root_fn(nil)
 H.eq(rf4(JDT_URI), AOSP, "project 模式: jdt:// 也复用现有 client")
 H.eq(rf4(KLS_JAVA), AOSP, "project 模式: kls 的 /tmp/…java 也复用")
+
+-- ---------------------------------------------------------------------------
+-- 6. 内存闸真的落下时: 退回已有台 **且** 出一次可见的 warn (2026-10-16)
+-- ---------------------------------------------------------------------------
+-- §3 的 project 断言一律把 _mem_avail_kb 注入 nil (放行), 那是为了测"每项目一台"的
+-- 主路径; 内存闸本身 (可用 < 4GB 时不起新台、退回已有台) 此前**没有**覆盖 —— 而它
+-- 正是用户会误判成 bug 的那条: 打开新项目 → 没起新实例 → 跨模块跳转静默落 jar。
+-- 这里反过来把可用内存压到阈值之下, 断言: (1) 返回现有台的根; (2) 出过一条 **warn**
+-- (默认档可见 —— 这条提示的全部意义就是"别让用户以为是 bug", 降到 info 就白搭)。
+-- 用真 fixture proj_java (有 .git), 让 find_project_root 能算出项目目录 —— 闸只在
+-- "拿得到项目目录 p 且已有台 live" 时才落 (见 root.lua 第 3 步)。
+do
+  local logl = require("aosp-nav.util.log")
+  local saved_level = logl.get_level()
+  logl.set_level("warn") -- 断言在**默认档**下可见
+  local saved_mem = root_mod._mem_avail_kb
+  root_mod._mem_avail_kb = function()
+    return 1024 * 1024
+  end -- 1 GB, 低于 4 GB 闸
+  nav.config.java.mode = "project"
+  clients = { fake(AOSP) }
+  local rf5 = root_mod.jdtls_root_fn(nil)
+
+  local notes = H.capture_notify(function()
+    H.eq(rf5(proj_java), AOSP, "内存不足: 退回已有台的根 (不起新台)")
+  end)
+  local warned = false
+  for _, n in ipairs(notes) do
+    if n.level == vim.log.levels.WARN and n.msg:find("memory", 1, true) then
+      warned = true
+    end
+  end
+  H.check(warned, "内存不足: 出过一条 warn (默认档可见, 用户不会误判成 bug)")
+
+  -- once 去重: 同一项目再触发一次不该重复刷屏
+  local again = H.capture_notify(function()
+    rf5(proj_java)
+  end)
+  local re_warned = false
+  for _, n in ipairs(again) do
+    if n.level == vim.log.levels.WARN and n.msg:find("memory", 1, true) then
+      re_warned = true
+    end
+  end
+  H.check(not re_warned, "内存不足: 同一项目只提示一次 (once 去重)")
+
+  -- 内存恢复后照旧按项目起新台 (闸不能粘住)
+  root_mod._mem_avail_kb = function()
+    return 8 * 1024 * 1024
+  end
+  local rf6 = root_mod.jdtls_root_fn(nil)
+  H.eq(rf6(proj_java), proj, "内存恢复: 照旧按项目起新台 (闸不粘)")
+  root_mod._mem_avail_kb = saved_mem
+  logl.set_level(saved_level)
+end
+
 vim.lsp.get_clients = real_get_clients
 vim.fn.delete(tmp, "rf")
 H.finish("t_root_fallback")
