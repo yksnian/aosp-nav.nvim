@@ -274,7 +274,7 @@ function M.jdtls_root_fn(user_root)
           log.warn(
             (
               "no new jdtls for %s: only %.1f GB memory available (need >= 4.0). "
-              .. "This buffer rides on the existing instance for \"%s\", so jumps "
+              .. 'This buffer rides on the existing instance for "%s", so jumps '
               .. "to other modules land in jars. Free some memory, or open %s in its "
               .. "own nvim, to get a full index for it."
             ):format(
