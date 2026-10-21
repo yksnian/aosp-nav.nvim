@@ -313,6 +313,9 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 
 ## FAQ
 
+### Client jdtls quit with exit code 13 and signal 0 (2026/10/21)
+升级jdtls 1.62.0后JDK版本低于25就会出现，请更新JDK版本至25。
+
 ### jdtls 几乎不索引就结束, 跳转全部失效
 
 症状: 打开 AOSP 里的 java 文件后 jdtls 很快就"索引完成", `gd` 找不到任何东西 (或落在只读缓冲里)。

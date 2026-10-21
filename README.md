@@ -314,6 +314,9 @@ This is a one-time step. The exclusion cache is refreshed together with the jars
 
 ## FAQ
 
+### Client jdtls quit with exit code 13 and signal 0 (2026/10/21)
+If this happen after you upgrade jdtls to v1.62.0, please update jdk to version 25.
+
 ### jdtls finishes indexing almost instantly and navigation does not work at all
 
 Symptom: after opening a Java file in the AOSP tree, jdtls reports "indexing done" right away and `gd` finds nothing (or lands in a read-only buffer).
