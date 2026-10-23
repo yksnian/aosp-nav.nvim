@@ -61,14 +61,16 @@ function M.expected_workspace_dir(root, cache_base)
     return nil
   end
   local base = (cache_base and cache_base ~= "") and cache_base or vim.fn.stdpath("cache")
-  -- [v18.17] 名字用**单射键** (cache_key: '-'->'--', '/'->'-', 可逆可读), 不再用
-  -- basename。旧形态 <basename>/workspace 在**跨树同名项目**下撞键: google/aosp
-  -- 与 qssi/aosp 的 frameworks/base 的 basename 都是 "base" —— 第二个 nvim 被
-  -- 会话隔离到 base-nvim<pid> (撞名触发的意外隔离), 且前者退出后, 第三个会话会
-  -- **复用别棵树的 .metadata** (workspace 里 Eclipse 工程是绝对路径, 静默串台,
-  -- qssi 文件挂上 google 树的 jar)。单射键后每棵树的每个项目唯一。代价: 旧
-  -- workspace (Connectivity/ base/ aosp/ ...) 不再被引用, 各项目索引重建一次。
-  return base .. "/jdtls/" .. require("aosp-nav.util.path").cache_key(root) .. "/workspace"
+  -- [v18.17] 名字用**短键** <basename>_<hash(绝对路径)> —— 即 invisible_project_name
+  -- (与 jdt.ls 的 invisible project 命名同规则): 可读 (Connectivity_6ab51fcc)、短、
+  -- 单射 (hash 含完整绝对路径, 跨树同名项目不同键)。为什么不沿用:
+  --   basename  -> 跨树同名项目撞键 (google/qssi 的 frameworks/base 都叫 "base"):
+  --               第二个 nvim 被会话隔离到 base-nvim<pid>, 前者退出后第三个复用
+  --               别棵树的 .metadata 静默串台;
+  --   cache_key -> 单射但太长 (home-user-project-aosp-...-Connectivity)。
+  -- 同 basename + hash 碰撞: 32 位域内同名路径 ~65536 个才 50%, 可忽略。
+  -- 代价: 命名再次变更, 旧 -data (basename 形态与 cache_key 形态) 孤儿化, 索引重建。
+  return base .. "/jdtls/" .. M.invisible_project_name(root) .. "/workspace"
 end
 
 --- jdt.ls 给 invisible project 起的名字:

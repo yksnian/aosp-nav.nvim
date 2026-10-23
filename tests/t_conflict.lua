@@ -229,16 +229,17 @@ local orig_pn = opts_plain.project_name
 local ok_plain, err_plain = pcall(javainit.configure, opts_plain)
 SC.check = saved_check -- 立刻还原, 别影响后面的断言
 H.check(ok_plain, "configure (无冲突) 不抛异常: " .. tostring(err_plain))
--- 回归闸 #1: 无冲突 -> project_name 必须**原样** (没有 -nvim<pid> 后缀)
-H.eq(
-  opts_plain.project_name,
-  orig_pn,
-  "回归闸: 无冲突时 opts.project_name 没被包装 (逐引用相同)"
+-- 回归闸 #1: [v18.17] project_name 现在被**无条件单射化包装** (与冲突无关):
+-- workspace 命名改为 cache_key(root_dir), 跨树同名项目 (frameworks/base) 不再
+-- 撞同一个 -data。包装后不带 -nvim<pid> 后缀 (那只有隔离场景才加)。
+H.check(
+  opts_plain.project_name ~= orig_pn,
+  "回归闸: project_name 已被单射化包装 (新引用)"
 )
-H.eq(
-  opts_plain.project_name("/x/qssi"),
-  "qssi",
-  "回归闸: 无冲突时 project_name 照旧返回 basename"
+H.check(
+  type(opts_plain.project_name("/x/qssi")) == "string"
+    and opts_plain.project_name("/x/qssi"):match("^qssi_%x+$") ~= nil,
+  "回归闸: 无冲突时 project_name 返回短键 (basename_hash, 无隔离后缀)"
 )
 
 -- 非 AOSP 目录 (本仓库) 里跑: 不该注入任何 AOSP 字段, 也不该炸

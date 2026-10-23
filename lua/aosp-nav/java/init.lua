@@ -301,6 +301,26 @@ function M.configure(opts, ctx)
   --    -> start_or_attach, opts 的子表按引用流入 config, 此刻的改写本次启动就能看到;
   --    纯 nvim-jdtls (root_dir 是用户算好的字符串) 没有这个时机, 由 attach 期的
   --    M.check_attach_tree 兜底告警。全部副作用幂等或按树分区, 重入安全。
+  -- [v18.17] workspace 命名单射化: -data/-configuration 的目录名由 **project_name**
+  -- 派生 (LazyVim java extra: jdtls_workspace_dir = <cache>/jdtls/<project_name>/...,
+  -- 默认 project_name = basename(root_dir)) —— 跨树同名项目撞键: google/aosp 与
+  -- qssi/aosp 的 frameworks/base 都叫 "base", 两个 nvim 抢同一 -data (第二个被会话
+  -- 隔离到 base-nvim<pid>, 名字无树信息), 且前者退出后第三个会话**复用别棵树的
+  -- .metadata** (Eclipse 工程是绝对路径, 静默串台)。改 cache_key(root_dir) (单射,
+  -- 与 workspace.expected_workspace_dir 的复算同源 —— 两边必须一致)。旧的
+  -- Connectivity/ base/ aosp/ 等 -data 因此失效, 各项目索引重建一次。
+  if not opts._aosp_nav_pn then
+    opts._aosp_nav_pn = true
+    local user_pn = opts.project_name
+    opts.project_name = function(rd)
+      if not rd or rd == "" then
+        return user_pn and user_pn(rd) or nil
+      end
+      -- 与 expected_workspace_dir 同源 (invisible_project_name: basename_hash8)
+      return require("aosp-nav.java.workspace").invisible_project_name(rd)
+    end
+  end
+
   if not opts._aosp_nav_re then
     -- 标记挂在 opts 上 (Lua 的 function 值不可挂字段); opts 是跨重入持久的同一张表,
     -- 重入时凭它跳过重复包装。
