@@ -1468,6 +1468,69 @@ Clean 想要的结果。
 
 ---
 
+### 2.19 soong 依赖闭包与排除键的真实覆盖面 (2026-10-23)
+
+project 模式用 soong 的 `module_bp_java_deps.json` 精确取依赖闭包 (见 `java/jars.lua`
+的 `module_deps_*` / `project_closure_jars`), 而不是全树 glob。写这一节是因为"soong
+精确 → 排除配置没用了吧" 是个**很自然但错误**的推断, 且真出过一个 bug。
+
+**排除键在各路径下的真实覆盖面** (实测 2026-10-23, Wifi 项目: 默认 193 jars):
+
+| 键 | soong 闭包路径 | make / 全树兜底路径 | 匹配对象 |
+| --- | --- | --- | --- |
+| `exclude_jars` | ✅ 生效 | ✅ 生效 | **jar 名 + 模块名** |
+| `exclude_paths` | ✅ 生效 | ✅ 生效 | 全路径**子串** |
+| `exclude_globs` | ✅ 生效 | ✅ 生效 | `.intermediates/` **之后**的相对路径 |
+| `make_jar_priority` | ❌ **不生效** | ✅ 生效 | jar 名 (仅 `scan_intermediates_base`) |
+| `make_blacklist` | ❌ **不生效** | ✅ 生效 | 目录名 (仅 `scan_intermediates_base`) |
+
+实测佐证 (改配置 → 数 jars): `exclude_globs` 置空 → 193→**202** (正好多回 9 个
+`prebuilts/sdk/sdk_*` 桩); 全部排除 → **0**。**所以 "soong 精确就不用排除" 是错的** ——
+soong 给的是**模块级**精度, 而每个模块有多个 **jar 变体** (`javac` / `combined` /
+`turbine-combined` / `.stubs` / `-headers` …), **变体选择仍要靠排除规则**
+(默认 `exclude_jars` 里的 `stubs` / `%-stub` / `%-headers` 就是干这个的)。
+
+### 2.19.1 `add_prebuilt_jars` 的守卫因 `plain=true` 恒不命中 → 排除键被整体绕过 (2026-10-23)
+
+**症状 (用户发现)**: 默认 `exclude_globs` 明确排除 `^prebuilts/sdk/sdk_`, 但 9 个
+`sdk_*` 桩仍进 Wifi 的 classpath, 而且**抢在真实现之前** —— 用户跳 `android.os.Parcel`
+落到 SDK 桩 (713 行) 而不是 `framework.jar` 的真实现 (4046 行); 同一次跳转在
+Connectivity 项目里却是对的。用户原话: "看起来有点矛盾"。
+
+**根因 (一个字符)**:
+
+```lua
+if j:sub(-4) == ".jar" and not j:find("%.intermediates/", 1, true) then
+                                          ^^ 反斜杠
+```
+
+第 3 参 `plain = true` 表示**按字面量查找**, 不是 Lua 模式 —— 所以它在找**含反斜杠的
+字符串** `%.intermediates/`, **永远匹配不到** (实测 `nil`; 去掉反斜杠才得 11)。
+于是守卫从不生效, `add_prebuilt_jars` 把闭包里**每个模块的每个 jar** 都塞了进来,
+**包括本该交给分桶引擎的 intermediates 产物** —— 而只有分桶引擎
+(`process_soong_matches`) 会应用 `exclude_globs` / `exclude_paths`; `add_prebuilt_jars`
+**只查 `exclude_jars`**。这就是"排除键被整体绕过"的机制。
+
+**定位过程 (三个假设都被实测否掉, 记下来省得重走)**:
+
+1. "`process_soong_matches` 没做 glob 过滤" —— **否**。单独喂它那个 jar → 产出 0 个,
+   过滤本身是对的。
+2. "`add_prebuilt_jars` 的守卫会跳过它" —— **否**, 正是它。插桩两条写入路径:
+   `after process_soong_matches: 193 jars, 0 sdk_` → `after add_prebuilt_jars: 246, 9 sdk_`。
+3. "manifest 里没有 / 持久缓存是旧的" —— **否**。TSV 里有它, 且缓存头与当前算法一致
+   (说明是**当前代码**写进去的, 不是陈旧产物)。
+
+**修法**: `"%.intermediates/"` → `".intermediates/"`。效果 (Wifi): 246 → **193**,
+`sdk_*` 9 → **0**; Connectivity 570 / NetworkStack 375, 均 0 个 `sdk_*`。
+
+**`add_prebuilt_jars` 的覆盖面是刻意的, 不是残留漏洞**: 它只补**树内 prebuilts**
+(androidx 等, 路径通常不在 `out/soong` 下), 所以只查 `exclude_jars` 是对的;
+要排掉某个 prebuilt 用它即可。这条已写进函数头注释。
+
+**回归测试**: `t_module_deps.lua` 加了模块 `P` (路径 `pkg/p` 不参与种子, 只经 A 的依赖
+进闭包), 它的 JSON `jars` 指向 intermediates 且命中 `exclude_globs` —— 双重钉死。
+**已验证是真闸**: 把守卫改回 `"%.intermediates/"` → 报红并打印泄漏的 jar 路径。
+
 ## 3. 导航模式
 
 **对用户只宣传两种体验** (v11 降级后), 由单个键 `java.mode` 表达:
@@ -2490,7 +2553,7 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_config.lua` | 37 | 本轮重构引入/删除的键: 死键静默丢弃 (不映射、不告警) / `merge` 不改调用方的表 / `source_apply_max_roots` 不再是配置键 / **重复 setup 不得打回默认值** (见 §2.14): 空参 `setup()` 后 `kotlin.jar_mode`·`log_level` 仍是用户值 / 第二次带参 setup 不丢上一次的键 / 新表产出且旧表不被就地改写 / 排除名单 append 语义未回归 / **合并结果不与 `M.defaults` 共享子表**, 就地改它不污染默认值 (标量+列表) |
 | `t_jvm.lua` | 127 | `util/jvm.assess` (此前**完全没有**测试): `-Xmx6G` 判否 / `--jvm-arg=` 前缀剥离 / 重复 `-Xmx` 后者胜 / `UseParallelGC` 识别 / 无值·无键·nil cmd 不崩 / **`xmx_over_host`** (§8.1.2): `-Xmx16G` 在 512G 宿主静默·在 15G 宿主报警且建议**调小** (不得误报 `xmx_small`) / 80% 边界恰好不报·超过才报 / `MemTotal` 读不到时跳过该检查 / `host_mem_total()` 真读 `/proc/meminfo` (正数或 nil, 不崩)。`util/jvm_live` (**活进程遥测**, §8.1.1): PerfCounter 解析 (去引号、值含 `=`、缺键) / uptime 与 `/proc/<pid>/status` (读不到是 nil 而非 0) / heap_info 三种形态 / young·major 按**名字**分类 (G1 的第三个 collector **不得**算 major) / 间隔按 `uptime/invocations` **自算**(不信 `avg*IntervalTime`) / 五条 fixture 的判定 (实测形态 → 三条 info 且零 warn; 6G 死亡螺旋 → 三条 warn; 健康 G1 → 零 finding; **G1 但新生代 <5% → 仍零 finding**, `young_gen_tiny` 只对 ParallelGC 报; 空快照不崩) / `find_jcmd` 三条回退路径 (注入式, 不碰 `/proc`) / jcmd 对死 pid 的失败路径 (退出码不可靠, 空 stdout 必须自己判失败) / `render` 的每一项都不得含换行 (`nvim_buf_set_lines` 会直接抛) |
 | `t_log.lua` | 54 | `util/log.lua`: 四档阈值比较 / `log.user` 绕过阈值 / 会话内 `once` 去重 / `once` 被阈值挡下时**不消费**登记 / 消息前缀 |
-| `t_module_deps.lua` | 20 | `java/jars` 的 **soong 依赖闭包** (§2.19): `module_bp_java_deps.json` 解析 (依赖图去重 / 传递闭包 / 缺文件退化) / manifest TSV 读回与 mtime 失效 / 闭包缓存按 (树, 项目) 键控且随产物 mtime 失效 / 降级集 ⊆ 完整集 (热补只增不减) |
+| `t_module_deps.lua` | 21 | `java/jars` 的 **soong 依赖闭包** (§2.19): `module_bp_java_deps.json` 解析 (依赖图去重 / 传递闭包 / 缺文件退化) / manifest TSV 读回与 mtime 失效 / 闭包缓存按 (树, 项目) 键控且随产物 mtime 失效 / 降级集 ⊆ 完整集 (热补只增不减) |
 | `t_multi_tree.lua` | 29 | **两棵树共用一个 nvim 会话** (§2.15): 假树造 A/B 两棵树, 零 LSP。两棵树各自推断出正确的根与项目 / 会话切到 B 后**不继承** A 的项目 (旧实现会) / 同一会话里 A·B 同时活动时 `union` 互不污染 / `state(A)` ≠ `state(B)` / 两棵树各有自己的顺序文件且内容不交叉 / `reset(A)` 不动 B / `client(fname)` 按 buffer 的 client 选 (旧实现取 `get_clients()[1]`) / `_is_applied` 按树分开 |
 | `t_path.lua` | 14 | `util/path.start_dir`: `nil`/`""` 归一成 cwd, 绝不能给 `"."` (§7 痛点 4 的根因) |
 | `t_follow.lua` | 21 | `java/workspace_follow.lua` (§2.17): `target()` 只认"树内 + 找得到项目标记"的文件 (树内无标记、树外、`""`、`nil` 一律 nil → 不动, 宁可保持当前工作区) 且第二个返回值是 AOSP 根 / 无 client 不插手 (第一台的根归 `root.lua`) / **已在目标项目之内 → 一次字符串比较后静默返回**, 子目录也算之内 / 跨项目 → 发**恰好一条** `didChangeWorkspaceFolders` 且 `added` 指向新项目 (name 是相对 AOSP 根的路径)、`removed` 是旧根 / **`mode` 为 `aosp`·`infer` 时一条都不发** / 树外文件有 client 也不把工作区搬出 AOSP 树。全部注入假 client + 临时目录, 零 LSP |
@@ -2503,9 +2566,9 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_root_fallback.lua` | 30 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 / **内存闸 (§2.13.1)**: 可用内存 < 4 GB 时退回已有台, 且发出的**必须是 warn** (默认档可见; 降回 info 则测试变红)、同项目 `once` 去重、内存恢复后照旧起新台 (闸不粘) |
 | `t_workspace.lua` | 42 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 / **`clean_workspace` 删完自动重启** (§2.18): 缓存根之外的 dir 被拒 / 非 java 缓冲只删不重启 / java 缓冲删完重放一次 `FileType` (自动重启) / **命令后窗口切走: 目录仍被删且当前缓冲跑完被还原** (`start_or_attach` 读的是 `nvim_get_current_buf()`, 不摆好窗口就重放不出来 = "清完没重启") / `buftype~=''` 的 java 缓冲不重启 (挡 §2.13 的第二台 jdtls) —— 注入 `dir`/`cache_root`/`defer=false`, 临时目录, 零 LSP | 
 
-合计 **584** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
-`t_jvm` 127 / `t_root_from_cwd` 13 / `t_source_apply` 25 / `t_conflict` 37, 共 **573**)。
-2026-10-23 本机实测默认 **573** / live **584**, 17 个套件 (差值是各套真机块按"真树齐备
+合计 **585** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
+`t_jvm` 127 / `t_root_from_cwd` 13 / `t_source_apply` 25 / `t_conflict` 37, 共 **574**)。
+2026-10-23 本机实测默认 **574** / live **585**, 17 个套件 (差值是各套真机块按"真树齐备
 + 真 jdtls 在跑"的有无整段 SKIP, 非不变量)。
 
 > **[2026-10-15] 真树块两条夹具缺陷已修** (两条都是**夹具**问题, 产品代码无缺陷):
@@ -2523,7 +2586,7 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 
 > 只有 `t_jvm` (127/127)、`t_root_from_cwd` (20/13)、`t_source_apply` (30/25) 和
 > `t_conflict` (41/37) 四个套件的条数**随环境而变** (真树块整段 SKIP 时不计数),
-> 所以 584/573 是当前环境的实测值而非不变量; 其余 13 个套件两种跑法条数相同。
+> 所以 585/574 是当前环境的实测值而非不变量; 其余 13 个套件两种跑法条数相同。
 > 特别注意 `t_jvm` 的真机块: 它要**真有 jdtls 在跑**才算数, 只设 `AOSPNAV_LIVE_TEST=1`
 > 是不够的 (本机 2026-10-10 就出现过"采样时在跑、跑测试时已退出"→ 静默少几条;
 > 2026-10-12 记 §2.10.1 那件事之后 jdtls 被 OOM 杀掉没在跑, 真机块整段 SKIP)。

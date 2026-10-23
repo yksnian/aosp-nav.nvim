@@ -1040,6 +1040,12 @@ end
 
 --- JSON jars 字段里的 prebuilts 补充: 闭包内模块声明的、不在 intermediates 的
 --- 预编译 jar (androidx 等), 磁盘存在且非 turbine 桩、过 exclude_jars 才收。
+---
+--- **覆盖面 (刻意的, 别当成漏洞)**: 本函数**只查 `exclude_jars`** (模块名 + jar 基名),
+--- **不查** `exclude_paths` / `exclude_globs`。那两条属于**分桶引擎**
+--- (process_soong_matches) 的职责 —— 它处理 intermediates 产物, 且应用全套排除规则。
+--- 这里补的是树内 prebuilts (路径通常不在 out/soong 下, 没有 intermediates 那套
+--- 变体结构), 两条通道的匹配对象本就不同。要排掉某个 prebuilt 请用 `exclude_jars`。
 local function add_prebuilt_jars(index, closure, aosp_root, jars, seen)
   local java_cfg = get_cfg().java
   for name in pairs(closure) do
@@ -1053,7 +1059,15 @@ local function add_prebuilt_jars(index, closure, aosp_root, jars, seen)
     if mod_ok then
       for _, j in ipairs(index[name].jars or {}) do
         -- intermediates 产物由分桶引擎负责, 这里只补树内 prebuilts 路径
-        if j:sub(-4) == ".jar" and not j:find("%.intermediates/", 1, true) then
+        -- [v18.22] 这个 find 的第 3 参是 plain=true —— 传的是**字面量**, 不是 Lua
+        -- 模式, 所以原来写的 `"%.intermediates/"` 实际在找**带反斜杠的字符串**,
+        -- 永远匹配不到 (实测 nil; 去掉反斜杠才命中)。后果: 本守卫从不生效, 于是
+        -- 这个函数把闭包里**每个模块的每个 jar** 都塞了进来, 包括本该由分桶引擎
+        -- 负责的 intermediates 产物 —— 那批**绕过了 exclude_globs / exclude_paths**
+        -- (本函数只查 exclude_jars)。用户实测: 默认 exclude_globs 明确排除
+        -- `^prebuilts/sdk/sdk_`, 但 9 个 sdk_* 桩照样进了 Wifi 的 classpath, 且
+        -- 抢在真实现之前 (JDT 取 classpath 上第一个含该类型的条目)。
+        if j:sub(-4) == ".jar" and not j:find(".intermediates/", 1, true) then
           local abs = (j:sub(1, 1) == "/") and j or (aosp_root .. "/" .. j)
           local base = j:match("([^/]+)%.jar$") or ""
           local ok_name = true

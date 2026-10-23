@@ -262,8 +262,8 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 | java.exclude_globs | {^prebuilts/sdk/sdk_} | Lua 模式排除: 匹配 .intermediates/ 之后的相对路径。默认剔除预构建 module SDK 桩; 用户自定义时与默认值**拼接** (见 exclude_merge); 锚定 ^ 可精确到顶层目录, 如 { "^external/cronet/" } |
 | java.exclude_paths | {linux_glibc_common, development/} | 排除的路径关键词 (子串匹配); 勿加 android_common_apex (会误杀只有 apex 变体的 core-oj 等模块) |
 | java.exclude_merge | append | 排除类列表 (exclude_jars/paths/globs/import_exclusions) 的合并语义: append=用户项追加到默认值后 (推荐); replace=整体替换默认值 |
-| java.make_jar_priority            | {classes.jar, classes-header.jar, javalib.jar}               | Make 构建系统 jar 优先级                                     |
-| java.make_blacklist               | {android_stubs_current_intermediates}                        | Make 构建排除目录                                            |
+| java.make_jar_priority            | {classes.jar, classes-header.jar, javalib.jar}               | Make 构建系统 jar 优先级 — **仅 make/兜底扫描** (走 soong 闭包时不生效) |
+| java.make_blacklist               | {android_stubs_current_intermediates}                        | Make 构建排除目录 — **仅 make/兜底扫描** (走 soong 闭包时不生效) |
 | java.mode | project | `project` (默认) = **每个项目一台 jdtls**: 工作区根为**当前文件所属项目**的目录, sourcePaths 为**该项目自己**的源码根; `aosp` = 工作区根为 AOSP 根**且**注入 sourcePaths (整树共享一份索引, 跨模块跳转到真实源码) |
 | java.source_apply_auto | true | 累积到新源码根时 (以及 jdtls attach 补存量时) 自动增量注入运行中的工作区。每会话最多一次, 且内部单次上限 5 条; 只在 `mode == "aosp"` 且 jdtls 在跑时生效 |
 | java.core_source_roots | {frameworks/base/core/java, frameworks/base/services/core/java} | 预置源码根 (相对 AOSP 根), 从首次导入起就注入。整表替换默认值 (同 `kotlin.curated_modules` 语义); 磁盘上不存在的条目自动跳过。给得越多首次索引越重 |

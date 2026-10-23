@@ -191,6 +191,11 @@ M.defaults = {
     -- 不再使用 core_source_roots / 项目累积 —— 想手工钉死一份列表时用它:
     --   source_paths = { "frameworks/base/core/java", "libcore/ojluni/src/main/java" }
     -- source_paths = {},
+    -- [v18.22] 下面两个 make_* 键**只在 make / 全树兜底扫描路径生效**
+    -- (jars.lua 的 scan_intermediates_base)。默认走 soong 依赖闭包时它们**不参与**
+    -- —— 那时中间产物由分桶引擎(process_soong_matches)按
+    -- exclude_jars/exclude_paths/exclude_globs 选, 变体优先级看 soong_tag_priority。
+    -- 保留: 兜底路径仍在用, 且 make 树(Android 14 及更早)确实需要。
     -- Make 构建系统 jar 优先级 (Android 14 及更早)
     make_jar_priority = { "classes.jar", "classes-header.jar", "javalib.jar" },
     -- Make 构建排除的 intermediates 目录名

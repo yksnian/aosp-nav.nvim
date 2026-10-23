@@ -107,7 +107,8 @@ vim.fn.writefile({
   '\t\t"jars": [',
   "\t\t],",
   '\t\t"dependencies": [',
-  '\t\t\t"B"',
+  '\t\t\t"B",',
+  '\t\t\t"P"',
   "\t\t],",
   "\t},",
   '\t"B": {',
@@ -136,8 +137,28 @@ vim.fn.writefile({
   '\t\t"dependencies": [',
   "\t\t],",
   "\t},",
+  -- [v18.22] P: 闭包内、且 JSON 的 jars 指向 **intermediates** 的模块。路径故意放在
+  -- pkg/p (不是种子目录), 只经 A 的依赖进闭包 —— 这样它不会改变上面的种子数断言,
+  -- 单测"intermediates 产物必须交给分桶引擎(走 exclude_globs/exclude_paths),
+  -- 不能被 add_prebuilt_jars 顺手塞进来"。旧守卫
+  -- `j:find("%.intermediates/", 1, true)` 因 plain=true 变成找**字面量反斜杠串**,
+  -- 恒不命中, 于是闭包里每个 jar 都被塞进来并绕过全套排除规则 (它只查 exclude_jars)。
+  '\t"P": {',
+  '\t\t"module_type": "java_library",',
+  '\t\t"path": [',
+  '\t\t\t"pkg/p"',
+  "\t\t],",
+  '\t\t"srcs": [',
+  "\t\t],",
+  '\t\t"jars": [',
+  '\t\t\t"out/soong/.intermediates/pkg/p/P/android_common/javac/P.jar"',
+  "\t\t],",
+  '\t\t"dependencies": [',
+  "\t\t],",
+  "\t},",
   "}",
 }, AOSP .. "/out/soong/module_bp_java_deps.json")
+
 -- intermediates 清单 TSV (mtime 基准 = JSON 产物): [v18.17b] manifest 后台化后,
 -- 预写 TSV 让端到端走"完整闭包"路径 (无 TSV 时 manifest 返回 nil → 降级集)
 local json_mtime = vim.uv.fs_stat(AOSP .. "/out/soong/module_bp_java_deps.json").mtime.sec
@@ -172,9 +193,34 @@ H.check(
       and has[PB]
       and not has[IZ]
       and meta.origin == "soong-closure"
-      and meta.closure_n == 2
+      and meta.closure_n == 3
   end)(),
   "closure wiring: jar 集含 A javac + B prebuilt, 排除闭包外 Z"
+)
+
+-- [v18.22] 回归 soong 视图的守卫失效 bug: 闭包内、JSON jars 指向 intermediates 的
+-- 模块 (P), 必须**不由** add_prebuilt_jars 混入 —— 那批 jar 该走分桶引擎, 只有它
+-- 会应用 exclude_globs/exclude_paths。旧守卫写成 `find("%.intermediates/",1,true)`,
+-- plain=true 下那是字面量反斜杠串, 恒不命中。用户实测的后果: 默认 exclude_globs
+-- 明确排除 `^prebuilts/sdk/sdk_`, 9 个 sdk_* 桩仍进 classpath 且抢在真实现之前。
+H.check(
+  (function()
+    local IP = AOSP .. "/out/soong/.intermediates/pkg/p/P/android_common/javac/P.jar"
+    vim.fn.mkdir(vim.fn.fnamemodify(IP, ":h"), "p")
+    vim.fn.writefile({ "x" }, IP)
+    local js = jars.project_closure_jars(AOSP, PROJ, { no_cache = true, no_memo = true })
+    if not js then
+      return false
+    end
+    for _, j in ipairs(js) do
+      if j == IP then
+        io.write("    leaked via add_prebuilt_jars: " .. j .. "\n")
+        return false
+      end
+    end
+    return true
+  end)(),
+  "closure wiring: intermediates 产物不由 add_prebuilt_jars 混入 (回归 plain=true 守卫)"
 )
 
 -- memo: 第二次调用命中会话缓存
