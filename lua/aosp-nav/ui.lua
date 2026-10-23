@@ -258,6 +258,18 @@ function M.diagnose(basis, src_file)
     local s = c.config and c.config.settings or {}
     local rl = s.java and s.java.project and s.java.project.referencedLibraries
     local n_rl = type(rl) == "table" and #rl or 0
+    -- [v18.19] 面板读的是 client.config.settings —— 那是 **initialize 时刻的本地表**,
+    -- 热补 (didChangeConfiguration) 只在 client.config 里**已有** settings.java.project
+    -- 时才回写 (用户配置没写 opts.settings 时那张表不存在)。于是"jdt.ls 实际有 243 个
+    -- jar、跳转完全正常"的机器上, 这一行仍显示 0 —— 面板在说谎 (用户实测报过)。
+    -- 真值以 state 为准 (热补成功时它被写成 cache_origin="soong-closure" + jars=N);
+    -- 仅在它比本地表**更可信**时采用 (即本地表给 0 而 state 有正值)。
+    local st_jars = require("aosp-nav.state").get(basis).jars or 0
+    local st_origin = require("aosp-nav.state").get(basis).cache_origin
+    local rl_from_state = n_rl == 0 and st_jars > 0 and st_origin == "soong-closure"
+    if rl_from_state then
+      n_rl = st_jars
+    end
     -- [v18.17c] project 模式的后台采集链运行中: 0 是**设计内的临时态**
     -- (jdt.ls 逐文件推断兜底, 链完成 didChangeConfiguration 热补), 不是故障 ——
     -- 老语义的红警告 + ":AospRescan" 建议在此场景全是误导。
@@ -273,17 +285,50 @@ function M.diagnose(basis, src_file)
         true
       )
     else
-      lines[#lines + 1] =
-        line("referencedLibraries", tostring(n_rl), n_rl > 0, action_if(n_rl > 0, ":AospRescan"))
+      lines[#lines + 1] = line(
+        "referencedLibraries",
+        rl_from_state and ("%d (hotpatched, from session state)"):format(n_rl) or tostring(n_rl),
+        n_rl > 0,
+        action_if(n_rl > 0, ":AospRescan")
+      )
     end
     -- sourcePaths: 按模式给不同的判据。
     --   aosp:    注入**开着** —— "未注入"是故障 (推断被关掉又没有替代)。
     --   project: 注入**开着** (v11 起注入本项目自己的根) —— 同样"未注入"是故障。
     --   infer:   注入**关着** —— "未注入"才是预期 (它靠 jdt.ls 逐文件推断)。
     -- 注意这里问的是"注入开没开", 不是"根是不是 AOSP 根"。
+    --
+    -- [v18.19] project 模式下**不能**用 client.config.settings 判这一行: 本项目自己的
+    -- 源码根走的是 source_roots + 运行期 addToSourcePath (见 source_apply.lua 函数头),
+    -- **故意不写进 settings.java.project.sourcePaths** —— 上面那行 `settings.java.
+    -- project.sourcePaths = nil` 就是明证。所以按 settings 判必然报 "NOT injected (...!)",
+    -- 而同一份面板下面的 == source roots == 段却写着 "4 root(s) injected", 自相矛盾
+    -- (用户实测报过)。project 模式改读 source_roots 的记账 (与下面那段同源)。
     local sp = s.java and s.java.project and s.java.project.sourcePaths
     local sp_n = type(sp) == "table" and #sp or 0
-    if mode == "infer" then
+    if mode == "project" then
+      -- 与下面 == source roots == 段**同源** (它也是问运行中那台的 root_dir +
+      -- find_for_project), 免得同一份面板自相矛盾。基准**不能**用 basis: 那是树的
+      -- 根, 而 source_roots 是按**项目目录**键控的 (实测 树根=0 / 项目目录=4)。
+      -- 也**不能**用 cur_file —— 它在本函数后面才算出来 (v18.19 初版踩过 nil)。
+      local proj_roots = 0
+      local live = require("aosp-nav.java.workspace_follow").client()
+      local proj = live and (live.root_dir or (live.config and live.config.root_dir)) or nil
+      if proj then
+        local ok_sr, list = pcall(require("aosp-nav.java.source_roots").find_for_project, proj)
+        if ok_sr and list then
+          proj_roots = #list
+        end
+      end
+      lines[#lines + 1] = line(
+        "sourcePaths",
+        proj_roots > 0
+            and ("injected via runtime apply (%d root(s), not in settings)"):format(proj_roots)
+          or "not injected yet (no source roots found for this project)",
+        proj_roots > 0,
+        action_if(proj_roots > 0, "open a .java file of this project to accumulate its roots")
+      )
+    elseif mode == "infer" then
       lines[#lines + 1] = line(
         "sourcePaths",
         sp_n > 0 and ("injected (%d entries)"):format(sp_n)

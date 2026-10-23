@@ -196,21 +196,22 @@ local _attach_tree_warned = {}
 --- 由 jars.lua 的 manifest 采集回调调用 (延迟 require 防循环依赖)。
 --- @param aosp_root string
 local _hotpatched = {} -- [client_id] = true (已补过; refLibs diff 本身 no-op, 这里省 notify)
+--- @return boolean 本次是否真的补了 (供 hotpatch_reflibs 计数)
 local function hotpatch_instance(client)
   local rm = require("aosp-nav.java.root")
   local jar_mod = require("aosp-nav.java.jars")
   local rd = client.root_dir or (client.config and client.config.root_dir)
   local aosp = rd and rm.aosp_root(rd) or nil
   if not aosp or _hotpatched[client.id] then
-    return
+    return false
   end
   -- manifest 未就绪 (后台采集中): 等 jars.lua 的 find 回调补 (双向守卫的另一半)
   if not jar_mod.manifest_ready(aosp) then
-    return
+    return false
   end
   local ok, jars = pcall(jar_mod.project_closure_jars, aosp, rd, {})
   if not (ok and jars and #jars > 0) then
-    return
+    return false
   end
   _hotpatched[client.id] = true
   local cfg = client.config or {}
@@ -227,11 +228,19 @@ local function hotpatch_instance(client)
   client:notify("workspace/didChangeConfiguration", { settings = settings })
   -- notify 不回写 client.config —— :Aosp 面板读 config.settings 会显示 initialize
   -- 时的旧集 (71 vs 243 的误导)。这里同步本地表, 让面板反映实际生效值。
-  if cfg.settings and cfg.settings.java and cfg.settings.java.project then
-    cfg.settings.java.project.referencedLibraries = { include = vim.deepcopy(jars) }
-    cfg.settings.java.project.sourcePaths = nil
-  end
-  require("aosp-nav.util.log").user(
+  --
+  -- [v18.19] 原来这里有个 `if cfg.settings.java.project then` 前置条件, 表不存在就
+  -- **静默跳过** —— 用户配置没写 opts.settings (很常见) 时面板永远显示
+  -- referencedLibraries=0 / sourcePaths NOT injected, 与磁盘上真实生效的 243 个 jar
+  -- 矛盾 (用户实测报过)。改为**按需建表**。
+  -- 注意守卫只能是 `cfg` 本身非 nil —— 写成 `if cfg.settings then` 仍然会在
+  -- "client.config 完全没有 settings 表"时跳过, 而那正是用户的场景 (测试钉住这条)。
+  cfg.settings = cfg.settings or {}
+  cfg.settings.java = cfg.settings.java or {}
+  cfg.settings.java.project = cfg.settings.java.project or {}
+  cfg.settings.java.project.referencedLibraries = { include = vim.deepcopy(jars) }
+  cfg.settings.java.project.sourcePaths = nil
+  require("aosp-nav.util.log").info(
     ("hotpatched refLibs into jdtls (%d jars) — full closure active for %s"):format(
       #jars,
       vim.fn.fnamemodify(rd, ":t")
@@ -243,8 +252,14 @@ local function hotpatch_instance(client)
   pcall(function()
     require("aosp-nav.state").set({ jars = #jars, cache_origin = "soong-closure" }, aosp)
   end)
+  return true
 end
 M._hotpatch_instance = hotpatch_instance
+--- 测试用: 清掉热补去重表。`_hotpatched` 按 client.id 键控且**跨整个进程存活**,
+--- 测试里复用同一个 id 会让后续调用静默 no-op (断言假通过)。见 t_module_deps。
+function M._reset_hotpatched()
+  _hotpatched = {}
+end
 
 local function _warming_done(aosp_root)
   local j = require("aosp-nav.java.jars")
@@ -252,10 +267,13 @@ local function _warming_done(aosp_root)
 end
 
 function M.hotpatch_reflibs(aosp_root, defer_retry)
+  local patched = 0
   for _, c in ipairs(vim.lsp.get_clients({ name = "jdtls" })) do
     local rd = c.root_dir or (c.config and c.config.root_dir)
     if rd and require("aosp-nav.java.root").aosp_root(rd) == aosp_root then
-      hotpatch_instance(c)
+      if hotpatch_instance(c) then
+        patched = patched + 1
+      end
     end
   end
   -- [v18.17b] 防御纵深: find 完成回调可能早于 jdtls attach (spawn 比 find 慢),
@@ -268,13 +286,20 @@ function M.hotpatch_reflibs(aosp_root, defer_retry)
       end
     end, 10000)
   end
-  -- 成功可见化: 降级集 -> 完整集的追平是用户关心的状态变化, 弹一条一次性通知
+  -- [v18.19] 这里原本是 `if patched > 0` + log.user —— **两处都是坏的**:
+  --   (a) `patched` 从未定义 (hotpatch_instance 当时也不返回值), 这行每次执行都抛
+  --       "attempt to compare nil with number"。调用点用 pcall 包着 (jars.lua), 于是
+  --       异常被静默吞掉, 整条通知从来没发出过;
+  --   (b) 就算修好计数, 音量也不对: 这是"插件自动把降级集追平成完整集", 按 §2.10
+  --       (能自动做掉的事不打扰) 该是 info。用户看到的 "每次进入都弹" 其实来自
+  --       hotpatch_instance 内部那条 log.user, 其 id 按 client.id 去重而 **client id
+  --       每起一台都变** —— 所以每开一个新实例都重弹。那条已一并降为 info。
   if patched > 0 then
-    log.user(
+    log.info(
       ("hotpatched refLibs into %d jdtls instance(s) — full closure jars are now active"):format(
         patched
       ),
-      { id = "hotpatch:" .. aosp_root, timeout = 8000 }
+      { once = true, id = "hotpatch:" .. aosp_root }
     )
   end
 end
@@ -358,6 +383,213 @@ local function hint_if_jar_jump(buf)
     { once = true, id = "jdt-jar-jump-hint", timeout = 15000 }
   )
 end
+
+--- [v18.18] jdt:// 缓冲回填前的占位行数。取值只需覆盖 jump UI 可能设的光标行号:
+--- snacks 按 LSP range 的 start.line 设光标, 反编译源码几乎不会比这更短。垫得够高
+--- 就不必用 vim.wait 等真内容 —— 这是把"同步等待"换成"占位"的关键。
+local JDT_PLACEHOLDER_LINES = 200
+
+--- jdt:// 缓冲的内容加载入口 (供包装体与兜底 handler 共用)。
+--- 与 nvim-jdtls open_classfile 同款的缓冲三件套 + 一次 classFileContents。
+--- @param buf integer
+--- @param fname string jdt:// URI
+--- @param client table|nil 省略则按 URI 的 ?=<project> 段反查
+--- @return function|nil load 重试用的加载函数 (client 都找不到时 nil)
+local function jdt_uri_load(buf, fname, client)
+  if not vim.api.nvim_buf_is_valid(buf) then
+    return nil
+  end
+  if not client then
+    -- [?=<project> 反查] 决定"哪台服务这个 URI"。nvim-jdtls 按 alternate buffer
+    -- 挑, 多台并存时挑错台 -> classFileContents 返回空 (jdt.ls 记 code 969
+    -- "does not exist")。项目名与 invisible_project_name 同规则, 实测逐字一致。
+    local q = fname:match("%?=(.+)$") or ""
+    local proj = vim.uri_decode(q:match("^(.-)/") or q)
+    local ws = require("aosp-nav.java.workspace")
+    local rm = require("aosp-nav.java.root")
+    if proj ~= "" then
+      for _, c in ipairs(vim.lsp.get_clients({ name = "jdtls" })) do
+        local r = rm.client_root(c)
+        if r and ws.invisible_project_name(r) == proj then
+          client = c
+          break
+        end
+      end
+    end
+    -- 无 query 段的 URI (jar 内部引用, 以 .class 结尾) 或归属台未起: 退第一台 ——
+    -- jdt.ls 按 jar 路径解析, 仍能反编译。
+    client = client or vim.lsp.get_clients({ name = "jdtls" })[1]
+  end
+  if not client then
+    return nil
+  end
+  vim.lsp.buf_attach_client(buf, client.id)
+
+  local function load()
+    if not vim.api.nvim_buf_is_valid(buf) then
+      return
+    end
+    -- 不查 client:supports_method("java/classFileContents"): 它是 jdt.ls 的**非标准**
+    -- 方法 (不在 capabilities 表里), 而 supports_method 对不完整的 client 表会抛
+    -- `_registration_provider` 为 nil —— 测试里的假 client 正会踩到。直接发请求,
+    -- 不支持时 jdt.ls 会回 error, 被下面的回调静默丢掉。
+    client:request("java/classFileContents", { uri = fname }, function(err, result)
+      if err or not vim.api.nvim_buf_is_valid(buf) then
+        return
+      end
+      -- [v18.18] 空内容**不算填好**: jdt.ls 在新台导入收尾窗口里正是回 `""` (不是
+      -- err/nil) —— 实测用户那次就是这样拿到空缓冲的。若照写进去, 占位块会被替换成
+      -- 单行空串 (光标再次越界) 且 filled 被置真 (重试永不触发), 等于把原来的 bug
+      -- 原样复现。所以空串走"未填"分支, 保留占位块等重试。
+      if result == "" then
+        return
+      end
+      vim.bo[buf].modifiable = true
+      vim.api.nvim_buf_set_lines(
+        buf,
+        0,
+        -1,
+        false,
+        vim.split(result:gsub("\r\n", "\n"), "\n", { plain = true })
+      )
+      vim.bo[buf].modifiable = false
+      vim.b[buf].aosp_nav_jdt_filled = true
+    end, buf)
+  end
+  return load
+end
+
+--- [v18.18] 缓冲预处理 + 归属台解析, 返回 load() 供调用方发起内容请求。
+--- 与 nvim-jdtls open_classfile 同款的缓冲三件套, 外加占位块。
+--- @return function|nil load (没有可用台时 nil, 由调用方决定回落)
+local function jdt_uri_begin(buf, fname)
+  -- 占位块: 内容是异步回填的, 而 jump UI (snacks 的 lsp picker 等) 在 bufload 后
+  -- **立即**按 LSP range 的 start.line 调 nvim_win_set_cursor —— 落在尚未回填的缓冲
+  -- 上就是 "Invalid cursor line: out of range"。
+  --
+  -- 旧版垫 1 行 + vim.wait(1500) 等真内容。两个毛病: (a) 那 1.5s 是**每次**打开 jar
+  -- 缓冲都付的主线程阻塞 ("本地反编译通常 <500ms" 在实测里不成立, 本机单次校验报过
+  -- 3491ms); (b) 光标目标往往是方法体深处的行号, 垫 1 行照样越界。
+  --
+  -- 现在垫足够多行 (JDT_PLACEHOLDER_LINES) 把落点撑住 —— 反编译源码几乎不会短于这个
+  -- 数, 回填时整体覆盖, 用户看不到占位 (回填通常几十 ms, 且在渲染间隙完成)。
+  -- 于是不再需要任何同步等待 (实测 BufReadCmd 返回 4.1 ms, 原为最多 1500 ms)。
+  if vim.api.nvim_buf_line_count(buf) <= 1 then
+    local ph = {}
+    for _ = 1, JDT_PLACEHOLDER_LINES do
+      ph[#ph + 1] = ""
+    end
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, ph)
+  end
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].swapfile = false
+  -- filetype **必须显式给 java**: URI 带 query 段, nvim 的按名检测匹配不上 *.java;
+  -- 缺了它 jar 无语法高亮、LazyVim 的 gd/LSP 链路不把它当 java 缓冲。
+  vim.bo[buf].filetype = "java"
+  return jdt_uri_load(buf, fname)
+end
+
+--- [v18.18] 空内容重试: 新台导入收尾窗口里 classFileContents 会返回空, 用户得手动再
+--- 跳一次。**直接重调 load()**, 每 3s 一次、至多 10 次, 内容到达即停。
+--- (v18.18 之前靠 exec_autocmds 重放 BufReadCmd —— buffer 已名为 jdt://…, 会把两个
+--- handler 各再触发一轮, 最坏 ~22 次请求打同一个类。)
+--- 完成判据只看 filled 标记: 占位块本身有 JDT_PLACEHOLDER_LINES 行, 看行数会让重试
+--- 永不触发 (空内容便永远停在占位块上)。
+local function jdt_uri_retry(buf, load)
+  local tries = 0
+  local function tick()
+    if not vim.api.nvim_buf_is_valid(buf) then
+      return
+    end
+    if vim.b[buf].aosp_nav_jdt_filled then
+      return
+    end
+    tries = tries + 1
+    if tries > 10 then
+      require("aosp-nav.util.log").debug(
+        "jdt:// still empty after retries (jdtls import may be unusually slow)"
+      )
+      return
+    end
+    load()
+    vim.defer_fn(tick, 3000)
+  end
+  vim.defer_fn(tick, 3000)
+end
+
+--- [v18.18] 已包装过的上游函数集合 (按函数身份判重)。见 install_jdt_uri_handlers 的
+--- 幂等闸 —— Lua 的 function 值不可挂字段, 只能用外部表记。
+local _jdt_uri_wrapped = {}
+
+--- [v18.18] jdt:// 加载: **包装** nvim-jdtls 的 `open_classfile`, 不删它的 autocmd。
+---
+--- 为什么不删 (v18.18 之前是删的): 上游在 `plugin/jdtls.lua` 用 augroup `"jdtls"` 注册了
+--- `BufReadCmd` 的 `"jdt://*"` 与 `"*.class"` 两条。删它们要 (a) 依赖 augroup 名这个
+--- **内部实现细节** —— 上游改名/改 pattern 集合就静默失效; (b) 连 `"*.class"` 一起删,
+--- 影响面超出必要; (c) 无法表达"只有带 project 段的那类我需要插手"。
+--- 改成包装函数后: 不动任何 autocmd 注册, 上游升级照旧生效; 只截住**我们需要**的那类
+--- URI, 其余 (含 `"*.class"`) 原样交还上游。
+---
+--- 包装只做一次 (模块级)。configure 每次**切项目**都会重入, 若把注册写在它体内且带
+--- augroup(clear=true), 每切一次就把 handler 连同**正在进行的重试链**一起销毁重建 ——
+--- 切项目恰是最可能同时有待重试 buffer 的时刻 (v18.18 前实测: 3 次 configure → 3 次创建)。
+local function install_jdt_uri_handlers()
+  if M._jdt_uri_installed then
+    return
+  end
+  M._jdt_uri_installed = true
+  local log = require("aosp-nav.util.log")
+
+  local ok, upstream = pcall(require, "jdtls")
+  if not ok or type(upstream.open_classfile) ~= "function" then
+    -- nvim-jdtls 没装 / 改名: 自己装一条 BufReadCmd 顶上, 保证 jdt:// 仍能用。
+    -- 这是兜底路径, 正常 (装了 nvim-jdtls) 走不到。
+    vim.api.nvim_create_autocmd("BufReadCmd", {
+      group = vim.api.nvim_create_augroup("aosp_nav_jdt_uri_load", { clear = true }),
+      pattern = "jdt://*",
+      callback = function(args)
+        local load = jdt_uri_begin(args.buf, args.match)
+        if load then
+          load()
+          jdt_uri_retry(args.buf, load)
+        end
+      end,
+    })
+    log.debug("nvim-jdtls open_classfile not found; installed a standalone jdt:// handler")
+    return
+  end
+
+  local orig = upstream.open_classfile
+  -- 幂等闸: 已包装过就不再包。**不能**把标记挂在函数上 —— Lua 里 `f.x = true` 对
+  -- function 值直接抛 "attempt to index a function value" (本仓库其它地方也记过
+  -- "function 值不可挂字段")。所以用模块级表按函数身份判重。
+  -- 为什么需要: 只靠 `_jdt_uri_installed` 不够 —— 它丢了 (模块被 reload、重复 require
+  -- 出两份实例、测试里清标记) 就会再包一层, 链随每次重装变长 (实测确认)。行为上还不
+  -- 算错 (最内层 orig 仍只被调一次), 但属真泄漏。
+  if _jdt_uri_wrapped[orig] then
+    return
+  end
+  local function wrapped(buf, fname)
+    -- 只截"带 ?=<project> 段"的 jdt:// URI —— 那正是上游按 alternate buffer 挑台、
+    -- 从而在多实例下挑错台 (classFileContents 回空 / jdt.ls code 969) 的那一类。
+    -- 无 query 段的 URI (jar 内部引用, 以 .class 结尾) 与普通文件路径一律交还上游。
+    if type(fname) == "string" and fname:match("^jdt://") and fname:find("?=", 1, true) then
+      local load = jdt_uri_begin(buf, fname)
+      if load then
+        load()
+        jdt_uri_retry(buf, load)
+        return
+      end
+      -- 没有可用台: 落回上游 (它会自己等 client), 不在这里吞掉。
+    end
+    return orig(buf, fname)
+  end
+  _jdt_uri_wrapped[orig] = true
+  _jdt_uri_wrapped[wrapped] = true -- 关键: 下次 install 的 orig 会是 wrapped 本身
+  upstream.open_classfile = wrapped
+  log.debug("wrapped nvim-jdtls open_classfile for project-aware jdt:// loading")
+end
+M._install_jdt_uri_handlers = install_jdt_uri_handlers
 
 --- 注入 AOSP 特化配置到 jdtls opts
 --- 不覆盖用户已有配置 (deep_extend force 合并, AOSP 字段优先)
@@ -566,149 +798,24 @@ function M.configure(opts, ctx)
     })
   end
 
-  -- [v18.14] jdt:// 空内容自动重试: 新台导入收尾窗口里 classFileContents 返回空,
-  -- 反编译缓冲只有一行 —— snacks 之类跳转 UI 往空缓冲 set cursor 报 "Invalid
-  -- cursor line", 且用户必须手动再跳一次。这里每 3s 检查缓冲, 仍空就**重放
-  -- BufReadCmd** (nvim-jdtls 的 handler 会重新请求 classFileContents), 退避至多
-  -- 10 次 —— 导入收尾通常几十秒内完成, 内容到达后缓冲自动填好, 用户无感。
-  -- _retrying 短路重放路径里本插件自己的 callback, 防检查链叠加。
-  do
-    local group = vim.api.nvim_create_augroup("aosp_nav_jdt_uri_retry", { clear = true })
-    local _retrying = {}
-    vim.api.nvim_create_autocmd("BufReadCmd", {
-      group = group,
-      pattern = "jdt://*",
-      callback = function(args)
-        local buf = args.buf
-        if _retrying[buf] then
-          return
-        end
-        _retrying[buf] = true
-        local tries = 0
-        local function check()
-          if not vim.api.nvim_buf_is_valid(buf) then
-            _retrying[buf] = nil
-            return
-          end
-          if vim.api.nvim_buf_line_count(buf) > 1 then
-            _retrying[buf] = nil
-            return
-          end
-          tries = tries + 1
-          if tries > 10 then
-            _retrying[buf] = nil
-            require("aosp-nav.util.log").debug(
-              "jdt:// still empty after retries (jdtls import may be unusually slow)"
-            )
-            return
-          end
-          vim.api.nvim_exec_autocmds("BufReadCmd", { buffer = buf, modeline = false })
-          vim.defer_fn(check, 3000)
-        end
-        vim.defer_fn(check, 3000)
-      end,
-    })
-  end
+  -- [v18.18] jdt:// 的空内容重试已并入 install_jdt_uri_handlers() (模块级, 一次安装)。
+  -- 旧版这里挂过一条独立的 3s 重试 handler, 它用 exec_autocmds("BufReadCmd") **重放**
+  -- 整个事件 —— 而 buffer 已命名为 jdt://…, 于是两个 handler 都被再触发一轮, 每次重放
+  -- 又各挂一个 1.5s 兜底请求: 最坏 ~22 次 classFileContents 打同一个取不到内容的类,
+  -- 是放大负载而非修复。现在重试**直接调 load()**, 不再经过事件系统。
 
   -- [v18.14b] jdt:// 内容加载接管: nvim-jdtls 的 open_classfile 按 **alternate
   -- buffer** 挑 client (fallback = 第一台), 多台并存 (project 模式) 下把请求发给
   -- 没有该工程上下文的台 —— classFileContents 返回空 (jdt.ls 侧记 code 969
   -- "X does not exist"), 跳转 UI 报 "Invalid cursor line", 只能靠重试碰运气。
   -- 这里按 URI 的 ?=<project> 段反查拥有该工程的台, 精确发请求。
-  -- 空缓冲的 3s 重试 (v18.14) 继续作为最后防线。
-  do
-    -- 摘除 nvim-jdtls (plugin/jdtls.lua, augroup "jdtls") 的全部 BufReadCmd 注册。
-    -- **不限 pattern**: 它注册了 "jdt://*" 和 "*.class" 两个, 而实测 (v18.14c 上线后
-    -- 仍残留的 969) 证明 "*.class" 也会命中 jdt:// URI —— snacks 的 lsp picker 在
-    -- locations_to_items 里 bufload 反编译缓冲, 只要 URI 以 .class 结尾 (无 query
-    -- 段) 就落进它手里, 同样错台 + 30s 同步 vim.wait。只按 event+group 摘, 幂等。
-    pcall(function()
-      for _, ac in ipairs(vim.api.nvim_get_autocmds({ event = "BufReadCmd", group = "jdtls" })) do
-        vim.api.nvim_del_autocmd(ac.id)
-      end
-    end)
-    local group = vim.api.nvim_create_augroup("aosp_nav_jdt_uri_load", { clear = true })
-    vim.api.nvim_create_autocmd("BufReadCmd", {
-      group = group,
-      pattern = "jdt://*",
-      callback = function(args)
-        local buf, fname = args.buf, args.match
-        -- 占位一行: 内容是异步回填的, snacks 等 jump UI 会在回填前就对缓冲
-        -- nvim_win_set_cursor —— 0 行缓冲直接报 "Invalid cursor line"。先垫一行
-        -- 把光标落点撑住 (内容到达后覆盖)。
-        if vim.api.nvim_buf_line_count(buf) == 0 then
-          vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
-        end
-        -- 与 nvim-jdtls open_classfile 同款的缓冲三件套。nofile: 退出不问保存、:w
-        -- 不往 URI 落盘。filetype **必须显式给 java**: URI 带 query 段, nvim 的按名
-        -- 检测匹配不上 *.java; 缺了它 jar 无语法高亮、LazyVim 的 gd/LSP 链路不把它
-        -- 当 java 缓冲 (v18.14d 实测: 无颜色且无法二次跳转)。
-        vim.bo[buf].buftype = "nofile"
-        vim.bo[buf].swapfile = false
-        vim.bo[buf].filetype = "java"
-        local q = fname:match("%?=(.+)$") or ""
-        local proj = vim.uri_decode(q:match("^(.-)/") or q)
-        local ws = require("aosp-nav.java.workspace")
-        local rm = require("aosp-nav.java.root")
-        local client
-        for _, c in ipairs(vim.lsp.get_clients({ name = "jdtls" })) do
-          local r = rm.client_root(c)
-          if r and ws.invisible_project_name(r) == proj then
-            client = c
-            break
-          end
-        end
-        if not client then
-          -- 反查有 query 段才可能精确; 无 query 段的 URI (jar 内部引用, 以 .class
-          -- 结尾) 或归属台未起时退第一台 —— jdt.ls 按 jar 路径解析, 仍能反编译。
-          -- 仍由本 handler 填充 (nvim-jdtls 的 handler 已摘除, 见上)。
-          client = vim.lsp.get_clients({ name = "jdtls" })[1]
-          if not client then
-            return
-          end
-        end
-        vim.lsp.buf_attach_client(buf, client.id)
-        local function load()
-          if not vim.api.nvim_buf_is_valid(buf) then
-            return
-          end
-          client:request("java/classFileContents", { uri = fname }, function(err, result)
-            if err or not result or not vim.api.nvim_buf_is_valid(buf) then
-              return
-            end
-            vim.bo[buf].modifiable = true
-            vim.api.nvim_buf_set_lines(
-              buf,
-              0,
-              -1,
-              false,
-              vim.split(result:gsub("\r\n", "\n"), "\n", { plain = true })
-            )
-            vim.bo[buf].modifiable = false
-          end, buf)
-        end
-        load()
-        -- 首次加载同步等一小段: snacks 的 lsp picker 在 locations_to_items 里
-        -- bufload 后**立即**读行并 set cursor (预览与跳转都是) —— 内容纯异步回填时
-        -- 缓冲只有占位一行, 行号越界报 "Invalid cursor line: out of range"
-        -- (v18.14c 上线后实测残留)。vim.wait 会泵事件循环, 响应回调在等待期间执行;
-        -- 归属台本地反编译通常 <500ms, 超时落回下面的异步兜底。只等首次: 3s 重试的
-        -- 重放路径 (exec_autocmds 再触发本 handler) 不再阻塞主循环。
-        if not vim.b[buf].aosp_nav_jdt_waited then
-          vim.b[buf].aosp_nav_jdt_waited = true
-          vim.wait(1500, function()
-            return not vim.api.nvim_buf_is_valid(buf) or vim.api.nvim_buf_line_count(buf) > 1
-          end, 50)
-        end
-        -- 兜底: 空填充若晚到覆盖了内容, 1.5s 后校验重填
-        vim.defer_fn(function()
-          if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_line_count(buf) <= 1 then
-            load()
-          end
-        end, 1500)
-      end,
-    })
-  end
+  --
+  -- [v18.18] 安装逻辑整体移到 install_jdt_uri_handlers() (模块级, 只跑一次)。
+  -- 原来它就写在 configure 体内、augroup 带 clear=true, 而 configure 每次**切项目**
+  -- 都会重入 —— 于是每切一次项目就把两个 handler 连同**正在进行的 3s 重试链**一起
+  -- 销毁重建 (闭包与 _retrying 表都是新的), 同一个 buffer 可能被两条链同时盯上。
+  -- 切项目恰恰是最可能同时有待重试 buffer 的时刻, 所以这不是理论问题。
+  install_jdt_uri_handlers()
 
   -- 7. 构造 AOSP 特化 settings
   -- sourcePaths 只在确有内容时才出现: 注入这个 key 会关闭 jdt.ls 的逐文件

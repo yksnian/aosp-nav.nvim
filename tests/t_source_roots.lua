@@ -47,16 +47,13 @@ local function set_mode(m)
 end
 
 -- ---------------------------------------------------------------------------
-H.check(
-  "两个入口都是函数",
-  type(SR.find) == "function" and type(SR.find_for_project) == "function"
-)
+H.check(type(SR.find) == "function" and type(SR.find_for_project) == "function", "两个入口都是函数")
 
 -- mode="aosp": M.find 给结果, M.find_for_project 退让
 set_mode("aosp")
 do
   local a = SR.find(PROJ)
-  H.check("aosp: find 返回条目", type(a) == "table" and #a > 0)
+  H.check(type(a) == "table" and #a > 0, "aosp: find 返回条目")
   H.eq(a and #a, 2, "aosp: find 恰好 2 条根")
   H.eq(SR.find_for_project(PROJ), nil, "aosp: find_for_project 退让 (nil)")
 end
@@ -72,7 +69,7 @@ end
 set_mode("project")
 do
   local a = SR.find_for_project(PROJ)
-  H.check("project: find_for_project 返回条目", type(a) == "table" and #a > 0)
+  H.check(type(a) == "table" and #a > 0, "project: find_for_project 返回条目")
   H.eq(a and #a, 2, "project: find_for_project 恰好 2 条根")
   H.eq(SR.find(PROJ), nil, "project: find 退让 (nil)")
   -- 路径必须是**相对项目目录**的: 这是 §2.7 的硬要求, 也是 project 模式
@@ -83,14 +80,14 @@ do
       all_relative = false
     end
   end
-  H.check("project: 全部是相对路径 (无绝对路径)", all_relative)
+  H.check(all_relative, "project: 全部是相对路径 (无绝对路径)")
 
   local has = {}
   for _, v in ipairs(a or {}) do
     has[v] = true
   end
-  H.check("project: 含 framework/java", has["framework/java"] == true)
-  H.check("project: 含 service/java", has["service/java"] == true)
+  H.check(has["framework/java"] == true, "project: 含 framework/java")
+  H.check(has["service/java"] == true, "project: 含 service/java")
 end
 
 -- 空列表: 两个入口在任何模式下都不得返回空表 (返回 nil 才是"不注入")
@@ -109,7 +106,7 @@ set_mode("project")
 do
   local a = SR.find_for_project(PROJ, { no_cache = true }) -- 强制重扫, 事件缓存清掉
   local b = SR.find_for_project(PROJ) -- 这次应命中缓存
-  H.check("缓存后结果一致", vim.deep_equal(a, b))
+  H.check(vim.deep_equal(a, b), "缓存后结果一致")
 end
 
 -- ---------------------------------------------------------------------------
@@ -146,7 +143,7 @@ do
   local pb = R.project_dir(TREE .. "/pkgB/framework/java/com/example/b/B.java")
   H.eq(pa, TREE .. "/pkgA", "project_dir: A.java -> pkgA")
   H.eq(pb, TREE .. "/pkgB", "project_dir: B.java -> pkgB")
-  H.check("project_dir: 两个不同项目给出不同根", pa ~= pb)
+  H.check(pa ~= pb, "project_dir: 两个不同项目给出不同根")
   H.eq(
     R.project_dir(TREE .. "/loose/NoMarker.java"),
     nil,
@@ -154,7 +151,7 @@ do
   )
 
   -- **这条才是 bug 的正面回归**: project 模式下绝不能把 AOSP 根当项目目录。
-  H.check("project_dir 不等于 AOSP 根", pa ~= TREE)
+  H.check(pa ~= TREE, "project_dir 不等于 AOSP 根")
   H.eq(
     R.workspace_root(TREE .. "/pkgA/framework/java/com/example/a/A.java"),
     nil,

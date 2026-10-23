@@ -19,53 +19,53 @@ local index = {
 }
 
 H.check(
-  "module_closure: 直依赖进闭包",
   (function()
     local c = jars.module_closure(index, { "A" }, { max_depth = 1 })
     return c.A and c.B and not c.C and not c.D
-  end)()
+  end)(),
+  "module_closure: 直依赖进闭包"
 )
 
 H.check(
-  "module_closure: BFS 到全部可达模块",
   (function()
     local c = jars.module_closure(index, { "A" }, {})
     return c.A and c.B and c.C and c.D and c.E
-  end)()
+  end)(),
+  "module_closure: BFS 到全部可达模块"
 )
 
 H.check(
-  "module_closure: 循环依赖 (E->A) 不死循环",
   (function()
     local c = jars.module_closure(index, { "A" }, {})
     return c.A ~= nil
-  end)()
+  end)(),
+  "module_closure: 循环依赖 (E->A) 不死循环"
 )
 
 H.check(
-  "module_closure: 未知种子与未知依赖被忽略",
   (function()
     local c = jars.module_closure(index, { "A", "NOSUCH" }, {})
     return c.NOSUCH == nil and c.F == nil
-  end)()
+  end)(),
+  "module_closure: 未知种子与未知依赖被忽略"
 )
 
 H.check(
-  "closure_jars: 闭包内模块的 .jar 合并去重转绝对路径",
   (function()
     local c = jars.module_closure(index, { "A" }, {})
     local js = jars.closure_jars(index, c, "/tree")
     -- A,B,C,E 有 jar (D 无); b 的两个都收; 去重后 5 个, 全部以 /tree/ 开头且排序
     return #js == 5 and js[1] == "/tree/out/jars/a.jar" and js[5] == "/tree/out/jars/e.jar"
-  end)()
+  end)(),
+  "closure_jars: 闭包内模块的 .jar 合并去重转绝对路径"
 )
 
 H.check(
-  "closure_jars: 非 .jar 结尾被过滤",
   (function()
     local i2 = { X = { type = "t", path = {}, jars = { "out/x.jar", "out/x.tgz" }, deps = {} } }
     return #jars.closure_jars(i2, { X = true }, "/t") == 1
-  end)()
+  end)(),
+  "closure_jars: 非 .jar 结尾被过滤"
 )
 
 -- ---------------------------------------------------------------------------
@@ -148,18 +148,17 @@ vim.fn.writefile(
 
 -- 种子发现: 类型白名单 + path 前缀 (T 是 android_test 不做种子)
 H.check(
-  "seed: 类型过滤 + path 前缀",
   (function()
     local idx = jars.module_deps_index(AOSP, { no_cache = true })
     local seeds = jars._project_seed_modules(idx, "pkg/a")
     table.sort(seeds)
     return #seeds == 1 and seeds[1] == "A"
-  end)()
+  end)(),
+  "seed: 类型过滤 + path 前缀"
 )
 
 -- 端到端: 闭包 A->B, jar = A 的 intermediates javac + B 的 prebuilt; Z (闭包外) 被滤掉
 H.check(
-  "closure wiring: jar 集含 A javac + B prebuilt, 排除闭包外 Z",
   (function()
     local js, meta = jars.project_closure_jars(AOSP, PROJ, {})
     if not js then
@@ -174,36 +173,37 @@ H.check(
       and not has[IZ]
       and meta.origin == "soong-closure"
       and meta.closure_n == 2
-  end)()
+  end)(),
+  "closure wiring: jar 集含 A javac + B prebuilt, 排除闭包外 Z"
 )
 
 -- memo: 第二次调用命中会话缓存
 H.check(
-  "closure wiring: memo 命中",
   (function()
     local _, meta = jars.project_closure_jars(AOSP, PROJ, {})
     return meta.memo == true
-  end)()
+  end)(),
+  "closure wiring: memo 命中"
 )
 
 -- fallback 原因: 无 JSON 的树
 H.check(
-  "fallback reason: no-module-deps",
   (function()
     local other = TMP .. "/empty-tree"
     vim.fn.mkdir(other .. "/pkg/x/.git", "p")
     local _, meta = jars.project_closure_jars(other, other .. "/pkg/x", {})
     return meta.reason == "no-module-deps"
-  end)()
+  end)(),
+  "fallback reason: no-module-deps"
 )
 
 -- fallback 原因: aosp 根本身 (project-is-root)
 H.check(
-  "fallback reason: project-is-root",
   (function()
     local _, meta = jars.project_closure_jars(AOSP, AOSP, {})
     return meta.reason == "project-is-root"
-  end)()
+  end)(),
+  "fallback reason: project-is-root"
 )
 
 -- ---------------------------------------------------------------------------
@@ -227,29 +227,81 @@ do
   end
   local rm = require("aosp-nav.java.root")
   local aosp_dbg = rm.aosp_root(PROJ)
-  javainit._hotpatch_instance(client)
+  javainit._reset_hotpatched() -- 去重表跨进程存活, 不清的话断言假通过
+  local patched = javainit._hotpatch_instance(client)
   vim.lsp.get_clients = real_get
 
   H.check(
-    "hotpatch: didChangeConfiguration 发出",
-    #notifies == 1 and notifies[1].method == "workspace/didChangeConfiguration"
-  )
+  #notifies == 1 and notifies[1].method == "workspace/didChangeConfiguration",
+  "hotpatch: didChangeConfiguration 发出"
+)
   local prj = notifies[1] and notifies[1].params.settings.java.project
-  print("DEBUG notifies=" .. vim.inspect(notifies))
   H.check(
-    "hotpatch: refLibs = 闭包集 (IA javac + PB prebuilt, 2 个)",
-    prj and prj.referencedLibraries and #prj.referencedLibraries == 2
-  )
-  H.check("hotpatch: sourcePaths 键被删除", prj.sourcePaths == nil)
+  prj and prj.referencedLibraries and #(prj.referencedLibraries.include or {}) == 2,
+  "hotpatch: refLibs = 闭包集 (IA javac + PB prebuilt, 2 个)"
+)
+  H.check(prj.sourcePaths == nil, "hotpatch: sourcePaths 键被删除")
   H.check(
-    "hotpatch: config 同步 (面板读这里)",
-    #client.config.settings.java.project.referencedLibraries == 2
-  )
+  #(client.config.settings.java.project.referencedLibraries.include or {}) == 2,
+  "hotpatch: config 同步 (面板读这里)"
+)
+  -- [v18.19] 返回值: hotpatch_reflibs 靠它累加计数 (旧版该变量根本没定义,
+  -- `patched > 0` 每次抛 "attempt to compare nil with number", 被调用点的
+  -- pcall 静默吞掉)。这里钉住"真补了 -> true"。
+  H.check(patched == true, "hotpatch: 真补了时返回 true (供调用方计数)")
   -- 幂等: 二次调用 no-op (_hotpatched 去重, 不重发 notify)
-  local javainit = require("aosp-nav.java.init")
   local n_before = #notifies
+  local again = javainit._hotpatch_instance(client)
+  H.check(#notifies == n_before, "hotpatch: 幂等 (_hotpatched 去重, 不重发)")
+  H.check(again == false, "hotpatch: 幂等时返回 false (不计入 patched)")
+end
+
+-- ---------------------------------------------------------------------------
+-- [v18.19] config 表缺席时也要同步 (回归: 面板显示 0 而那台其实有 243 个 jar)
+-- ---------------------------------------------------------------------------
+-- 旧实现是 `if cfg.settings.java.project then ... end` —— 用户配置没写 opts.settings
+-- (很常见) 时表不存在, 同步被**静默跳过**, 面板永远读 0, 与磁盘上真实生效的闭包集
+-- 矛盾 (用户实测报过)。现在按需建表。
+do
+  local client = {
+    id = 4011,
+    name = "jdtls",
+    root_dir = PROJ,
+    config = {}, -- 完全没有 settings 表
+  }
+  function client:notify() end
+  local javainit = require("aosp-nav.java.init")
+  javainit._reset_hotpatched()
+  local real_get = vim.lsp.get_clients
+  vim.lsp.get_clients = function(_)
+    return { client }
+  end
   javainit._hotpatch_instance(client)
-  H.check("hotpatch: 幂等 (_hotpatched 去重, 不重发)", #notifies == n_before)
+  vim.lsp.get_clients = real_get
+  H.check(
+  client.config.settings
+      and client.config.settings.java
+      and client.config.settings.java.project
+      and #(client.config.settings.java.project.referencedLibraries.include or {}) == 2,
+  "hotpatch: 无 settings 表也建表同步 (面板不再假报 0)"
+)
+end
+
+-- ---------------------------------------------------------------------------
+-- [v18.19] hotpatch_reflibs: 不再抛 undefined `patched`
+-- ---------------------------------------------------------------------------
+do
+  local javainit = require("aosp-nav.java.init")
+  local real_get = vim.lsp.get_clients
+  vim.lsp.get_clients = function()
+    return {}
+  end
+  local ok, err = pcall(javainit.hotpatch_reflibs, "/nonexistent/tree")
+  vim.lsp.get_clients = real_get
+  H.check(ok, "hotpatch_reflibs: 无 client 时不抛 (回归 undefined patched)")
+  if not ok then
+    io.write("    err: " .. tostring(err) .. "\n")
+  end
 end
 
 H.finish("t_module_deps")

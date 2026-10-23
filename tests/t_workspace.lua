@@ -61,10 +61,7 @@ local keep = ui.invisible_project_name(root)
 -- ---------------------------------------------------------------------------
 local blockers = ui.workspace_blockers(tmp, root)
 H.eq(#blockers, 4, "blockers = 4 (假工程与 invisible project 都不算)")
-H.check(
-  not vim.tbl_contains(blockers, "jdt.ls-java-project"),
-  "jdt.ls-java-project 不算外部工程"
-)
+H.check(not vim.tbl_contains(blockers, "jdt.ls-java-project"), "jdt.ls-java-project 不算外部工程")
 H.check(
   not vim.tbl_contains(blockers, keep),
   "本该存在的 invisible project (" .. keep .. ") 不算外部工程"
@@ -264,10 +261,10 @@ vim.api.nvim_del_augroup_by_id(grp)
 do
   local g = ui.expected_workspace_dir("/home/x/google/aosp/frameworks/base", "/tmp/ck")
   local q = ui.expected_workspace_dir("/home/x/qssi/aosp/frameworks/base", "/tmp/ck")
-  H.check("跨树同名项目 (frameworks/base) 得到不同 workspace", g ~= q and g ~= nil)
+  H.check(g ~= q and g ~= nil, "跨树同名项目 (frameworks/base) 得到不同 workspace")
   H.check(
-    "同根同项目稳定",
-    g == ui.expected_workspace_dir("/home/x/google/aosp/frameworks/base", "/tmp/ck")
+    g == ui.expected_workspace_dir("/home/x/google/aosp/frameworks/base", "/tmp/ck"),
+    "同根同项目稳定"
   )
 end
 
