@@ -398,6 +398,32 @@ function M.find_android_jars(opts)
   end
   _last_root = android_root
 
+  -- [v18.16 P1] project 模式: 优先 soong 依赖闭包 (模块图精确定模块, 现有分桶
+  -- 引擎选 jar) —— 候选从全树 2552 收窄到闭包模块, 且补上 glob 收不到的
+  -- prebuilts (androidx 等)。任一步失败 fallback 到下方现有全树收集, 行为不变。
+  -- aosp 模式不接线: 跨模块跳转是它的核心承诺, 全树 jar 是刻意设计。
+  if java_cfg.mode == "project" then
+    local bufname0 = (opts and opts.fname) or ""
+    local project_dir = bufname0 ~= "" and vim.fs.root(bufname0, ".git") or nil
+    if
+      project_dir
+      and project_dir ~= android_root
+      and project_dir:sub(1, #android_root + 1) == android_root .. "/"
+    then
+      local cjars, cmeta = M.project_closure_jars(android_root, project_dir, {})
+      if cjars then
+        _jars_origin[android_root] = "soong-closure"
+        _last_root = android_root
+        return cjars, android_root
+      end
+      log.debug(
+        ("closure collection failed (%s), falling back to full scan"):format(
+          cmeta and cmeta.reason or "?"
+        )
+      )
+    end
+  end
+
   -- 命中内存缓存直接返回 ([#3] 按树分区: 双树交替打开互不挤掉)
   if _jars_cache[android_root] then
     return _jars_cache[android_root], android_root
@@ -699,5 +725,424 @@ function M.cache_status(root)
     stale = M.cache_stale(r),
   }
 end
+
+-- ===========================================================================
+-- [v18.16] soong 模块数据源 (ASfP 思路落地第一步: 提取 + 对比, 不改现有收集)
+--
+-- 数据源 = out/soong/module_bp_java_deps.json: soong 分析 build graph 时自动
+-- 刷新 (每次 build / m nothing 都更新), 每模块含 module_type / path / srcs /
+-- srcjars / jars / dependencies / class —— 与 ASfP (Android Studio for
+-- Platform) 读的 JdepsKey 字段集一一对应。本树实测 61MB / 31726 模块。
+--
+-- 61MB JSON 不做 Lua 全量 decode (内存不可控): awk 单遍流式提取每模块的紧凑
+-- 摘要 (name/type/path/jars/deps) 成 TSV 缓存, 一次扫描秒级, 闭包计算纯内存。
+-- 本节只加**只读**的提取/闭包/对比能力, find_android_jars 现有收集一字不动 ——
+-- 对比结果 (闭包集 vs 全树 glob 集) 作为是否切换数据源的决策依据。
+-- ===========================================================================
+
+local MODULE_DEPS_AWK = [[
+BEGIN { inm = 0 }
+/^\t"[^"]+": \{/ {
+  if (inm) print cur "\t" mtype "\t" path "\t" jars "\t" deps
+  line = $0; sub(/^\t"/, "", line); sub(/".*$/, "", line); cur = line
+  mtype = ""; path = ""; jars = ""; deps = ""; mode = ""; inm = 1; next
+}
+inm && /^\t\},?/ { print cur "\t" mtype "\t" path "\t" jars "\t" deps; inm = 0; next }
+inm && /^\t\t"module_type": "/ { t = $0; sub(/^\t\t"module_type": "/, "", t); sub(/".*$/, "", t); mtype = t; next }
+inm && /^\t\t"path": \[/ { mode = "path"; next }
+inm && /^\t\t"jars": \[/ { mode = "jars"; next }
+inm && /^\t\t"dependencies": \[/ { mode = "deps"; next }
+inm && /^\t+\],?/ { mode = ""; next }
+inm && mode != "" && /^\t\t\t"[^"]*",?$/ {
+  s = $0; sub(/^\t+"/, "", s); sub(/",?$/, "", s)
+  if (mode == "jars") jars = (jars == "" ? s : jars "|" s)
+  else if (mode == "deps") deps = (deps == "" ? s : deps " " s)
+  else if (mode == "path") path = (path == "" ? s : path "|" s)
+  next
+}
+END { if (inm) print cur "\t" mtype "\t" path "\t" jars "\t" deps }
+]]
+
+--- soong 模块依赖图的产物探测。**不读内容**, 只 stat —— 新鲜度判定的基准。
+--- @param aosp_root string
+--- @return table|nil { path = string, mtime = number }
+function M.module_deps_artifact(aosp_root)
+  if not aosp_root or aosp_root == "" then
+    return nil
+  end
+  -- 主选: soong 的 java deps 图 (轻, 每次分析自动刷)。备选: product-out 的
+  -- module-info.json (ASfP 用同款路径形态, 更全但更大) —— 暂不接, 先验证主选。
+  local p = aosp_root .. "/out/soong/module_bp_java_deps.json"
+  local st = vim.uv.fs_stat(p)
+  if st and st.type == "file" and st.size > 2 then
+    return { path = p, mtime = math.floor(st.mtime.sec) }
+  end
+  return nil
+end
+
+local function module_deps_tsv_for(aosp_root)
+  local cfg = get_cfg()
+  if not cfg.cache_dir or not aosp_root or aosp_root == "" then
+    return nil
+  end
+  return cfg.cache_dir
+    .. "/"
+    .. require("aosp-nav.util.path").cache_key(aosp_root)
+    .. ".module-deps.tsv"
+end
+
+--- 读取 soong 模块依赖图摘要 (awk 单遍提取, TSV 缓存按产物 mtime 判新鲜)。
+--- @param aosp_root string
+--- @param opts table|nil { no_cache = boolean }
+--- @return table|nil index { [name] = { type, path, jars, deps } }
+--- @return table|nil meta { artifact_path, artifact_mtime, source = "cache"|"scan" }
+function M.module_deps_index(aosp_root, opts)
+  local artifact = M.module_deps_artifact(aosp_root)
+  if not artifact then
+    return nil, nil
+  end
+  local tsv = module_deps_tsv_for(aosp_root)
+
+  -- 文件缓存命中: 头部产物 mtime 与当前一致才复用 (soong 重新分析即失效)
+  if tsv and not (opts and opts.no_cache) and vim.fn.filereadable(tsv) == 1 then
+    local lines = vim.fn.readfile(tsv)
+    if (lines[1] or "") == "# module-deps v1 mtime=" .. artifact.mtime then
+      local index = {}
+      for i = 2, #lines do
+        local name, mtype, path, jars, deps = unpack(vim.split(lines[i], "\t", { plain = true }))
+        if name and name ~= "" then
+          index[name] = {
+            type = mtype or "",
+            path = path and vim.split(path, "|", { plain = true }) or {},
+            jars = jars and vim.split(jars, "|", { plain = true }) or {},
+            deps = deps and vim.split(deps, " ", { plain = true }) or {},
+          }
+        end
+      end
+      if next(index) then
+        return index,
+          { artifact_path = artifact.path, artifact_mtime = artifact.mtime, source = "cache" }
+      end
+    end
+  end
+
+  -- awk 单遍扫描 (60MB 秒级)。输出经 xargs 式防御: 不依赖首行
+  local ok, out = pcall(vim.fn.systemlist, { "awk", MODULE_DEPS_AWK, artifact.path })
+  if not ok or vim.v.shell_error ~= 0 or #out == 0 then
+    log.warn("module-deps extraction failed (awk?): " .. tostring(out and out[1] or "?"))
+    return nil, nil
+  end
+  local index = {}
+  for _, line in ipairs(out) do
+    local name, mtype, path, jars, deps = unpack(vim.split(line, "\t", { plain = true }))
+    if name and name ~= "" then
+      index[name] = {
+        type = mtype or "",
+        path = path and vim.split(path, "|", { plain = true }) or {},
+        jars = jars and vim.split(jars, "|", { plain = true }) or {},
+        deps = deps and vim.split(deps, " ", { plain = true }) or {},
+      }
+    end
+  end
+  if not next(index) then
+    return nil, nil
+  end
+  if tsv then
+    local dump = { "# module-deps v1 mtime=" .. artifact.mtime }
+    for name, m in pairs(index) do
+      dump[#dump + 1] = table.concat({
+        name,
+        m.type,
+        table.concat(m.path, "|"),
+        table.concat(m.jars, "|"),
+        table.concat(m.deps, " "),
+      }, "\t")
+    end
+    pcall(vim.fn.writefile, dump, tsv)
+  end
+  return index, { artifact_path = artifact.path, artifact_mtime = artifact.mtime, source = "scan" }
+end
+
+--- 依赖闭包: 从种子模块出发 BFS dependencies 字段。
+--- @param index table M.module_deps_index 的结果
+--- @param seeds table 种子模块名列表
+--- @param opts table|nil { max_depth = number|nil (缺省不限) }
+--- @return table 闭包模块名集合 (含种子; 未知模块名不进闭包)
+function M.module_closure(index, seeds, opts)
+  local max_depth = opts and opts.max_depth
+  local closure, seen, frontier = {}, {}, {}
+  for _, s in ipairs(seeds or {}) do
+    if index[s] then
+      closure[s] = true
+      seen[s] = true
+      frontier[#frontier + 1] = s
+    end
+  end
+  local depth = 0
+  while #frontier > 0 and (not max_depth or depth < max_depth) do
+    local next_frontier = {}
+    for _, name in ipairs(frontier) do
+      for _, dep in ipairs(index[name].deps or {}) do
+        if not seen[dep] and index[dep] then
+          seen[dep] = true
+          closure[dep] = true
+          next_frontier[#next_frontier + 1] = dep
+        end
+      end
+    end
+    frontier = next_frontier
+    depth = depth + 1
+  end
+  return closure
+end
+
+--- 闭包内模块的 jar 集合 (绝对路径, 已去重排序) —— 与 find_android_jars 同形态。
+--- @param index table
+--- @param closure table M.module_closure 的结果
+--- @param aosp_root string (JSON 里是树相对路径)
+--- @return table jars
+function M.closure_jars(index, closure, aosp_root)
+  local jars, seen = {}, {}
+  for name in pairs(closure or {}) do
+    local m = index[name]
+    for _, j in ipairs(m.jars or {}) do
+      if j:sub(-4) == ".jar" then
+        local abs = (j:sub(1, 1) == "/") and j or (aosp_root .. "/" .. j)
+        if not seen[abs] then
+          seen[abs] = true
+          jars[#jars + 1] = abs
+        end
+      end
+    end
+  end
+  table.sort(jars)
+  return jars
+end
+
+--- 对比: 指定模块的 soong 依赖闭包 jar 集 vs 现有全树 glob 集。
+--- 只读诊断, 不改任何收集行为。输出差集与统计, 供数据源切换决策。
+--- @param aosp_root string
+--- @param seeds table 种子模块名
+--- @param opts table|nil { no_glob_cache = boolean, max_depth = number|nil }
+--- @return table|nil report { closure_modules, closure_jars, glob_jars,
+---   only_closure (闭包有 glob 无), only_glob_count, only_glob_sample, meta }
+function M.compare_module_vs_glob(aosp_root, seeds, opts)
+  local index, meta = M.module_deps_index(aosp_root, { no_cache = opts and opts.no_cache })
+  if not index then
+    return nil
+  end
+  local closure = M.module_closure(index, seeds, opts)
+  local cjars = M.closure_jars(index, closure, aosp_root)
+  -- fname = aosp_root: 现有收集按缓冲名解析树, 对比入口没有缓冲, 直接给树根
+  local glob = M.find_android_jars({ no_cache = opts and opts.no_glob_cache, fname = aosp_root })
+  local cset = {}
+  for _, j in ipairs(cjars) do
+    cset[j] = true
+  end
+  local only_closure = {}
+  for _, j in ipairs(cjars) do
+    if not vim.list_contains(glob, j) then
+      only_closure[#only_closure + 1] = j
+    end
+  end
+  local only_glob_count = 0
+  local only_glob_sample = {}
+  for _, j in ipairs(glob) do
+    if not cset[j] then
+      only_glob_count = only_glob_count + 1
+      if #only_glob_sample < 10 then
+        only_glob_sample[#only_glob_sample + 1] = j
+      end
+    end
+  end
+  local cm = {}
+  for name in pairs(closure) do
+    cm[#cm + 1] = name
+  end
+  table.sort(cm)
+  return {
+    closure_modules = cm,
+    closure_jars = cjars,
+    glob_jars = glob,
+    only_closure = only_closure,
+    only_glob_count = only_glob_count,
+    only_glob_sample = only_glob_sample,
+    meta = meta,
+  }
+end
+
+-- ===========================================================================
+-- [v18.16 P1] project 模式的闭包 jar 收集 (soong 模块图 × 现有分桶引擎)
+--
+-- 原理: 依赖闭包决定**收哪些模块的 jar**, jar 选择完全复用现有分桶引擎
+-- (process_soong_matches: android_common 变体优先 / turbine·combined 仅兜底 /
+-- exclude_jars·exclude_paths·exclude_globs 全部沿用) —— 与全树收集选出的 jar
+-- 同一套规则, 只是候选从"全树 2552 个"收窄到"闭包模块的产物"。
+-- 三轮对比的实证: 闭包模块的产物在 out/soong/.intermediates 下都有
+-- (596/596, 合并集 473 ≈ 全树 37%); JSON jars 字段额外补 prebuilts 预编译库
+-- (androidx 等, 不在 intermediates) —— 仅收磁盘存在且非 turbine 桩的。
+-- 任一步失败返回 nil + 原因, 调用方 (find_android_jars) fallback 全树收集。
+-- ===========================================================================
+
+-- 会话级 memo: [project_dir] = 闭包 jar 集 (同项目会话内稳定; 每个新 java 缓冲
+-- 的 configure 重入都会走到这里, BFS+glob ~200ms 不必重复)
+local _closure_cache = {}
+
+--- intermediates jar 路径 -> 模块名。**与 process_soong_matches 的解析规则保持
+--- 一致** (从右往左找变体分量, 其前一段即模块名, java_sdk_library 剥 .impl)。
+local function module_of_intermediates(path)
+  local comps = vim.split(path, "/", { plain = true })
+  for i = #comps - 1, 1, -1 do
+    if variant_rank(comps[i]) then
+      if i < 2 then
+        return nil
+      end
+      return comps[i - 1]:gsub("%.impl$", "")
+    end
+  end
+  return nil
+end
+
+-- 种子模块的类型白名单: 项目目录内真正"产出可依赖 jar"的库形态。
+-- android_test/java_test (CTS 等) 不是任何主模块的编译依赖, filegroup/genrule
+-- 无 jar 产物 —— 都不做种子 (它们的 jar 若真被依赖, 会经由依赖方进入闭包)。
+local PROJECT_SEED_TYPES = {
+  java_library = true,
+  java_sdk_library = true,
+  android_library = true,
+}
+
+--- 发现项目目录内的种子模块: index.path 以 project_dir (树相对) 为前缀且类型
+--- 在白名单内。ASfP 用显式 include 白名单, 这里自动推导 (项目目录即白名单)。
+local function project_seed_modules(index, project_dir_rel)
+  local seeds = {}
+  for name, m in pairs(index) do
+    if PROJECT_SEED_TYPES[m.type or ""] then
+      for _, p in ipairs(m.path or {}) do
+        if p == project_dir_rel or p:sub(1, #project_dir_rel + 1) == project_dir_rel .. "/" then
+          seeds[#seeds + 1] = name
+          break
+        end
+      end
+    end
+  end
+  return seeds
+end
+
+--- JSON jars 字段里的 prebuilts 补充: 闭包内模块声明的、不在 intermediates 的
+--- 预编译 jar (androidx 等), 磁盘存在且非 turbine 桩、过 exclude_jars 才收。
+local function add_prebuilt_jars(index, closure, aosp_root, jars, seen)
+  local java_cfg = get_cfg().java
+  for name in pairs(closure) do
+    local mod_ok = true
+    for _, pat in ipairs(java_cfg.exclude_jars or {}) do
+      if name:match(pat) then
+        mod_ok = false
+        break
+      end
+    end
+    if mod_ok then
+      for _, j in ipairs(index[name].jars or {}) do
+        -- intermediates 产物由分桶引擎负责, 这里只补树内 prebuilts 路径
+        if j:sub(-4) == ".jar" and not j:find("%.intermediates/", 1, true) then
+          local abs = (j:sub(1, 1) == "/") and j or (aosp_root .. "/" .. j)
+          local base = j:match("([^/]+)%.jar$") or ""
+          local ok_name = true
+          for _, pat in ipairs(java_cfg.exclude_jars or {}) do
+            if base:match(pat) then
+              ok_name = false
+              break
+            end
+          end
+          if
+            ok_name
+            and not j:find("turbine%-combined", 1, true)
+            and not seen[abs]
+            and vim.uv.fs_stat(abs)
+          then
+            seen[abs] = true
+            jars[#jars + 1] = abs
+          end
+        end
+      end
+    end
+  end
+end
+
+--- project 模式闭包 jar 收集主函数 (详见上方段落注释)。
+--- @param aosp_root string
+--- @param project_dir string 项目目录 (绝对路径, 须在 aosp_root 内)
+--- @param opts table|nil { index = table (测试注入, 跳过 JSON 读取), no_cache = boolean }
+--- @return table|nil jars 排序后的绝对路径列表
+--- @return table|nil meta { seeds, closure_n, reason (仅失败时) }
+function M.project_closure_jars(aosp_root, project_dir, opts)
+  opts = opts or {}
+  if not aosp_root or not project_dir or project_dir == "" then
+    return nil, { reason = "bad-args" }
+  end
+  if not opts.no_memo and _closure_cache[project_dir] then
+    return _closure_cache[project_dir], { origin = "soong-closure", memo = true }
+  end
+
+  local index = opts.index
+  if not index then
+    index = M.module_deps_index(aosp_root, { no_cache = opts.no_cache })
+    if not index then
+      return nil, { reason = "no-module-deps" }
+    end
+  end
+
+  local rel = project_dir:gsub("/+$", ""):sub(#aosp_root + 2)
+  if rel == "" then
+    return nil, { reason = "project-is-root" } -- aosp 根本身: 闭包不适用 (全树场景)
+  end
+  local seeds = project_seed_modules(index, rel)
+  if #seeds == 0 then
+    return nil, { reason = "no-seed-modules" }
+  end
+  local closure = M.module_closure(index, seeds, {})
+
+  -- 一次全量 intermediates glob (实测 2552 jar / 156ms), 过滤到闭包模块后
+  -- 交现有分桶引擎 —— 候选收窄, 选择规则零漂移
+  local all = vim.fn.glob(aosp_root .. "/out/soong/.intermediates/**/*.jar", false, true)
+  local filtered = {}
+  for _, p in ipairs(all) do
+    local mod = module_of_intermediates(p)
+    if mod and closure[mod] then
+      filtered[#filtered + 1] = p
+    end
+  end
+
+  local jars, seen = {}, {}
+  if #filtered > 0 then
+    process_soong_matches(aosp_root .. "/out/soong/.intermediates", filtered, jars, seen)
+  end
+  add_prebuilt_jars(index, closure, aosp_root, jars, seen)
+  if #jars == 0 then
+    return nil, { reason = "empty-closure-jars", seeds = seeds, closure_n = 0 }
+  end
+  sort_by_dir_priority(jars)
+
+  local meta = {
+    origin = "soong-closure",
+    seeds = seeds,
+    closure_n = 0,
+  }
+  for _ in pairs(closure) do
+    meta.closure_n = meta.closure_n + 1
+  end
+  if not opts.no_memo then
+    _closure_cache[project_dir] = jars
+  end
+  return jars, meta
+end
+
+--- 清除闭包会话 memo (:AospRescan 等刷新场景)。
+function M.reset_closure_cache()
+  _closure_cache = {}
+end
+
+--- 测试钩子: 种子发现 (与 workspace.workspace_dir / source_apply._classify 同惯例)
+M._project_seed_modules = project_seed_modules
 
 return M
