@@ -160,7 +160,8 @@ H.eq(#instances.foreign_jdtls(""), 0, "workspace_dir='' -> 空")
 --    注入 dir/cache_root/defer 走临时目录, 全程不碰真缓存、不真起 jdtls。
 -- ---------------------------------------------------------------------------
 local cache = vim.fn.tempname() .. "/jdtls"
-local wsdir = cache .. "/qssi/workspace"
+-- [v18.17] wsdir 由 expected_workspace_dir 派生 (命名已单射化, 不再是 <basename>/workspace)
+local wsdir = ui.expected_workspace_dir(tmp .. "/qssi", vim.fn.fnamemodify(cache, ":h"))
 mkdir(wsdir)
 
 -- 7a. 安全的注入路径: 缓存根之外的 dir 被拒 (防手滑闸仍生效)
@@ -253,6 +254,23 @@ H.eq(vim.fn.isdirectory(wsdir), 0, "clean_workspace: 目录已删 (虚拟 java �
 H.eq(fired_java, before_v + 1, "clean_workspace: 归属 wsdir 的 java 缓冲重放一次")
 
 vim.api.nvim_del_augroup_by_id(grp)
+
+-- ---------------------------------------------------------------------------
+-- [v18.17] 跨树同名项目: workspace 名单射化。google/aosp 与 qssi/aosp 的
+-- frameworks/base 的 basename 都是 "base" —— 旧命名 (<basename>/workspace) 下
+-- 两棵树撞同一个 -data (第二个被会话隔离, 前者退出后第三个复用别棵树的
+-- .metadata 静默串台)。单射键后必须不同, 且同根同项目稳定。
+-- ---------------------------------------------------------------------------
+do
+  local g = ui.expected_workspace_dir("/home/x/google/aosp/frameworks/base", "/tmp/ck")
+  local q = ui.expected_workspace_dir("/home/x/qssi/aosp/frameworks/base", "/tmp/ck")
+  H.check("跨树同名项目 (frameworks/base) 得到不同 workspace", g ~= q and g ~= nil)
+  H.check(
+    "同根同项目稳定",
+    g == ui.expected_workspace_dir("/home/x/google/aosp/frameworks/base", "/tmp/ck")
+  )
+end
+
 vim.fn.delete(tmp, "rf")
 vim.fn.delete(cache, "rf")
 H.finish("t_workspace")

@@ -61,7 +61,14 @@ function M.expected_workspace_dir(root, cache_base)
     return nil
   end
   local base = (cache_base and cache_base ~= "") and cache_base or vim.fn.stdpath("cache")
-  return base .. "/jdtls/" .. vim.fn.fnamemodify(root, ":t") .. "/workspace"
+  -- [v18.17] 名字用**单射键** (cache_key: '-'->'--', '/'->'-', 可逆可读), 不再用
+  -- basename。旧形态 <basename>/workspace 在**跨树同名项目**下撞键: google/aosp
+  -- 与 qssi/aosp 的 frameworks/base 的 basename 都是 "base" —— 第二个 nvim 被
+  -- 会话隔离到 base-nvim<pid> (撞名触发的意外隔离), 且前者退出后, 第三个会话会
+  -- **复用别棵树的 .metadata** (workspace 里 Eclipse 工程是绝对路径, 静默串台,
+  -- qssi 文件挂上 google 树的 jar)。单射键后每棵树的每个项目唯一。代价: 旧
+  -- workspace (Connectivity/ base/ aosp/ ...) 不再被引用, 各项目索引重建一次。
+  return base .. "/jdtls/" .. require("aosp-nav.util.path").cache_key(root) .. "/workspace"
 end
 
 --- jdt.ls 给 invisible project 起的名字:
