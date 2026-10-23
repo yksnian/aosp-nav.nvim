@@ -187,6 +187,98 @@ local _attach_tree_warned = {}
 --- 用户配置里算好的字符串) 没有重入时机, 单树设置不会踩 (任何 java 文件推的是同一个
 --- 根), 多树会话里这是唯一可靠的暴露点 —— 把静默错配变成一条可行动的告警。
 --- @param client table|nil
+--- 测试钩子: 单台热补 (mock client 断言 notify payload / config 同步)。
+
+--- [v18.17b] manifest 后台采集完成后的热补: 对该树上已起、且是用**降级集**
+--- (JSON jars + prebuilts) initialize 的 jdtls 台, 补发完整闭包的
+--- referencedLibraries (workspace/didChangeConfiguration —— v17 验证过的
+--- refLibs diff 通道: jdt.ls 按差异更新 classpath, 已是完整集的台 no-op)。
+--- 由 jars.lua 的 manifest 采集回调调用 (延迟 require 防循环依赖)。
+--- @param aosp_root string
+local _hotpatched = {} -- [client_id] = true (已补过; refLibs diff 本身 no-op, 这里省 notify)
+local function hotpatch_instance(client)
+  local rm = require("aosp-nav.java.root")
+  local jar_mod = require("aosp-nav.java.jars")
+  local rd = client.root_dir or (client.config and client.config.root_dir)
+  local aosp = rd and rm.aosp_root(rd) or nil
+  if not aosp or _hotpatched[client.id] then
+    return
+  end
+  -- manifest 未就绪 (后台采集中): 等 jars.lua 的 find 回调补 (双向守卫的另一半)
+  if not jar_mod.manifest_ready(aosp) then
+    return
+  end
+  local ok, jars = pcall(jar_mod.project_closure_jars, aosp, rd, {})
+  if not (ok and jars and #jars > 0) then
+    return
+  end
+  _hotpatched[client.id] = true
+  local cfg = client.config or {}
+  local settings = vim.tbl_deep_extend(
+    "force",
+    vim.deepcopy(cfg.settings or {}),
+    vim.deepcopy(cfg.init_options and cfg.init_options.settings or {})
+  )
+  settings.java = settings.java or {}
+  settings.java.project = settings.java.project or {}
+  settings.java.project.referencedLibraries = { include = vim.deepcopy(jars) }
+  -- 故意不带 sourcePaths 键 (见 source_apply.lua 函数头)
+  settings.java.project.sourcePaths = nil
+  client:notify("workspace/didChangeConfiguration", { settings = settings })
+  -- notify 不回写 client.config —— :Aosp 面板读 config.settings 会显示 initialize
+  -- 时的旧集 (71 vs 243 的误导)。这里同步本地表, 让面板反映实际生效值。
+  if cfg.settings and cfg.settings.java and cfg.settings.java.project then
+    cfg.settings.java.project.referencedLibraries = { include = vim.deepcopy(jars) }
+    cfg.settings.java.project.sourcePaths = nil
+  end
+  require("aosp-nav.util.log").user(
+    ("hotpatched refLibs into jdtls (%d jars) — full closure active for %s"):format(
+      #jars,
+      vim.fn.fnamemodify(rd, ":t")
+    ),
+    { id = "hotpatch:" .. rd, timeout = 8000 }
+  )
+  -- state 同步: configure 在降级窗口记的 jars=旧值已过时, 面板读 state ——
+  -- 热补追平后不更新的话面板永远显示旧值
+  pcall(function()
+    require("aosp-nav.state").set({ jars = #jars, cache_origin = "soong-closure" }, aosp)
+  end)
+end
+M._hotpatch_instance = hotpatch_instance
+
+local function _warming_done(aosp_root)
+  local j = require("aosp-nav.java.jars")
+  return not j.warming(aosp_root) and j.manifest_ready(aosp)
+end
+
+function M.hotpatch_reflibs(aosp_root, defer_retry)
+  for _, c in ipairs(vim.lsp.get_clients({ name = "jdtls" })) do
+    local rd = c.root_dir or (c.config and c.config.root_dir)
+    if rd and require("aosp-nav.java.root").aosp_root(rd) == aosp_root then
+      hotpatch_instance(c)
+    end
+  end
+  -- [v18.17b] 防御纵深: find 完成回调可能早于 jdtls attach (spawn 比 find 慢),
+  -- 此刻循环空转。延迟重试一次, 覆盖 "client 晚到" 的时序; hotpatch_instance
+  -- 幂等 (_hotpatched + refLibs diff no-op), 重复调用无害。
+  if defer_retry then
+    vim.defer_fn(function()
+      if _warming_done(aosp_root) then
+        M.hotpatch_reflibs(aosp_root)
+      end
+    end, 10000)
+  end
+  -- 成功可见化: 降级集 -> 完整集的追平是用户关心的状态变化, 弹一条一次性通知
+  if patched > 0 then
+    log.user(
+      ("hotpatched refLibs into %d jdtls instance(s) — full closure jars are now active"):format(
+        patched
+      ),
+      { id = "hotpatch:" .. aosp_root, timeout = 8000 }
+    )
+  end
+end
+
 function M.check_attach_tree(client)
   if not (client and client.name == "jdtls") then
     return
@@ -826,6 +918,14 @@ function M.configure(opts, ctx)
       -- [#2] 一致性自检: client 的树与组装基准树是否一致 (错配只在纯 nvim-jdtls
       -- 多树会话出现, 见函数注释)
       M.check_attach_tree(client)
+      -- [v18.17b] 双向守卫: manifest 就绪而该台还是降级集 (find 回调跑时 client
+      -- 尚未注册的竞态) → attach 时立即补。幂等 (refLibs diff no-op)。
+      pcall(function()
+        local cfgj = require("aosp-nav").config.java or {}
+        if (cfgj.mode or "aosp") == "project" then
+          hotpatch_instance(client)
+        end
+      end)
     end,
   })
 

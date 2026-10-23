@@ -258,8 +258,24 @@ function M.diagnose(basis, src_file)
     local s = c.config and c.config.settings or {}
     local rl = s.java and s.java.project and s.java.project.referencedLibraries
     local n_rl = type(rl) == "table" and #rl or 0
-    lines[#lines + 1] =
-      line("referencedLibraries", tostring(n_rl), n_rl > 0, action_if(n_rl > 0, ":AospRescan"))
+    -- [v18.17c] project 模式的后台采集链运行中: 0 是**设计内的临时态**
+    -- (jdt.ls 逐文件推断兜底, 链完成 didChangeConfiguration 热补), 不是故障 ——
+    -- 老语义的红警告 + ":AospRescan" 建议在此场景全是误导。
+    local warming = mode == "project"
+      and require("aosp-nav.java.jars").warming((function()
+        local rd0 = c.root_dir or (c.config and c.config.root_dir)
+        return rd0 and require("aosp-nav.java.root").aosp_root(rd0) or nil
+      end)())
+    if warming then
+      lines[#lines + 1] = line(
+        "referencedLibraries",
+        "collecting in background (jdt.ls infers per file; hotpatched when ready)",
+        true
+      )
+    else
+      lines[#lines + 1] =
+        line("referencedLibraries", tostring(n_rl), n_rl > 0, action_if(n_rl > 0, ":AospRescan"))
+    end
     -- sourcePaths: 按模式给不同的判据。
     --   aosp:    注入**开着** —— "未注入"是故障 (推断被关掉又没有替代)。
     --   project: 注入**开着** (v11 起注入本项目自己的根) —— 同样"未注入"是故障。
@@ -274,6 +290,12 @@ function M.diagnose(basis, src_file)
           or "not injected (jdt.ls infers per file)",
         sp_n == 0,
         sp_n > 0 and ("mode=" .. tostring(mode)) or nil
+      )
+    elseif warming then
+      lines[#lines + 1] = line(
+        "sourcePaths",
+        "not injected yet — jdt.ls infers per file until the background chain completes",
+        true
       )
     else
       -- aosp / project 都应当注入: aosp 注入核心集+累积, project 注入本项目自己的根

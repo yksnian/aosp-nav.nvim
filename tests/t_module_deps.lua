@@ -98,27 +98,53 @@ vim.fn.writefile({
   "{",
   '\t"A": {',
   '\t\t"module_type": "java_library",',
-  '\t\t"path": ["pkg/a"],',
-  '\t\t"srcs": ["pkg/a/A.java"],',
-  '\t\t"jars": [],',
-  '\t\t"dependencies": ["B"]',
+  '\t\t"path": [',
+  '\t\t\t"pkg/a"',
+  "\t\t],",
+  '\t\t"srcs": [',
+  '\t\t\t"pkg/a/A.java"',
+  "\t\t],",
+  '\t\t"jars": [',
+  "\t\t],",
+  '\t\t"dependencies": [',
+  '\t\t\t"B"',
+  "\t\t],",
   "\t},",
   '\t"B": {',
   '\t\t"module_type": "java_library",',
-  '\t\t"path": ["pkg/b"],',
-  '\t\t"srcs": [],',
-  '\t\t"jars": ["prebuilts/b.jar"],',
-  '\t\t"dependencies": ["UNKNOWN"]',
+  '\t\t"path": [',
+  '\t\t\t"pkg/b"',
+  "\t\t],",
+  '\t\t"srcs": [',
+  "\t\t],",
+  '\t\t"jars": [',
+  '\t\t\t"prebuilts/b.jar"',
+  "\t\t],",
+  '\t\t"dependencies": [',
+  '\t\t\t"UNKNOWN"',
+  "\t\t],",
   "\t},",
   '\t"T": {',
   '\t\t"module_type": "android_test",',
-  '\t\t"path": ["pkg/a/tests"],',
-  '\t\t"srcs": [],',
-  '\t\t"jars": [],',
-  '\t\t"dependencies": []',
+  '\t\t"path": [',
+  '\t\t\t"pkg/a/tests"',
+  "\t\t],",
+  '\t\t"srcs": [',
+  "\t\t],",
+  '\t\t"jars": [',
+  "\t\t],",
+  '\t\t"dependencies": [',
+  "\t\t],",
   "\t},",
   "}",
 }, AOSP .. "/out/soong/module_bp_java_deps.json")
+-- intermediates 清单 TSV (mtime 基准 = JSON 产物): [v18.17b] manifest 后台化后,
+-- 预写 TSV 让端到端走"完整闭包"路径 (无 TSV 时 manifest 返回 nil → 降级集)
+local json_mtime = vim.uv.fs_stat(AOSP .. "/out/soong/module_bp_java_deps.json").mtime.sec
+vim.fn.writefile(
+  { "# imj mtime=" .. json_mtime, IA },
+  TMP .. "/cache/" .. require("aosp-nav.util.path").cache_key(AOSP) .. ".intermediates-jars.tsv"
+)
 
 -- 种子发现: 类型白名单 + path 前缀 (T 是 android_test 不做种子)
 H.check(
@@ -179,5 +205,51 @@ H.check(
     return meta.reason == "project-is-root"
   end)()
 )
+
+-- ---------------------------------------------------------------------------
+-- [v18.17b] 热补: mock client + fixture 全链 → refLibs notify / config 同步 / 幂等
+-- ---------------------------------------------------------------------------
+do
+  local notifies = {}
+  local client = {
+    id = 987,
+    name = "jdtls",
+    root_dir = PROJ,
+    config = { settings = { java = { project = { referencedLibraries = {} } } } },
+  }
+  function client:notify(method, params)
+    notifies[#notifies + 1] = { method = method, params = params }
+  end
+  local javainit = require("aosp-nav.java.init")
+  local real_get = vim.lsp.get_clients
+  vim.lsp.get_clients = function(_)
+    return { client }
+  end
+  local rm = require("aosp-nav.java.root")
+  local aosp_dbg = rm.aosp_root(PROJ)
+  javainit._hotpatch_instance(client)
+  vim.lsp.get_clients = real_get
+
+  H.check(
+    "hotpatch: didChangeConfiguration 发出",
+    #notifies == 1 and notifies[1].method == "workspace/didChangeConfiguration"
+  )
+  local prj = notifies[1] and notifies[1].params.settings.java.project
+  print("DEBUG notifies=" .. vim.inspect(notifies))
+  H.check(
+    "hotpatch: refLibs = 闭包集 (IA javac + PB prebuilt, 2 个)",
+    prj and prj.referencedLibraries and #prj.referencedLibraries == 2
+  )
+  H.check("hotpatch: sourcePaths 键被删除", prj.sourcePaths == nil)
+  H.check(
+    "hotpatch: config 同步 (面板读这里)",
+    #client.config.settings.java.project.referencedLibraries == 2
+  )
+  -- 幂等: 二次调用 no-op (_hotpatched 去重, 不重发 notify)
+  local javainit = require("aosp-nav.java.init")
+  local n_before = #notifies
+  javainit._hotpatch_instance(client)
+  H.check("hotpatch: 幂等 (_hotpatched 去重, 不重发)", #notifies == n_before)
+end
 
 H.finish("t_module_deps")

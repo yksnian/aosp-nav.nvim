@@ -411,10 +411,17 @@ function M.find_android_jars(opts)
       and project_dir:sub(1, #android_root + 1) == android_root .. "/"
     then
       local cjars, cmeta = M.project_closure_jars(android_root, project_dir, {})
-      if cjars then
+      if cjars and #cjars > 0 then
         _jars_origin[android_root] = "soong-closure"
         _last_root = android_root
         return cjars, android_root
+      end
+      -- [v18.17c] 后台采集链在跑 (module-deps awk / manifest find): **不 fallback
+      -- 全树** —— 那会重新引入卡顿。返回空集 (jdt.ls 逐文件推断兜底), 链完成后
+      -- didChangeConfiguration 热补追平覆盖面。
+      if M.warming(android_root) then
+        _jars_origin[android_root] = "soong-closure"
+        return {}, android_root
       end
       log.debug(
         ("closure collection failed (%s), falling back to full scan"):format(
@@ -987,6 +994,8 @@ end
 -- 会话级 memo: [project_dir] = 闭包 jar 集 (同项目会话内稳定; 每个新 java 缓冲
 -- 的 configure 重入都会走到这里, BFS+glob ~200ms 不必重复)
 local _closure_cache = {}
+local _intermediates_manifest = {} -- [aosp_root] = intermediates 全量 jar 清单 (树级)
+local _warming = {} -- [aosp_root] = true (后台 find 采集中)
 
 --- intermediates jar 路径 -> 模块名。**与 process_soong_matches 的解析规则保持
 --- 一致** (从右往左找变体分量, 其前一段即模块名, java_sdk_library 剥 .impl)。
@@ -1069,6 +1078,138 @@ local function add_prebuilt_jars(index, closure, aosp_root, jars, seen)
   end
 end
 
+--- intermediates 的全量 jar 清单 (树级资产, 与项目无关):
+--- glob "**/*.jar" 递归 walk 几十万目录 —— page cache 热 156ms, 冷缓存 + jdtls
+--- 抢 CPU 时**秒级**, 而 picker/历史快速浏览会在每个新项目的首次 configure 撞上。
+--- 两层缓存: 会话 memo (每树一次) + 持久 TSV (mtime 基准 = soong 产物, 重新
+--- 分析即失效) —— 稳态 = readfile 毫秒级。
+--- @param aosp_root string
+--- @param artifact_mtime number|string|nil TSV 新鲜度基准 (soong 产物 mtime)
+--- @return table { [jar_abs_path] = true }
+local function intermediates_manifest(aosp_root, artifact_mtime)
+  if _intermediates_manifest[aosp_root] then
+    return _intermediates_manifest[aosp_root]
+  end
+  local cfg = get_cfg()
+  local tsv = cfg.cache_dir
+      and (cfg.cache_dir .. "/" .. require("aosp-nav.util.path").cache_key(aosp_root) .. ".intermediates-jars.tsv")
+    or nil
+  local paths = nil
+  if tsv and vim.fn.filereadable(tsv) == 1 then
+    local lines = vim.fn.readfile(tsv)
+    if (lines[1] or "") == "# imj mtime=" .. tostring(artifact_mtime) then
+      paths = {}
+      for i = 2, #lines do
+        if lines[i] ~= "" then
+          paths[lines[i]] = true
+        end
+      end
+    end
+  end
+  if not paths then
+    -- [v18.17b] TSV 未就绪: **后台 find 子进程采集**, 不冻结主循环 —— 工作站上
+    -- 这一步在慢 I/O 上是秒级~几十秒, 同步跑就是 picker 卡顿的来源。采集期间
+    -- 返回 nil, 调用方降级 (JSON jars 字段 + prebuilts 兜底, 不 fallback 到
+    -- 全树 glob 那条更卡的流程); 完成后落 TSV, 下次命中。
+    if not _warming[aosp_root] then
+      _warming[aosp_root] = true
+      vim.system(
+        { "find", aosp_root .. "/out/soong/.intermediates", "-name", "*.jar", "-type", "f" },
+        { text = true },
+        function(res)
+          vim.schedule(function()
+            local collected = {}
+            if res.code == 0 and res.stdout then
+              for p in res.stdout:gmatch("[^\n]+") do
+                if p ~= "" then
+                  collected[p] = true
+                end
+              end
+            end
+            if tsv then
+              local dump = { "# imj mtime=" .. tostring(artifact_mtime) }
+              for p in pairs(collected) do
+                dump[#dump + 1] = p
+              end
+              table.sort(dump)
+              pcall(vim.fn.writefile, dump, tsv)
+            end
+            _intermediates_manifest[aosp_root] = collected
+            _warming[aosp_root] = nil
+            -- [v18.17b] manifest 就绪: 对该树上用降级集起的 jdtls 台热补完整
+            -- refLibs (didChangeConfiguration, 已完整台 no-op)
+            pcall(function()
+              require("aosp-nav.java.init").hotpatch_reflibs(aosp_root, true)
+            end)
+          end)
+        end
+      )
+    end
+    return nil
+  end
+  _intermediates_manifest[aosp_root] = paths
+  return paths
+end
+
+local _warming_deps = {} -- [aosp_root] = true (module-deps 后台采集中)
+
+--- module-deps TSV 未就绪时的**后台采集链**: awk 子进程解析 JSON → 落 TSV →
+--- 触发 manifest 的后台 find → find 完成回调里闭包/持久/热补 (见
+--- intermediates_manifest 与 hotpatch_reflibs)。全程子进程, 主循环零阻塞。
+--- [v18.17c] 替代旧同步 awk —— 清缓存后首次 configure 卡 1.7s+ 的来源。
+local function warmup_module_deps_async(aosp_root)
+  if _warming_deps[aosp_root] then
+    return
+  end
+  local artifact = M.module_deps_artifact(aosp_root)
+  if not artifact then
+    return
+  end
+  _warming_deps[aosp_root] = true
+  vim.system({ "awk", MODULE_DEPS_AWK, artifact.path }, { text = true }, function(res)
+    vim.schedule(function()
+      _warming_deps[aosp_root] = nil
+      if (res.code ~= 0 and res.code ~= 1) or not res.stdout or res.stdout == "" then
+        return
+      end
+      local index = {}
+      for _, line in ipairs(vim.split(res.stdout, "\n", { plain = true })) do
+        local name, mtype, path, jars, deps = unpack(vim.split(line, "	", { plain = true }))
+        if name and name ~= "" then
+          index[name] = {
+            type = mtype or "",
+            path = path and vim.split(path, "|", { plain = true }) or {},
+            jars = jars and vim.split(jars, "|", { plain = true }) or {},
+            deps = deps and vim.split(deps, " ", { plain = true }) or {},
+          }
+        end
+      end
+      if not next(index) then
+        return
+      end
+      local cfg = get_cfg()
+      local tsv = cfg.cache_dir
+          and (cfg.cache_dir .. "/" .. require("aosp-nav.util.path").cache_key(aosp_root) .. ".module-deps.tsv")
+        or nil
+      if tsv then
+        local dump = { "# module-deps v1 mtime=" .. tostring(artifact.mtime) }
+        for name, m in pairs(index) do
+          dump[#dump + 1] = table.concat({
+            name,
+            m.type,
+            table.concat(m.path, "|"),
+            table.concat(m.jars, "|"),
+            table.concat(m.deps, " "),
+          }, "	")
+        end
+        pcall(vim.fn.writefile, dump, tsv)
+      end
+      -- manifest: 此调用会启动后台 find (未就绪时); find 回调里闭包+热补
+      intermediates_manifest(aosp_root, artifact.mtime)
+    end)
+  end)
+end
+
 --- project 模式闭包 jar 收集主函数 (详见上方段落注释)。
 --- @param aosp_root string
 --- @param project_dir string 项目目录 (绝对路径, 须在 aosp_root 内)
@@ -1084,10 +1225,46 @@ function M.project_closure_jars(aosp_root, project_dir, opts)
     return _closure_cache[project_dir], { origin = "soong-closure", memo = true }
   end
 
+  -- [v18.17b] 持久缓存: 闭包 jar 集 per (树, 项目), 失效基准 = soong 产物 mtime。
+  -- 命中 = readfile (~691 行) + 逐个 fs_stat 验证 (~10ms), **跳过 BFS/清单/分桶
+  -- 全链** —— 那条链是新项目首开"顿一下"的来源 (module-deps TSV 全量解析 +
+  -- 种子遍历 + manifest 读 + 分桶, ~100-200ms)。soong 重新分析 (产物 mtime 变)
+  -- 后自动失效重算; 产物被删的路径由 fs_stat 过滤, 全空则落回全量计算。
+  local cfg0 = get_cfg()
+  local artifact0 = M.module_deps_artifact(aosp_root)
+  local mt0 = artifact0 and artifact0.mtime or "none"
+  local pc = (cfg0.cache_dir and not opts.no_cache)
+      and (cfg0.cache_dir .. "/" .. require("aosp-nav.util.path").cache_key(aosp_root) .. "." .. require(
+        "aosp-nav.util.path"
+      ).cache_key(project_dir) .. ".closure-jars.txt")
+    or nil
+  if pc and vim.fn.filereadable(pc) == 1 then
+    local lines = vim.fn.readfile(pc)
+    if (lines[1] or "") == "# closure v1 mtime=" .. tostring(mt0) then
+      local jars = {}
+      local stat = vim.uv.fs_stat
+      for i = 2, #lines do
+        local p = lines[i]
+        if p ~= "" and stat(p) then
+          jars[#jars + 1] = p
+        end
+      end
+      if #jars > 0 then
+        _closure_cache[project_dir] = jars
+        return jars, { origin = "soong-closure", persisted = true }
+      end
+    end
+  end
+
   local index = opts.index
   if not index then
     index = M.module_deps_index(aosp_root, { no_cache = opts.no_cache })
     if not index then
+      -- [v18.17c] module-deps TSV 未就绪 (清缓存后首次): awk 同步跑会卡 1.7s+
+      -- (工作站更久)。改**后台采集链**: awk → TSV → manifest(find) → 闭包 →
+      -- 持久 → didChangeConfiguration 热补, 全程子进程不占主循环。本次 jdtls
+      -- 无 jar 启动 (jdt.ls 逐文件推断兜底), 链完成后热补追平覆盖面。
+      warmup_module_deps_async(aosp_root)
       return nil, { reason = "no-module-deps" }
     end
   end
@@ -1102,14 +1279,20 @@ function M.project_closure_jars(aosp_root, project_dir, opts)
   end
   local closure = M.module_closure(index, seeds, {})
 
-  -- 一次全量 intermediates glob (实测 2552 jar / 156ms), 过滤到闭包模块后
-  -- 交现有分桶引擎 —— 候选收窄, 选择规则零漂移
-  local all = vim.fn.glob(aosp_root .. "/out/soong/.intermediates/**/*.jar", false, true)
+  -- intermediates 清单走树级缓存 (memo + 持久 TSV), 过滤到闭包模块后交现有
+  -- 分桶引擎 —— 候选收窄, 选择规则零漂移。[v18.17b] TSV 未就绪时 manifest 为
+  -- nil (后台 find 采集中): 此刻**不冻结、不 fallback** —— 只用 JSON jars +
+  -- prebuilts 组一个降级集 (跳转部分可用), 且**不写持久/不 memo** (等清单就绪
+  -- 后重算完整版)。
+  local artifact = M.module_deps_artifact(aosp_root)
+  local manifest = intermediates_manifest(aosp_root, artifact and artifact.mtime or "none")
   local filtered = {}
-  for _, p in ipairs(all) do
-    local mod = module_of_intermediates(p)
-    if mod and closure[mod] then
-      filtered[#filtered + 1] = p
+  if manifest then
+    for p in pairs(manifest) do
+      local mod = module_of_intermediates(p)
+      if mod and closure[mod] then
+        filtered[#filtered + 1] = p
+      end
     end
   end
 
@@ -1118,7 +1301,7 @@ function M.project_closure_jars(aosp_root, project_dir, opts)
     process_soong_matches(aosp_root .. "/out/soong/.intermediates", filtered, jars, seen)
   end
   add_prebuilt_jars(index, closure, aosp_root, jars, seen)
-  if #jars == 0 then
+  if #jars == 0 and manifest ~= nil then
     return nil, { reason = "empty-closure-jars", seeds = seeds, closure_n = 0 }
   end
   sort_by_dir_priority(jars)
@@ -1127,12 +1310,23 @@ function M.project_closure_jars(aosp_root, project_dir, opts)
     origin = "soong-closure",
     seeds = seeds,
     closure_n = 0,
+    degraded = manifest == nil,
   }
   for _ in pairs(closure) do
     meta.closure_n = meta.closure_n + 1
   end
-  if not opts.no_memo then
-    _closure_cache[project_dir] = jars
+  -- 降级集 (后台采集中) 不持久、不 memo —— 完整清单就绪后下次 configure 重算
+  if manifest ~= nil then
+    if pc then
+      local dump = { "# closure v1 mtime=" .. tostring(mt0) }
+      for _, j in ipairs(jars) do
+        dump[#dump + 1] = j
+      end
+      pcall(vim.fn.writefile, dump, pc)
+    end
+    if not opts.no_memo then
+      _closure_cache[project_dir] = jars
+    end
   end
   return jars, meta
 end
@@ -1140,6 +1334,42 @@ end
 --- 清除闭包会话 memo (:AospRescan 等刷新场景)。
 function M.reset_closure_cache()
   _closure_cache = {}
+end
+
+--- manifest 是否已就绪 (内存 memo 非空, 或 TSV 命中)。[v18.17b] LspAttach 侧的
+--- 热补守卫用它判定"这台能不能补": 就绪才补, 未就绪等 find 回调补。
+--- @param aosp_root string
+--- @return boolean
+function M.manifest_ready(aosp_root)
+  if
+    aosp_root
+    and _intermediates_manifest[aosp_root]
+    and next(_intermediates_manifest[aosp_root])
+  then
+    return true
+  end
+  local artifact = aosp_root and M.module_deps_artifact(aosp_root) or nil
+  if not artifact then
+    return false
+  end
+  local cfg = get_cfg()
+  local tsv = cfg.cache_dir
+      and (cfg.cache_dir .. "/" .. require("aosp-nav.util.path").cache_key(aosp_root) .. ".intermediates-jars.tsv")
+    or nil
+  if tsv and vim.fn.filereadable(tsv) == 1 then
+    local head = (vim.fn.readfile(tsv, "", 1)[1] or "")
+    return head == "# imj mtime=" .. tostring(artifact.mtime)
+  end
+  return false
+end
+
+--- 后台采集链是否在跑 (module-deps awk 或 manifest find 任一)。[v18.17c]
+--- 面板用它把 "referencedLibraries=0 / sourcePaths 未注入" 从故障降级为
+--- "后台采集中" 的临时状态提示 (jdt.ls 逐文件推断兜底, 链完成热补)。
+--- @param aosp_root string
+--- @return boolean
+function M.warming(aosp_root)
+  return (aosp_root and (_warming_deps[aosp_root] or _warming[aosp_root])) == true
 end
 
 --- 测试钩子: 种子发现 (与 workspace.workspace_dir / source_apply._classify 同惯例)
