@@ -193,6 +193,25 @@ function M.check_attach_tree(client)
   end
   local rm = require("aosp-nav.java.root")
   local rd = client.root_dir or (client.config and client.config.root_dir)
+  -- [v18.16] project 模式跳过 aosp 语义的自检: 本函数查的 "state[树根].android_root"
+  -- 是 aosp 模式的组装记账 (state key = 树根); project 模式的组装 key 是 root_path
+  -- (项目目录, 或 root_dir 回退的 aosp 根), 两个口径不一致 —— 首台 attach 必误报
+  -- "assembled for another tree" (用户实测: kt 启动 -> 跳 java -> 误报, 且文案给的
+  -- 修复建议对 LazyVim 用户是错的)。project 模式下唯一值得提示的: root_dir 回退到了
+  -- aosp 根 (文件不在任何项目里, 起了全树台)。
+  if (require("aosp-nav").config.java or {}).mode == "project" then
+    if rd and rm.aosp_root(rd) == rd then
+      require("aosp-nav.util.log").info(
+        (
+          "jdtls rooted at the AOSP root: %s is outside any project, so this client "
+          .. "fell back to a full-tree workspace (project mode normally runs one "
+          .. "jdtls per project)."
+        ):format(rd),
+        { id = "pfulltree:" .. rd, timeout = 10000 }
+      )
+    end
+    return
+  end
   local key = rd and rm.aosp_root(rd) or nil
   if not key or _attach_tree_warned[key] then
     return

@@ -413,6 +413,14 @@ function M.scan(root)
   local out = vim.fn.systemlist(grep_cmd(root))
   -- grep 无匹配时退出码 1 (out 为 { "" } 之类的空表)
   if vim.v.shell_error ~= 0 and vim.v.shell_error ~= 1 then
+    -- [v18.17] 失败必须带诊断: 退出码 + 输出首行 (路径错误 / 参数不支持 /
+    -- 环境注入都只有靠它定位; 旧版 "grep unavailable?" 是瞎猜)
+    log.warn(
+      ("source-root grep failed (exit=%d, first-line=%s)"):format(
+        vim.v.shell_error,
+        (out[1] or ""):sub(1, 120)
+      )
+    )
     return nil, nil
   end
   if #out == 0 or (#out == 1 and out[1] == "") then
@@ -638,9 +646,13 @@ local function scan_cached(root, opts)
   end
   local list, stats = M.scan(root)
   if not list or #list == 0 then
+    -- [v18.17] 带 root: 无 .java 的项目 (纯 native/资源目录) 也会走到这,
+    -- 与真失败 (grep 报错) 需要区分得开
     log.warn(
-      "source-root scan failed (grep unavailable?); falling back to jdt.ls inference — "
+      (
+        "source-root scan empty/failed for %s; falling back to jdt.ls inference — "
         .. "cross-module jumps will land in jars"
+      ):format(root)
     )
     return nil
   end
