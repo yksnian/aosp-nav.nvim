@@ -217,4 +217,45 @@ H.eq(
 )
 H.check(m5 and m5:find("kill 200", 1, true) ~= nil, "报告: kill 行只给活着的那个")
 
+-- ---------------------------------------------------------------------------
+-- [v18.21] force_kill 的越界闸 —— 这是全仓**第二个**杀进程的地方 (另一个是 reap)。
+-- ---------------------------------------------------------------------------
+-- 为什么单独钉这条: force_kill 复用 jdtls_pid 定位进程, 而 jdtls_pid 末尾是
+--   `cands = #mine > 0 and mine or all`
+-- —— 没有"本进程后代"时它**故意**退回"所有持有该 -data 的 JVM"。对 :AospDebug
+-- (只读观察) 那是对的, 对**杀进程**则是越界。实测确认过: 在本进程里对用户那台活着的
+-- jdtls 调 jdtls_pid 会返回它的 pid。所以 force_kill 必须自己重查一次后代关系。
+-- 这里用**真实 /proc** (不注入): 断言的是"拿一个不由本进程拉起的目标, 它不杀"。
+do
+  local dead = "/tmp/aospnav-not-held-" .. vim.fn.getpid()
+  local c = { config = { cmd = { "jdtls", "-data", dead } } }
+  H.eq(ui.force_kill(c), nil, "force_kill: -data 没人持有 -> 不杀 (nil)")
+  H.eq(
+    ui.force_kill({ config = { cmd = { "jdtls" } } }),
+    nil,
+    "force_kill: cmd 里没有 -data -> 不杀 (nil)"
+  )
+  H.check(pcall(ui.force_kill, nil), "force_kill: nil client 不抛异常")
+  -- 真树里那台**别的 nvim** 拉起的 jdtls: 本进程不是它的祖先, 绝不能杀。
+  -- 注意不能拿 glob 的**第一个**目录就断言 —— glob 是字典序, 第一个往往**没有**活
+  -- JVM (实测 Connectivity 那个就是空的), 于是 jdtls_pid 返回 nil, 断言"碰巧"通过,
+  -- 守卫删掉也不会红 (踩过)。必须挑一个**真的有 JVM 持有**的 dir。
+  -- 找不到就跳过: 这条只在用户真开着 jdtls 时有意义, 不能因此判失败。
+  local target
+  for _, d in ipairs(vim.fn.glob(vim.fn.expand("~/.cache/nvim/jdtls") .. "/*/workspace", false, true)) do
+    local c = { config = { cmd = { "jdtls", "-data", d } } }
+    if ui.jdtls_pid(c) then
+      target = c
+      break
+    end
+  end
+  if target then
+    -- 前置条件: jdtls_pid 确实看得见它 (证明后面 nil 是**守卫**拦下的, 不是"没找到")
+    H.check(ui.jdtls_pid(target) ~= nil, "force_kill 前置: 该 dir 确有活 JVM 被 jdtls_pid 看见")
+    H.eq(ui.force_kill(target), nil, "force_kill: 非本进程后代 (别的 nvim 的 jdtls) -> 拒绝杀 (越界闸)")
+  else
+    io.write("SKIP: no live jdtls to test the cross-process guard\n")
+  end
+end
+
 H.finish("instances")

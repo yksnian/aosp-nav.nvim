@@ -1171,6 +1171,9 @@ function M.clean_workspace(opts)
   end
   table.sort(replay)
   local clients = vim.lsp.get_clients({ name = "jdtls" })
+  -- [v18.21] 圈出 `-data` 命中 dir 的那几台, 先请它们优雅退出, 随后 SIGKILL 兜底
+  -- (见下面的 doomed 循环) —— 不这样做, 目录会在还活着的 JVM 脚下被删。
+  local doomed = {}
   for _, c in ipairs(clients) do
     local cmd = type(c.config) == "table" and c.config.cmd or nil
     local cdata = nil
@@ -1183,9 +1186,32 @@ function M.clean_workspace(opts)
       end
     end
     if cdata and norm(cdata) == tdir then
+      doomed[#doomed + 1] = c
       pcall(function()
         vim.lsp.stop_client(c.id, true)
       end)
+    end
+  end
+
+  -- [v18.21] **别让目录在还活着的 JVM 脚下消失。**
+  -- 缺陷 (2026-10-23 实测日志): stop_client 是异步的, 旧代码只 `defer_fn(..., 800)`
+  -- 死等 800ms 就删 —— 一台 4.2GB、跑了 27 分钟的 JVM 优雅退出远超 800ms, 于是
+  -- 目录在它脚下消失, 它继续按 DelayedSnapshotJob 往不存在的路径写盘:
+  --     Could not save master table to '.../Wifi_e774a2a/workspace/.metadata/...'
+  --     (No such file or directory)
+  -- 并在 4.5 分钟后仍在跑 DocumentHighlight 抛 "Missing system library"。
+  --
+  -- 修法: stop_client 之后直接 SIGKILL 兜底。这一操作**本来就是删索引**, 优雅退出
+  -- 唯一做的事就是"把索引落盘一次", 而那份索引下一秒就被删了 —— 等它零收益, 只是
+  -- 把命令从秒级拖到十秒级。**也不用 vim.wait**: 那正是 2026-10-16 修掉的主线程阻塞;
+  -- 固定睡眠更是两头不讨好 (既挡不住又白慢)。
+  -- 安全边界全在 instances.force_kill 里 (必须是本 nvim 后代 + -data 命中 + exe 是
+  -- java), 只碰我们自己拉起的这一台。
+  local instances = require("aosp-nav.java.instances")
+  for _, c in ipairs(doomed) do
+    local pid = instances.force_kill(c)
+    if pid then
+      log.debug(("SIGKILLed jdtls pid %s before removing its workspace"):format(pid))
     end
   end
 
@@ -1250,7 +1276,11 @@ function M.clean_workspace(opts)
   if opts.defer == false then
     after_delete() -- 测试注入: 同步执行, 不排 libuv 定时器
   else
-    vim.defer_fn(after_delete, clients[1] and 800 or 0)
+    -- [v18.21] 原来这里等 800ms —— 那是**固定睡眠、不是检查**, 既挡不住"JVM 还没
+    -- 退" (实测它 4.5 分钟后还在写盘), 又白拖慢 800ms。现在上面已 SIGKILL 并同步
+    -- 确认, 目录可以立刻删; 排一个 0ms 的 defer 只为保持"删除发生在命令返回之后"
+    -- 这一既有语义 (与测试注入的 defer=false 区分)。
+    vim.defer_fn(after_delete, 0)
   end
 end
 

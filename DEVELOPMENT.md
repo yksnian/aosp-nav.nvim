@@ -2385,6 +2385,64 @@ Buildship 的 gradle-wrapper 校验告警) —— 禁用 gradle 必须进 `initi
 
 ---
 
+### 2.18.1 `:AospCleanWorkspace` 删目录时 JVM 还活着 → 它继续往不存在的路径写盘 (2026-10-23)
+
+**症状 (用户反馈)**: Wifi 项目 CleanWorkspace 卡很久; 之后再次进入该项目报
+`Couldn't retrieve source path settings. Can't set 'path' (err=Path must include project
+and resource name: /Wifi_e774a2a)`, 且项目持续刷 `Missing system library` (实测 76 次)。
+
+**取证 (jdt.ls 自己的 .metadata/.log, Wifi_e774a2a)**:
+
+```
+!ENTRY org.eclipse.core.resources 4 566
+!MESSAGE Could not save master table to
+  '.../Wifi_e774a2a/workspace/.metadata/.plugins/.../.safetable/org.eclipse.core.resources'
+java.io.FileNotFoundException: ... (No such file or directory)
+  at SaveManager.saveMasterTable -> DelayedSnapshotJob.run
+```
+
+jdt.ls 的定期快照找不到自己的工作区 —— **目录在它脚下被删了**。那条 `Missing system
+library` 是同一件事的下游 (工程被抽走 → 没有 classpath → `DocumentHighlightHandler`
+每次都抛)。而 `Path must include project and resource name: /Wifi_e774a2a` 来自
+**nvim-jdtls**, 不是本插件 (它 `setup.lua` 里那条
+"Couldn't retrieve source path settings" 逐字对应; 堆栈全在 nvim-jdtls / jdt.ls 内部)。
+
+**根因 (本插件的缺陷)**: `clean_workspace` 的顺序是
+
+```lua
+vim.lsp.stop_client(c.id, true)          -- **异步**: 发完请求立刻返回
+...
+vim.defer_fn(after_delete, clients[1] and 800 or 0)   -- 死等 800ms
+-- after_delete 里 vim.fn.delete(dir, "rf")
+```
+
+`stop_client` 是异步的, 而 800ms 是**固定睡眠、不是检查**。一台 4.2 GB、已跑 27 分钟的
+JVM 优雅退出 (Eclipse save hook) 远超 800ms —— 实测它在目录删除后 **4.5 分钟**仍在尝试
+写盘。对比: `session_conflict.cleanup` 与 `instances.reap_orphan_jdtls` 都**有**等退出
+的步骤, 唯独这里没有。
+
+**修法: 直接 SIGKILL, 不等** (`instances.force_kill`)。理由是这一操作**本来就是删索引**:
+优雅退出唯一做的事就是"把索引落盘一次", 而那份索引下一秒就被删 —— 等它零收益, 只是把
+命令从秒级拖到十秒级。**也不引入等待**: 上一轮刚把 `vim.wait(3000)` 改成非阻塞轮询
+(§2.16), 再塞一个同步等待是开倒车; 而固定睡眠 (旧 800ms) 既挡不住又白慢, 是两头不讨好。
+
+**安全闸 (三条同时成立才杀, 全部在 force_kill 内)**:
+1. 必须是**本 nvim 的后代**;
+2. `-data` 等于目标 dir;
+3. exe 指向 java。
+
+> **踩过的坑 (必须记住)**: `force_kill` 复用 `jdtls_pid` 定位进程, 而后者末尾是
+> `cands = #mine > 0 and mine or all` —— 没有"本进程后代"时它**故意**退回"所有持有该
+> `-data` 的 JVM"。对 `:AospDebug` (只读观察) 那是对的 ("看到别人的总比看不到好"),
+> 对**杀进程**则是越界。实测确认: 在本进程里对用户那台活着的 jdtls 调 `jdtls_pid`
+> **会返回它的 pid**。所以 `force_kill` 里**另外**重查了一次 `is_descendant`, **不能**
+> 直接信 `jdtls_pid` 的结果。
+>
+> 测试也踩了两个坑: (a) 断言写成了 `H.check("文字", 条件)` (见 §10.0), 空跑;
+> (b) 用 `glob` 的**第一个**目录当靶子 —— glob 是字典序, 第一个 (Connectivity) 往往
+> **没有**活 JVM, 于是 `jdtls_pid` 返回 nil, 断言"碰巧"通过, **守卫删掉也不会红**。
+> 现在改成"先挑一个 jdtls_pid 真能看见的 dir", 并加一条前置断言钉死这一点。
+
 ## 10. 测试
 
 ### 10.0 写测试第一条: `H.check(cond, msg)` —— 参数序反了就是**静默空跑**
@@ -2436,7 +2494,7 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_multi_tree.lua` | 29 | **两棵树共用一个 nvim 会话** (§2.15): 假树造 A/B 两棵树, 零 LSP。两棵树各自推断出正确的根与项目 / 会话切到 B 后**不继承** A 的项目 (旧实现会) / 同一会话里 A·B 同时活动时 `union` 互不污染 / `state(A)` ≠ `state(B)` / 两棵树各有自己的顺序文件且内容不交叉 / `reset(A)` 不动 B / `client(fname)` 按 buffer 的 client 选 (旧实现取 `get_clients()[1]`) / `_is_applied` 按树分开 |
 | `t_path.lua` | 14 | `util/path.start_dir`: `nil`/`""` 归一成 cwd, 绝不能给 `"."` (§7 痛点 4 的根因) |
 | `t_follow.lua` | 21 | `java/workspace_follow.lua` (§2.17): `target()` 只认"树内 + 找得到项目标记"的文件 (树内无标记、树外、`""`、`nil` 一律 nil → 不动, 宁可保持当前工作区) 且第二个返回值是 AOSP 根 / 无 client 不插手 (第一台的根归 `root.lua`) / **已在目标项目之内 → 一次字符串比较后静默返回**, 子目录也算之内 / 跨项目 → 发**恰好一条** `didChangeWorkspaceFolders` 且 `added` 指向新项目 (name 是相对 AOSP 根的路径)、`removed` 是旧根 / **`mode` 为 `aosp`·`infer` 时一条都不发** / 树外文件有 client 也不把工作区搬出 AOSP 树。全部注入假 client + 临时目录, 零 LSP |
-| `t_instances.lua` | 39 | jdtls 实例自检 (§2.16), 全部走**注入的假 /proc** (不碰真进程): 盘点只认真 jdtls (命令行里只**含**那个 jar 名的 `grep`、以及 `-jar` 指向别的 jar 的 java 都不算) / 归属判定 (有主 → `owner_pid`; ppid 链到 init → `orphan`) / `ours` 按 `/proc` 缓存根前缀判 / `jdtls_holders`·`foreign_jdtls` 的旧契约 (含 nil·空串·尾斜杠归一) / **回收的两条安全闸** (孤儿+ours 才杀; 有主的、`-data` 在别处的、`enabled=false` 时都不动, 且连 `kill` 都不调) / 默认 killer 对已消失 pid **静默失败** (libuv 的 kill 失败不抛错而是返回 nil, err) / 报告文本: 无事可做时返回 `nil`、有主的重复给 `kill` 行、孤儿已自动回收**不单独通知**、全孤儿时不说"去关 nvim"、**已回收的 pid 不得在 holders 段里再出现一次** (holders 是回收**之前**那份盘点, 不按 pid 扣掉就会"列两遍 + 让你杀一个死 pid"; 这条是 configure 端到端跑出来的回归) / **`-data` 在别处的 jdtls 一律不冒头** (§2.16 把那整段报告删了): `foreign_jdtls` 只收 `data == ws_dir` 的, 别人的 JVM 结构性进不来 |
+| `t_instances.lua` | 44 | jdtls 实例自检 (§2.16), 全部走**注入的假 /proc** (不碰真进程): 盘点只认真 jdtls (命令行里只**含**那个 jar 名的 `grep`、以及 `-jar` 指向别的 jar 的 java 都不算) / 归属判定 (有主 → `owner_pid`; ppid 链到 init → `orphan`) / `ours` 按 `/proc` 缓存根前缀判 / `jdtls_holders`·`foreign_jdtls` 的旧契约 (含 nil·空串·尾斜杠归一) / **回收的两条安全闸** (孤儿+ours 才杀; 有主的、`-data` 在别处的、`enabled=false` 时都不动, 且连 `kill` 都不调) / 默认 killer 对已消失 pid **静默失败** (libuv 的 kill 失败不抛错而是返回 nil, err) / 报告文本: 无事可做时返回 `nil`、有主的重复给 `kill` 行、孤儿已自动回收**不单独通知**、全孤儿时不说"去关 nvim"、**已回收的 pid 不得在 holders 段里再出现一次** (holders 是回收**之前**那份盘点, 不按 pid 扣掉就会"列两遍 + 让你杀一个死 pid"; 这条是 configure 端到端跑出来的回归) / **`-data` 在别处的 jdtls 一律不冒头** (§2.16 把那整段报告删了): `foreign_jdtls` 只收 `data == ws_dir` 的, 别人的 JVM 结构性进不来 / **`force_kill` 的越界闸 (§2.18.1)**: `-data` 无人持有 -> 不杀 / cmd 无 `-data` -> 不杀 / nil client 不抛 / **非本进程后代 (别的 nvim 的 jdtls) -> 拒绝杀** (守卫删掉即变红) |
 | `t_proc.lua` | 19 | `util/proc`: `/proc/<pid>/cmdline` 必须**真的按 NUL 切开参数** (回归"一个 nvim 报 2 个 jdtls 实例") / `is_descendant` 自反与否定 / `comm` 认出 `nvim` (归属判定的地基) / `ancestor_named` 用注入的 reader 造链: 命中 nvim / 走到 init → 孤儿 / 起点自己命中 / comm 读不到 / 成环有上限兜底 / 超过 `limit` |
 | `t_root_from_cwd.lua` | 20 | 痛点 4 的**端到端**回归: 起在 AOSP 根、不打开任何 `.java` 文件时 `aosp_root(nil/"")` 仍拿到树根 (真树断言部分需 `AOSPNAV_LIVE_TEST=1`) |
 | `t_phase.lua` | 19 | `phase` 是活状态的冻结契约: `ui.statusline()` 对 `idle`/`ready`/`indexing`/`no-out`/`failed` 五态各自的渲染 (`indexing` 必须带 `(idx)`) / `install_phase_handler` **链式**调用原有 handler (不吞掉 nvim-jdtls 的 status 消息) / 只有 `ServiceReady` 翻牌, 其余 `ServiceStatus` 不动 / `no-out`/`failed` 不被覆盖 / `err` 非空不翻牌 / 非 jdtls client 不包装 |
@@ -2445,9 +2503,9 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_root_fallback.lua` | 30 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 / **内存闸 (§2.13.1)**: 可用内存 < 4 GB 时退回已有台, 且发出的**必须是 warn** (默认档可见; 降回 info 则测试变红)、同项目 `once` 去重、内存恢复后照旧起新台 (闸不粘) |
 | `t_workspace.lua` | 42 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 / **`clean_workspace` 删完自动重启** (§2.18): 缓存根之外的 dir 被拒 / 非 java 缓冲只删不重启 / java 缓冲删完重放一次 `FileType` (自动重启) / **命令后窗口切走: 目录仍被删且当前缓冲跑完被还原** (`start_or_attach` 读的是 `nvim_get_current_buf()`, 不摆好窗口就重放不出来 = "清完没重启") / `buftype~=''` 的 java 缓冲不重启 (挡 §2.13 的第二台 jdtls) —— 注入 `dir`/`cache_root`/`defer=false`, 临时目录, 零 LSP | 
 
-合计 **581** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
-`t_jvm` 127 / `t_root_from_cwd` 13 / `t_source_apply` 25 / `t_conflict` 37, 共 **570**)。
-2026-10-23 本机实测默认 **570** / live **581**, 17 个套件 (差值是各套真机块按"真树齐备
+合计 **584** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
+`t_jvm` 127 / `t_root_from_cwd` 13 / `t_source_apply` 25 / `t_conflict` 37, 共 **573**)。
+2026-10-23 本机实测默认 **573** / live **584**, 17 个套件 (差值是各套真机块按"真树齐备
 + 真 jdtls 在跑"的有无整段 SKIP, 非不变量)。
 
 > **[2026-10-15] 真树块两条夹具缺陷已修** (两条都是**夹具**问题, 产品代码无缺陷):
@@ -2465,7 +2523,7 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 
 > 只有 `t_jvm` (127/127)、`t_root_from_cwd` (20/13)、`t_source_apply` (30/25) 和
 > `t_conflict` (41/37) 四个套件的条数**随环境而变** (真树块整段 SKIP 时不计数),
-> 所以 581/570 是当前环境的实测值而非不变量; 其余 13 个套件两种跑法条数相同。
+> 所以 584/573 是当前环境的实测值而非不变量; 其余 13 个套件两种跑法条数相同。
 > 特别注意 `t_jvm` 的真机块: 它要**真有 jdtls 在跑**才算数, 只设 `AOSPNAV_LIVE_TEST=1`
 > 是不够的 (本机 2026-10-10 就出现过"采样时在跑、跑测试时已退出"→ 静默少几条;
 > 2026-10-12 记 §2.10.1 那件事之后 jdtls 被 OOM 杀掉没在跑, 真机块整段 SKIP)。

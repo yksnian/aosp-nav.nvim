@@ -226,6 +226,53 @@ function M.reap_orphan_jdtls(records, opts)
   return out
 end
 
+--- [v18.21] 强杀**本 nvim 自己拉起的**、`-data` 命中 dir 的 jdtls。
+---
+--- 为什么需要 (2026-10-23 实测的缺陷): :AospCleanWorkspace 的顺序是
+--- `stop_client(id, true)` -> 死等 800ms -> `delete(dir, "rf")`。stop_client 是
+--- **异步**的, 800ms 又是固定睡眠而非检查, 于是 JVM 常常还活着目录就没了。实测日志:
+---
+---     !ENTRY org.eclipse.core.resources 4 566
+---     Could not save master table to '.../Wifi_e774a2a/workspace/.metadata/...'
+---     (No such file or directory)
+---
+--- 那台 JVM 在目录删除**4.5 分钟后**还在尝试写盘, 并继续跑 DocumentHighlight 抛
+--- "Missing system library" (它脚下的工程已被抽走)。
+---
+--- 为什么用 SIGKILL 而非等它优雅退出: 这**本来就是删索引**的操作 —— 优雅退出唯一
+--- 做的事就是"把索引落盘一次", 而那份索引下一秒就被删了。等它毫无收益, 只是把
+--- 命令完成时间从秒级拖到十秒级。也用不起 `vim.wait` (那正是 2026-10-16 修掉的
+--- 主线程阻塞)。
+---
+--- 安全边界 (三条同时成立才杀):
+---   1. 进程是**本 nvim 的后代** (is_descendant) —— 绝不碰别的 nvim/编辑器的 jdtls;
+---   2. 它的 `-data` **等于** dir (调用方已按 client.config.cmd 圈定);
+---   3. exe 指向 java (jdtls_pid 内部优先挑, 排除 python 包装残留)。
+--- @param client table
+--- @return string|nil pid 已发 SIGKILL 的 pid
+function M.force_kill(client)
+  local pid = M.jdtls_pid(client)
+  if not pid then
+    return nil
+  end
+  -- !! 自己再确认一遍"是本进程后代" !!
+  -- jdtls_pid 末尾是 `cands = #mine > 0 and mine or all` —— 没有后代时它**故意**
+  -- 退回"所有持有该 -data 的 JVM", 那对 :AospDebug (只读观察) 是对的 ("看到别人的
+  -- 总比什么都看不到好"), 对**杀进程**则是越界。实测: 在本进程里对用户那台活着的
+  -- jdtls 调 jdtls_pid, 它照样返回了那个 pid。
+  -- 所以这里不复用那个宽松口径, 自己把第 1 条边界重新校验一遍。
+  if not require("aosp-nav.util.proc").is_descendant(pid, vim.fn.getpid()) then
+    return nil
+  end
+  -- 与 reap 同款: libuv 的 kill 失败不抛错而是返回 nil, err —— 必须看返回值,
+  -- 否则"没杀成"会被当成杀成了。
+  local ok, res = pcall(vim.uv.kill, tonumber(pid), "sigkill")
+  if ok and res ~= nil then
+    return pid
+  end
+  return nil
+end
+
 --- "jdtls 实例"自检的报告文本 (纯函数, 便于测试)。无事可做时返回 nil ——
 --- **自动回收掉的孤儿不单独通知** (插件能自动做掉的事就自动做掉, 见 DEVELOPMENT
 --- §2.10), 它的痕迹只进日志; 只有还剩"该由用户拍板"的东西时才开口。
