@@ -1531,6 +1531,55 @@ if j:sub(-4) == ".jar" and not j:find("%.intermediates/", 1, true) then
 进闭包), 它的 JSON `jars` 指向 intermediates 且命中 `exclude_globs` —— 双重钉死。
 **已验证是真闸**: 把守卫改回 `"%.intermediates/"` → 报红并打印泄漏的 jar 路径。
 
+### 2.19.2 `exclude_merge` 不得清空 `import_exclusions` (2026-10-26)
+
+**症状**: 用户配了 `exclude_merge = "replace"` (只为自己接管 `exclude_jars` /
+`exclude_globs`), 结果 `frameworks/base` 下 12 个残留 `.project` 全部漏过, 不可见工程
+建不出来, 跳转全废 —— 与 §2.19.1 的表象一样, 根因不同。
+
+**根因**: `effective()` 开头原本有一句
+
+```lua
+if java_cfg.exclude_merge == "replace" then
+  return vim.deepcopy(user)      -- 只回用户项; 用户没配 import_exclusions ⇒ 0 条
+end
+```
+
+`import_exclusions` 与 `exclude_jars`/`paths`/`globs` 归在同一个 `exclude_merge` 下, 但
+**两者性质不同**: 后者是**用户对全树 jar 的选择策略** (`replace` = "我的规则我说了算",
+丢掉默认正是他要的); 前者是**插件自己扫出来的**"残留 `.project` 会让整棵树建不出不可见
+工程"清单 + jdt.ls 自带的 6 条默认 —— 用户通常压根不知道它存在, 却被 `replace` 连带清空。
+
+**修法**: `import_exclusions` **恒定** = 6 条默认 + 扫描结果 + 用户追加项, 不看
+`exclude_merge`。用户想排掉某条默认, 用 jdt.ls 原生的 `"!"` 前缀反向放行
+(见 `BasicFileDetector.isExcluded`)。
+
+**定位手法 (值得复用)**: 加两条 `log.warn` 探针 —— 一条打在 `effective()` 之后
+(`exclusions=%d aosp_root=%s is_android=%s`), 一条打在三处 `opts` 注入之后。用户实跑后
+两条都是 **0**, 而 `is_android=true` 且缓存里明明有 15 条 —— 一步就把范围从"送没送到"
+缩到"算出来就是 0"。**别再靠读代码猜**, 探针一次就定位。
+
+**回归测试**: `t_exclusions.lua` 里 `replace` 那组从"只留用户项"改成"三项都在"
+(默认 / 扫描 / 用户)。**已验证是真闸**: 把短路加回去 → 25 条里红 4 条。
+
+### 2.19.3 `cmd` 里 JVM 参数"重复两遍"是正常的, 别当 bug 修 (2026-10-26)
+
+**现象**: `pgrep -a java` 看到 `-Xms1G` / `--add-modules` / `--add-opens` 各出现两次,
+容易怀疑配置被合并了两遍。
+
+**真相**: 是 jdtls 启动器 (`mason/packages/jdtls/bin/jdtls.py`) 的**正常设计** ——
+
+```python
+exec_args = [ ...它自己的固定默认, 含 -Xms1G / --add-modules / --add-opens ×2... ] \
+          + known_args.jvm_arg \      # ← 用户的 --jvm-arg=... 追加在这里
+          + ["-jar", jar_path, "-data", ...]
+```
+
+JVM 对重复参数取**后者**, 所以生效的是用户的值, 行为正确。**不是** LazyVim 的
+`attach_jdtls()` 双调用造成的 (那次双调用确实存在 —— 它直接调一次 + 注册在 `FileType`,
+注释里写明是 "Avoid race condition" 的刻意设计 —— 但它只影响 `configure` 被多跑几次,
+而 `configure` 对同一 `opts` 是幂等的, 实测连续 6 次调用 `exclusions` 恒为 21)。
+
 ## 3. 导航模式
 
 **对用户只宣传两种体验** (v11 降级后), 由单个键 `java.mode` 表达:

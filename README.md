@@ -250,42 +250,47 @@ reflects the tree of the **current buffer**.
 
 ## Options
 
-| Option                            | Default                                                      | Description                                                  |
-| --------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| android_root                      | nil                                                          | nil = auto-detect, or an explicit AOSP root path             |
-| sibling_projects                  | {soc/qcom/qssi, google/aosp}                                 | Vendor sub-project layout: when the opened file's ancestors have no `out/`, look for these sibling projects' `out/` under the closest top-level root (shared by root detection and the KLS classpath script) |
-| cache_dir                         | ~/.cache/nvim/aosp_nav                                       | jar list cache directory                                     |
-| log_level                         | warn                                                         | Message threshold (`debug`/`info`/`warn`/`error`/`off`); everything below is dropped silently. See [Messages and notifications](#messages-and-notifications) |
-| java.enabled                      | true                                                         | Enable the java sub-module                                   |
-| java.jar_fallback_dir             | ~/.usr/android_jars                                          | Fallback jar directory when no build outputs exist           |
-| java.soong_tag_priority           | {combined, turbine-combined, turbine}                        | Order within the fallback bucket; javac/kotlinc belong to the own-source bucket and are always kept |
-| java.exclude_jars | {R.jar, stubs.jar, lint.jar, dex.jar, srcjarsN.jar, kapt-*.jar, stubs, *-stub, jrt-fs.jar, *-headers} | Exclusion rules (Lua patterns) matched against both jar and module names |
-| java.exclude_globs | {^prebuilts/sdk/sdk_} | Lua-pattern exclusions on the path relative to .intermediates/. By default drops the prebuilt module-SDK stubs; user entries are appended to the defaults (see exclude_merge). Anchor with ^ for top-level precision, e.g. { "^external/cronet/" } |
-| java.exclude_paths | {linux_glibc_common, development/} | Excluded path keywords (substring match); do NOT add android_common_apex (it would drop apex-only modules such as core-oj) |
-| java.exclude_merge | append | Merge semantics for the exclusion lists (exclude_jars/paths/globs/import_exclusions): append = user entries are added after defaults; replace = defaults are discarded |
-| java.make_jar_priority            | {classes.jar, classes-header.jar, javalib.jar}               | Make build system jar priority — **make/fallback scan only** (ignored when the soong closure is used) |
-| java.make_blacklist               | {android_stubs_current_intermediates}                        | Make build excluded directories — **make/fallback scan only** (ignored when the soong closure is used) |
-| java.mode | project | `project` (default) = **one jdtls instance per project**: workspace root is the dir of **the project the current file belongs to**, sourcePaths are **that project's own** roots; `aosp` = workspace root is the AOSP root AND sourcePaths are injected (whole-tree index in one shared instance, cross-module jumps to real sources) |
-| java.source_apply_auto | true | Automatically apply the accumulated roots to the running jdtls (at most once per session, internally capped at 5 roots) |
-| java.core_source_roots | {frameworks/base/core/java, frameworks/base/services/core/java} | Preset source roots, relative to the AOSP root, injected from the first import. Replaces the default list wholesale |
-| java.source_paths_max_projects | 8 | Upper bound on accumulated `.git` projects (LRU eviction, `0` = unlimited) |
-| java.source_root_exclude | 7 curated test-suite patterns | Lua-pattern exclusions applied to a root's path relative to its project, e.g. `{ "^external/cronet/" }`. User entries are **appended** to the defaults (`java.exclude_merge`); `"replace"` drops them |
-| java.source_paths | nil | Explicit `java.project.sourcePaths`, relative to the AOSP root (absolute paths under the root are converted; entries outside it are dropped). Non-empty = full takeover |
-| java.disable_folding_range        | true                                                         | Disable foldingRange (avoids -32603)                         |
-| java.disable_gradle_import        | true                                                         | Disable Gradle/Maven import                                  |
-| java.import_exclusions_enabled    | true                                                         | Inject `java.import.exclusions` (AOSP projects only; see [Opening from the Android root](#opening-from-the-android-root-javaimportexclusions)) |
-| java.import_exclusions            | {}                                                           | Extra jdt.ls glob patterns, appended after the defaults; a leading `!` negates (order matters) |
-| java.import_exclusions_scan       | true                                                         | Background-scan the source tree for stale `.project`+`.classpath` dirs and exclude them automatically |
-| java.import_exclusions_ttl        | 604800                                                       | Scan-cache lifetime (seconds); ≤0 = never expires, rescan only via `:AospRescan` |
-| java.kill_orphan_jdtls            | true                                                         | SIGTERM the jdtls JVM left behind by a dead nvim (it still holds your `-data`, so every later session fights it for the index). Only kills one that is both truly orphaned and pointed at this plugin's cache root; `false` = report only |
-| java.inlay_hints_mode             | auto                                                         | auto = forced off with jars / all without, or off/all        |
-| kotlin.enabled                    | true                                                         | Enable the kotlin sub-module (KLS)                           |
-| kotlin.jar_mode                   | curated                                                      | curated = core modules only, all = everything (experimental) |
-| kotlin.curated_modules            | {framework, core-all, SystemUI, dagger...}                   | Soong modules loaded in curated mode                         |
-| kotlin.soong_tag_priority         | {combined, javac, turbine-combined}                          | KLS-specific tag priority; combined first makes navigation land in decompiled method bodies (fernflower). Switch back to turbine-first if completion speed / memory matters more |
-| kotlin.make_jar_priority          | {classes-header.jar, classes.jar, javalib.jar}               | Make build system jar priority for Kotlin                    |
-| kotlin.disable_document_highlight | true                                                         | Disable documentHighlight (avoids KLS -32603)                |
-| kotlin.storage_path               | ~/.cache/kotlin-language-server                              | KLS cache directory (init_options.storagePath)               |
+`Applies to` says which jar-collection path a key affects. `java.mode = "project"` (the
+default) collects jars from the **soong dependency closure**; `aosp` mode and the fallback
+path when the closure is unavailable use the **full-tree scan**; older make-based trees
+additionally use the **make scan**. A key marked `make scan` is inert on a modern tree.
+
+| Option                            | Default                                                      | Applies to                                  | Description                                                  |
+| --------------------------------- | ------------------------------------------------------------ | ------------------------------------------- | ------------------------------------------------------------ |
+| android_root                      | nil                                                          | all | nil = auto-detect, or an explicit AOSP root path             |
+| sibling_projects                  | {soc/qcom/qssi, google/aosp}                                 | all | Vendor sub-project layout: when the opened file's ancestors have no `out/`, look for these sibling projects' `out/` under the closest top-level root (shared by root detection and the KLS classpath script) |
+| cache_dir                         | ~/.cache/nvim/aosp_nav                                       | all | jar list cache directory                                     |
+| log_level                         | warn                                                         | all | Message threshold (`debug`/`info`/`warn`/`error`/`off`); everything below is dropped silently. See [Messages and notifications](#messages-and-notifications) |
+| java.enabled                      | true                                                         | all | Enable the java sub-module                                   |
+| java.jar_fallback_dir             | ~/.usr/android_jars                                          | fallback only | Fallback jar directory when no build outputs exist           |
+| java.soong_tag_priority           | {combined, turbine-combined, turbine}                        | soong closure + full-tree scan | Order within the fallback bucket; javac/kotlinc belong to the own-source bucket and are always kept |
+| java.exclude_jars | {R.jar, stubs.jar, lint.jar, dex.jar, srcjarsN.jar, kapt-*.jar, stubs, *-stub, jrt-fs.jar, *-headers} | full-tree + make scan | Exclusion rules (Lua patterns) matched against both jar and module names |
+| java.exclude_globs | {^prebuilts/sdk/sdk_} | full-tree scan | Lua-pattern exclusions on the path relative to .intermediates/. By default drops the prebuilt module-SDK stubs; user entries are appended to the defaults (see exclude_merge). Anchor with ^ for top-level precision, e.g. { "^external/cronet/" } |
+| java.exclude_paths | {linux_glibc_common, development/} | full-tree scan | Excluded path keywords (substring match); do NOT add android_common_apex (it would drop apex-only modules such as core-oj) |
+| java.exclude_merge | append | full-tree scan | Merge semantics for the jar-side exclusion lists (`exclude_jars` / `exclude_paths` / `exclude_globs`): append = user entries are added after defaults; replace = defaults are discarded. It does **not** apply to `import_exclusions`, which is derived (scanned) rather than chosen |
+| java.make_jar_priority            | {classes.jar, classes-header.jar, javalib.jar}               | make scan | Make build system jar priority — **make/fallback scan only** (ignored when the soong closure is used) |
+| java.make_blacklist               | {android_stubs_current_intermediates}                        | make scan | Make build excluded directories — **make/fallback scan only** (ignored when the soong closure is used) |
+| java.mode | project | all | `project` (default) = **one jdtls instance per project**: workspace root is the dir of **the project the current file belongs to**, sourcePaths are **that project's own** roots; `aosp` = workspace root is the AOSP root AND sourcePaths are injected (whole-tree index in one shared instance, cross-module jumps to real sources) |
+| java.source_apply_auto | true | all | Automatically apply the accumulated roots to the running jdtls (at most once per session, internally capped at 5 roots) |
+| java.core_source_roots | {frameworks/base/core/java, frameworks/base/services/core/java} | all | Preset source roots, relative to the AOSP root, injected from the first import. Replaces the default list wholesale |
+| java.source_paths_max_projects | 8 | all | Upper bound on accumulated `.git` projects (LRU eviction, `0` = unlimited) |
+| java.source_root_exclude | 7 curated test-suite patterns | all | Lua-pattern exclusions applied to a root's path relative to its project, e.g. `{ "^external/cronet/" }`. User entries are **appended** to the defaults (`java.exclude_merge`); `"replace"` drops them |
+| java.source_paths | nil | all | Explicit `java.project.sourcePaths`, relative to the AOSP root (absolute paths under the root are converted; entries outside it are dropped). Non-empty = full takeover |
+| java.disable_folding_range        | true                                                         | all | Disable foldingRange (avoids -32603)                         |
+| java.disable_gradle_import        | true                                                         | all | Disable Gradle/Maven import                                  |
+| java.import_exclusions_enabled    | true                                                         | all | Inject `java.import.exclusions` (AOSP projects only; see [Opening from the Android root](#opening-from-the-android-root-javaimportexclusions)) |
+| java.import_exclusions            | {}                                                           | all | Extra jdt.ls glob patterns, appended after the defaults; a leading `!` negates (order matters) |
+| java.import_exclusions_scan       | true                                                         | all | Background-scan the source tree for dirs holding a stale `.project` and exclude them automatically. A `.project` alone is enough: jdt.ls's `EclipseProjectImporter` imports on that file, and one imported visible project stops the invisible project for the whole root from ever being created (every jump then lands in the `jdt.ls-java-project` shell) |
+| java.import_exclusions_ttl        | 604800                                                       | all | Scan-cache lifetime (seconds); ≤0 = never expires, rescan only via `:AospRescan` |
+| java.kill_orphan_jdtls            | true                                                         | all | SIGTERM the jdtls JVM left behind by a dead nvim (it still holds your `-data`, so every later session fights it for the index). Only kills one that is both truly orphaned and pointed at this plugin's cache root; `false` = report only |
+| java.inlay_hints_mode             | auto                                                         | all | auto = forced off with jars / all without, or off/all        |
+| kotlin.enabled                    | true                                                         | all | Enable the kotlin sub-module (KLS)                           |
+| kotlin.jar_mode                   | curated                                                      | all | curated = core modules only, all = everything (experimental) |
+| kotlin.curated_modules            | {framework, core-all, SystemUI, dagger...}                   | all | Soong modules loaded in curated mode                         |
+| kotlin.soong_tag_priority         | {combined, javac, turbine-combined}                          | soong closure + full-tree scan | KLS-specific tag priority; combined first makes navigation land in decompiled method bodies (fernflower). Switch back to turbine-first if completion speed / memory matters more |
+| kotlin.make_jar_priority          | {classes-header.jar, classes.jar, javalib.jar}               | make scan | Make build system jar priority for Kotlin                    |
+| kotlin.disable_document_highlight | true                                                         | all | Disable documentHighlight (avoids KLS -32603)                |
+| kotlin.storage_path               | ~/.cache/kotlin-language-server                              | all | KLS cache directory (init_options.storagePath)               |
 
 ## Messages and notifications
 

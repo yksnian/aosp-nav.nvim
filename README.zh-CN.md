@@ -249,42 +249,44 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 
 ## 配置项
 
-| 项                                | 默认                                                         | 说明                                                         |
-| --------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| android_root                      | nil                                                          | nil=自动检测, 或指定 AOSP 根目录                             |
-| sibling_projects                  | {soc/qcom/qssi, google/aosp}                                 | 兄弟子项目布局: 打开的文件祖先里没有 `out/` 时, 在最近的顶层根下按此顺序找兄弟项目的 `out/` (根探测与 KLS classpath 脚本共用) |
-| cache_dir                         | ~/.cache/nvim/aosp_nav                                       | jar 列表缓存目录                                             |
-| log_level                         | warn                                                         | 消息阈值 (`debug`/`info`/`warn`/`error`/`off`); 低于阈值的一律静默丢弃。见 [消息与通知](#消息与通知) |
-| java.enabled                      | true                                                         | 启用 java 子模块                                             |
-| java.jar_fallback_dir             | ~/.usr/android_jars                                          | 无编译产物时 fallback jar 目录                               |
-| java.soong_tag_priority           | {combined, turbine-combined, turbine}                        | 兜底桶内部顺序; javac/kotlinc 属自身产物桶, 恒全保留         |
-| java.exclude_jars | {R.jar, stubs.jar, lint.jar, dex.jar, srcjarsN.jar, kapt-*.jar, stubs, *-stub, jrt-fs.jar, *-headers} | 排除规则 (Lua 模式), 同时匹配 jar 名与模块名; 覆盖 API 签名桩家族 (stubs/-stub/-headers) 与 JDK 工具 jar |
-| java.exclude_globs | {^prebuilts/sdk/sdk_} | Lua 模式排除: 匹配 .intermediates/ 之后的相对路径。默认剔除预构建 module SDK 桩; 用户自定义时与默认值**拼接** (见 exclude_merge); 锚定 ^ 可精确到顶层目录, 如 { "^external/cronet/" } |
-| java.exclude_paths | {linux_glibc_common, development/} | 排除的路径关键词 (子串匹配); 勿加 android_common_apex (会误杀只有 apex 变体的 core-oj 等模块) |
-| java.exclude_merge | append | 排除类列表 (exclude_jars/paths/globs/import_exclusions) 的合并语义: append=用户项追加到默认值后 (推荐); replace=整体替换默认值 |
-| java.make_jar_priority            | {classes.jar, classes-header.jar, javalib.jar}               | Make 构建系统 jar 优先级 — **仅 make/兜底扫描** (走 soong 闭包时不生效) |
-| java.make_blacklist               | {android_stubs_current_intermediates}                        | Make 构建排除目录 — **仅 make/兜底扫描** (走 soong 闭包时不生效) |
-| java.mode | project | `project` (默认) = **每个项目一台 jdtls**: 工作区根为**当前文件所属项目**的目录, sourcePaths 为**该项目自己**的源码根; `aosp` = 工作区根为 AOSP 根**且**注入 sourcePaths (整树共享一份索引, 跨模块跳转到真实源码) |
-| java.source_apply_auto | true | 累积到新源码根时 (以及 jdtls attach 补存量时) 自动增量注入运行中的工作区。每会话最多一次, 且内部单次上限 5 条; 只在 `mode == "aosp"` 且 jdtls 在跑时生效 |
-| java.core_source_roots | {frameworks/base/core/java, frameworks/base/services/core/java} | 预置源码根 (相对 AOSP 根), 从首次导入起就注入。整表替换默认值 (同 `kotlin.curated_modules` 语义); 磁盘上不存在的条目自动跳过。给得越多首次索引越重 |
-| java.source_paths_max_projects | 8 | 累积的 `.git` 项目数上限 (LRU 淘汰, `0` = 不限)。上限与累积集合都会跨会话保留 |
-| java.source_root_exclude | 7 条精选测试套件模式 | Lua 模式排除, 匹配源码根相对所属项目的路径, 如 `{ "^external/cronet/" }`。默认值补齐内建剪枝抓不到的测试目录家族 (`apct-tests/`、`perftests/`、`test-*`、`integration-tests`、`multivalentTests`、`testrunner-src`) —— frameworks/base 实测 28 个根 / 815 文件 ≈ 注入量的 6%。用户项**追加**在默认值之后 (走 `java.exclude_merge`); 写 `"replace"` 才掀掉默认项。改这个列表会自动让源码根缓存失效 (缓存头带指纹)。其余剪枝规则 (测试根 / JDK 影子根 / 同名影子根) 属算法的一部分 |
-| java.source_paths | nil | 显式指定 `java.project.sourcePaths` (相对 AOSP 根; 树内的绝对路径会自动转成相对, 树外的丢弃)。非空即完全接管: 不再使用核心集与项目累积。除非想钉死一份固定列表, 否则不要设置 |
-| java.disable_folding_range        | true                                                         | 禁用 foldingRange (避 -32603)                                |
-| java.disable_gradle_import        | true                                                         | 禁用 Gradle/Maven 导入                                       |
-| java.import_exclusions_enabled    | true                                                         | 是否注入 `java.import.exclusions` (仅 android 项目; 见 [从 Android 根目录打开](#从-android-根目录打开-javaimportexclusions)) |
-| java.import_exclusions            | {}                                                           | 追加的 jdt.ls glob 排除模式, 排在默认值之后; `!` 开头 = 反向放行 (顺序敏感) |
-| java.import_exclusions_scan       | true                                                         | 是否后台扫描源码树里残留的 `.project`+`.classpath` 目录并自动排除 |
-| java.import_exclusions_ttl        | 604800                                                       | 扫描结果缓存有效期 (秒); ≤0 = 永不过期, 仅 `:AospRescan` 强制重扫 |
-| java.kill_orphan_jdtls            | true                                                         | 启动时 SIGTERM 掉"孤儿"jdtls —— 上一个 nvim 已经退出、却还占着同一份 `-data` 的那台 (之后每个会话都要跟它抢索引)。只杀"确实是孤儿"**且** `-data` 在本插件缓存根之下的; 设 `false` 只报告不杀 |
-| java.inlay_hints_mode             | auto                                                         | auto=有jar强制off/无jar all, 或 off/all                      |
-| kotlin.enabled                    | true                                                         | 启用 kotlin 子模块 (KLS)                                     |
-| kotlin.jar_mode                   | curated                                                      | curated=精选核心模块, all=全量 (实验性)                      |
-| kotlin.curated_modules            | {framework, core-all, SystemUI, dagger...}                   | curated 模式加载的 soong 模块列表                            |
-| kotlin.soong_tag_priority         | {combined, javac, turbine-combined}                          | KLS 专用 tag 优先级; combined 优先使跳转可见方法体 (fernflower 反编译), 补全优先/内存敏感可改回 turbine 优先 |
-| kotlin.make_jar_priority          | {classes-header.jar, classes.jar, javalib.jar}               | Kotlin 的 Make 构建系统 jar 优先级                           |
-| kotlin.disable_document_highlight | true                                                         | 禁用 documentHighlight (避 KLS -32603)                       |
-| kotlin.storage_path               | ~/.cache/kotlin-language-server                              | KLS 缓存目录 (init_options.storagePath)                      |
+`生效范围` 说明该键作用于哪条 jar 收集路径。`java.mode = "project"`（默认）从 **soong 依赖闭包**取 jar；`aosp` 模式、以及闭包不可用时的兜底路径走**全树扫描**；make 时代的老树另外还有 **make 扫描**。标 `make scan` 的键在现代树上不生效。
+
+| 项                                | 默认                                                         | 生效范围                                                      | 说明                                                         |
+| --------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| android_root                      | nil                                                          | 全部 | nil=自动检测, 或指定 AOSP 根目录                             |
+| sibling_projects                  | {soc/qcom/qssi, google/aosp}                                 | 全部 | 兄弟子项目布局: 打开的文件祖先里没有 `out/` 时, 在最近的顶层根下按此顺序找兄弟项目的 `out/` (根探测与 KLS classpath 脚本共用) |
+| cache_dir                         | ~/.cache/nvim/aosp_nav                                       | 全部 | jar 列表缓存目录                                             |
+| log_level                         | warn                                                         | 全部 | 消息阈值 (`debug`/`info`/`warn`/`error`/`off`); 低于阈值的一律静默丢弃。见 [消息与通知](#消息与通知) |
+| java.enabled                      | true                                                         | 全部 | 启用 java 子模块                                             |
+| java.jar_fallback_dir             | ~/.usr/android_jars                                          | 仅兜底 | 无编译产物时 fallback jar 目录                               |
+| java.soong_tag_priority           | {combined, turbine-combined, turbine}                        | soong 闭包 + 全树扫描 | 兜底桶内部顺序; javac/kotlinc 属自身产物桶, 恒全保留         |
+| java.exclude_jars | {R.jar, stubs.jar, lint.jar, dex.jar, srcjarsN.jar, kapt-*.jar, stubs, *-stub, jrt-fs.jar, *-headers} | 全树 + make 扫描 | 排除规则 (Lua 模式), 同时匹配 jar 名与模块名; 覆盖 API 签名桩家族 (stubs/-stub/-headers) 与 JDK 工具 jar |
+| java.exclude_globs | {^prebuilts/sdk/sdk_} | 全树扫描 | Lua 模式排除: 匹配 .intermediates/ 之后的相对路径。默认剔除预构建 module SDK 桩; 用户自定义时与默认值**拼接** (见 exclude_merge); 锚定 ^ 可精确到顶层目录, 如 { "^external/cronet/" } |
+| java.exclude_paths | {linux_glibc_common, development/} | 全树扫描 | 排除的路径关键词 (子串匹配); 勿加 android_common_apex (会误杀只有 apex 变体的 core-oj 等模块) |
+| java.exclude_merge | append | 全树扫描 | **jar 侧**排除列表 (`exclude_jars` / `exclude_paths` / `exclude_globs`) 的合并语义: append=用户项追加到默认值后 (推荐); replace=整体替换默认值。**不适用于** `import_exclusions` —— 那一项是插件扫描推导出来的, 不是用户选的 |
+| java.make_jar_priority            | {classes.jar, classes-header.jar, javalib.jar}               | make 扫描 | Make 构建系统 jar 优先级 — **仅 make/兜底扫描** (走 soong 闭包时不生效) |
+| java.make_blacklist               | {android_stubs_current_intermediates}                        | make 扫描 | Make 构建排除目录 — **仅 make/兜底扫描** (走 soong 闭包时不生效) |
+| java.mode | project | 全部 | `project` (默认) = **每个项目一台 jdtls**: 工作区根为**当前文件所属项目**的目录, sourcePaths 为**该项目自己**的源码根; `aosp` = 工作区根为 AOSP 根**且**注入 sourcePaths (整树共享一份索引, 跨模块跳转到真实源码) |
+| java.source_apply_auto | true | 全部 | 累积到新源码根时 (以及 jdtls attach 补存量时) 自动增量注入运行中的工作区。每会话最多一次, 且内部单次上限 5 条; 只在 `mode == "aosp"` 且 jdtls 在跑时生效 |
+| java.core_source_roots | {frameworks/base/core/java, frameworks/base/services/core/java} | 全部 | 预置源码根 (相对 AOSP 根), 从首次导入起就注入。整表替换默认值 (同 `kotlin.curated_modules` 语义); 磁盘上不存在的条目自动跳过。给得越多首次索引越重 |
+| java.source_paths_max_projects | 8 | 全部 | 累积的 `.git` 项目数上限 (LRU 淘汰, `0` = 不限)。上限与累积集合都会跨会话保留 |
+| java.source_root_exclude | 7 条精选测试套件模式 | 全部 | Lua 模式排除, 匹配源码根相对所属项目的路径, 如 `{ "^external/cronet/" }`。默认值补齐内建剪枝抓不到的测试目录家族 (`apct-tests/`、`perftests/`、`test-*`、`integration-tests`、`multivalentTests`、`testrunner-src`) —— frameworks/base 实测 28 个根 / 815 文件 ≈ 注入量的 6%。用户项**追加**在默认值之后 (走 `java.exclude_merge`); 写 `"replace"` 才掀掉默认项。改这个列表会自动让源码根缓存失效 (缓存头带指纹)。其余剪枝规则 (测试根 / JDK 影子根 / 同名影子根) 属算法的一部分 |
+| java.source_paths | nil | 全部 | 显式指定 `java.project.sourcePaths` (相对 AOSP 根; 树内的绝对路径会自动转成相对, 树外的丢弃)。非空即完全接管: 不再使用核心集与项目累积。除非想钉死一份固定列表, 否则不要设置 |
+| java.disable_folding_range        | true                                                         | 全部 | 禁用 foldingRange (避 -32603)                                |
+| java.disable_gradle_import        | true                                                         | 全部 | 禁用 Gradle/Maven 导入                                       |
+| java.import_exclusions_enabled    | true                                                         | 全部 | 是否注入 `java.import.exclusions` (仅 android 项目; 见 [从 Android 根目录打开](#从-android-根目录打开-javaimportexclusions)) |
+| java.import_exclusions            | {}                                                           | 全部 | 追加的 jdt.ls glob 排除模式, 排在默认值之后; `!` 开头 = 反向放行 (顺序敏感) |
+| java.import_exclusions_scan       | true                                                         | 全部 | 是否后台扫描源码树里残留的 `.project` 目录并自动排除。**只认 `.project` 一个文件**: jdt.ls 的 `EclipseProjectImporter` 就是凭它导入的, 而只要有一个可见工程被导进来, 整个根的不可见工程就再也建不出来 (之后所有跳转都落进 `jdt.ls-java-project` 假工程) |
+| java.import_exclusions_ttl        | 604800                                                       | 全部 | 扫描结果缓存有效期 (秒); ≤0 = 永不过期, 仅 `:AospRescan` 强制重扫 |
+| java.kill_orphan_jdtls            | true                                                         | 全部 | 启动时 SIGTERM 掉"孤儿"jdtls —— 上一个 nvim 已经退出、却还占着同一份 `-data` 的那台 (之后每个会话都要跟它抢索引)。只杀"确实是孤儿"**且** `-data` 在本插件缓存根之下的; 设 `false` 只报告不杀 |
+| java.inlay_hints_mode             | auto                                                         | 全部 | auto=有jar强制off/无jar all, 或 off/all                      |
+| kotlin.enabled                    | true                                                         | 全部 | 启用 kotlin 子模块 (KLS)                                     |
+| kotlin.jar_mode                   | curated                                                      | 全部 | curated=精选核心模块, all=全量 (实验性)                      |
+| kotlin.curated_modules            | {framework, core-all, SystemUI, dagger...}                   | 全部 | curated 模式加载的 soong 模块列表                            |
+| kotlin.soong_tag_priority         | {combined, javac, turbine-combined}                          | soong 闭包 + 全树扫描 | KLS 专用 tag 优先级; combined 优先使跳转可见方法体 (fernflower 反编译), 补全优先/内存敏感可改回 turbine 优先 |
+| kotlin.make_jar_priority          | {classes-header.jar, classes.jar, javalib.jar}               | make 扫描 | Kotlin 的 Make 构建系统 jar 优先级                           |
+| kotlin.disable_document_highlight | true                                                         | 全部 | 禁用 documentHighlight (避 KLS -32603)                       |
+| kotlin.storage_path               | ~/.cache/kotlin-language-server                              | 全部 | KLS 缓存目录 (init_options.storagePath)                      |
 
 ## 消息与通知
 
