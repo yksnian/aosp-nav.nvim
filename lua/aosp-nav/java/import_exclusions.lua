@@ -24,11 +24,30 @@ local M = {}
 local log = require("aosp-nav.util.log")
 
 -- [v7] 缓存版本: 扫描算法/默认模式变更时 bump, 旧缓存自动作废重扫
-local CACHE_VERSION = 1
+-- [v18.25] 2: 判据从 ".project + .classpath 同目录" 改成 "只认 .project" (见 scan_cmd)。
+--   不 bump 的话旧缓存会继续生效, 用户升级后仍看不到那些漏网的 .project。
+local CACHE_VERSION = 2
 
--- VSCode eclipseGuardScan.ts 的 MAX_DEPTH = 5 (以目录计); .classpath 在目录
--- 下一层, 故按 fd/find 的 entry 深度算 = 6
-local MAX_DEPTH = 6
+-- [v18.25] 扫描深度必须**不小于 jdt.ls 自己的搜索深度**, 否则漏网的 .project 会
+-- 在 jdt.ls 那边被导入, 一个就足以废掉整棵树的不可见工程 (见 scan_cmd 注释)。
+--
+-- jdt.ls 的深度 (反编译 org.eclipse.jdt.ls.core 1.62.0 确证):
+--   EclipseProjectImporter.applies() -> new BasicFileDetector(rootFolder, ".project")
+--     -> BasicFileDetector 的 maxDepth 字段**默认 5** (iconst_5), 且该类暴露
+--        maxDepth(int) 但 importer **从不调用**它 -> 实际就是 5
+--     -> scanDir 调 Files.walkFileTree(root, ..., maxDepth=5, visitor)
+--   Oracle 的 walkFileTree 里 maxDepth 以**目录层**计, 起点目录 = 0。
+--   实测本机: frameworks/base 下最深的两个 .project 在 dir-depth=5
+--   (packages/SettingsLib/tests/robotests/fragment, packages/SystemUI/pods/headline/ui)
+--   —— 正好卡在 jdt.ls 的边界内, 所以它一定会被导入。
+--
+-- 我们的扫描基准是 **AOSP 根** (见 configure 里的 effective(java_cfg, aosp_root)),
+-- 不是 jdtls 的 root, 所以还要加上 root 自身在树里的深度。原值 6 是在
+-- frameworks/base roots 只有 3 层深时够用的, 深一点的模块就会漏。
+-- 取 12: 覆盖 "树根 -> 模块根 (通常 <=4 层) + jdt.ls 的 5 层" 并留足余量。
+-- 代价: fd/find 多走几层 —— 实测整棵树仍是毫秒级 (参见 ensure_cached 注释),
+-- 而漏一个 .project 的代价是整棵树不可用。
+local MAX_DEPTH = 12
 
 -- VSCode eclipseGuardScan.ts 的 SKIP_DIRS: 扫描时不下探这些目录
 local SKIP_DIRS = { "out", ".repo", ".git", "node_modules", ".metadata" }
@@ -247,7 +266,18 @@ local function scan_cmd(root)
       cmd[#cmd + 1] = d
     end
     -- --full-path 正则; 不加 ^ 锚 (fd 匹配的是带根前缀的完整路径)
-    cmd[#cmd + 1] = "\\.classpath$"
+    --
+    -- [v18.25] 扫 **`.project`** 而不是 `.classpath` —— 实测确证 (2026-10-26):
+    -- jdt.ls 的 EclipseProjectImporter 只认 `.project` 就导入, `.classpath` 不是前提。
+    -- 旧规则照搬 VSCode 的"两个都有才算 Eclipse 工程", 于是
+    -- `frameworks/base/tests/TouchLatency` (有 .project + build.gradle, **无** .classpath)
+    -- 从缝里漏过去 -> jdt.ls 把它当可见工程导入 -> Gradle 同步失败 ->
+    -- `getVisibleProjects(rootPath)` 非空 -> **整个 frameworks/base 的不可见工程
+    -- 再也建不出来**, 所有跳转落 jdt.ls-java-project 假工程。
+    -- 对照实验 (同一棵树, 仅把 12 个 .project 改名): 工作区立刻从
+    -- `jdt.ls-java-project` 变成 `base_93614236`, 日志出现
+    -- "Successfully created a workspace invisible project base_93614236"。
+    cmd[#cmd + 1] = "\\.project$"
     cmd[#cmd + 1] = root
     return cmd
   end
@@ -261,7 +291,7 @@ local function scan_cmd(root)
       "-type",
       "f",
       "-name",
-      ".classpath",
+      ".project",
     }
     for _, d in ipairs(SKIP_DIRS) do
       cmd[#cmd + 1] = "-not"
@@ -274,19 +304,23 @@ local function scan_cmd(root)
   return nil
 end
 
---- 把 .classpath 文件列表转成排除模式
---- VSCode 判定 = 目录同时含 .project 与 .classpath (两条都在才算 Eclipse 工程)。
+--- 把扫到的 `.project` 文件列表转成排除模式 (每个文件所在目录一条)。
 --- 扫描基准目录自身命中时, 产生的就是"整个根"这一条模式, 与
 --- eclipseGuardScan.ts 的 rootBlocked 语义一致 (无需特判)
---- @param files table .classpath 文件路径列表
+---
+--- [v18.25] 判据只认 `.project` (原来还要求同目录有 `.classpath`) —— 见 scan_cmd
+--- 的注释: jdt.ls 只凭 `.project` 就导入, 多要一个 `.classpath` 会让
+--- "有 .project 无 .classpath" 的 Gradle 工程漏网, 而一个漏网的可见工程足以
+--- 废掉整棵树的不可见工程。
+--- @param files table `.project` 文件路径列表
 --- @return table patterns 转义后的绝对路径模式
 local function to_patterns(files)
   local out, seen = {}, {}
   for _, f in ipairs(files) do
     if f ~= "" and vim.fn.filereadable(f) == 1 then
-      local dir = vim.fn.fnamemodify(f, ":h")
-      if vim.fn.filereadable(dir .. "/.project") == 1 then
-        local pat = M.escape_glob(dir)
+      -- 兜底: 只收名字确实是 .project 的 (注入的扫描命令不会给别的, 防御性判断)
+      if vim.fn.fnamemodify(f, ":t") == ".project" then
+        local pat = M.escape_glob(vim.fn.fnamemodify(f, ":h"))
         if not seen[pat] then
           seen[pat] = true
           out[#out + 1] = pat

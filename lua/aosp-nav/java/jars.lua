@@ -156,9 +156,17 @@ end
 --- @param seen_paths table 已见路径集合
 --- @return boolean found_any
 --- @return table|nil selected mod_name -> jar_path (v4: 供调用方做 pre-jarjar 后处理)
-local function process_soong_matches(base_dir, all_matches, jars, seen_paths)
+--- @param opts table|nil { no_exclude = boolean } —— [v18.24] true = **不应用任何排除
+---   规则** (exclude_jars / exclude_paths / exclude_globs)。给 soong 闭包路径用。
+---   理由: soong 的模块图已经是**精确**的, 再叠一层启发式排除只会帮倒忙 —— 实测
+---   (2026-10-23) 默认规则里的 `^prebuilts/sdk/sdk_` 在 Wifi 上排掉了闭包图**真正
+---   依赖**的 SDK 桩, 而那些桩是 `android.os.*` 的唯一 provider (该闭包够不着
+---   framework.jar), 结果整片 import 无法解析 (ClientModeImpl.java 满屏红)。
+---   排除规则是给**全树/兜底扫描**写的: 那里候选是全树 glob, 需要启发式收窄。
+local function process_soong_matches(base_dir, all_matches, jars, seen_paths, opts)
   local cfg = get_cfg()
   local java_cfg = cfg.java
+  local no_exclude = opts and opts.no_exclude
 
   -- [v3] type_rank 只决定兜底桶内部排序; own/fallback 的归属由 tag 名决定
   local type_rank = {}
@@ -203,22 +211,25 @@ local function process_soong_matches(base_dir, all_matches, jars, seen_paths)
 
     -- [v3] 排除规则同时匹配 jar 名与模块名: "stubs" 子串可拦住
     -- android-non-updatable.stubs.system 等签名桩 (桩 jar 名 = 模块名 + .jar)
+    -- [v18.24] soong 闭包路径整体跳过 (no_exclude) —— 见函数头注释。
     local jar_name = comps[#comps]
-    for _, pat in ipairs(java_cfg.exclude_jars) do
-      if jar_name:match(pat) or mod:match(pat) then
-        goto continue
+    if not no_exclude then
+      for _, pat in ipairs(java_cfg.exclude_jars) do
+        if jar_name:match(pat) or mod:match(pat) then
+          goto continue
+        end
       end
-    end
-    -- 排除路径关键词 (普通字符串匹配)
-    for _, kw in ipairs(java_cfg.exclude_paths) do
-      if path:find(kw, 1, true) then
-        goto continue
+      -- 排除路径关键词 (普通字符串匹配)
+      for _, kw in ipairs(java_cfg.exclude_paths) do
+        if path:find(kw, 1, true) then
+          goto continue
+        end
       end
-    end
-    -- [v4] Lua 模式排除: 匹配 intermediates 之后的相对路径
-    for _, pat in ipairs(java_cfg.exclude_globs or {}) do
-      if rel:match(pat) then
-        goto continue
+      -- [v4] Lua 模式排除: 匹配 intermediates 之后的相对路径
+      for _, pat in ipairs(java_cfg.exclude_globs or {}) do
+        if rel:match(pat) then
+          goto continue
+        end
       end
     end
 
@@ -1039,53 +1050,30 @@ local function project_seed_modules(index, project_dir_rel)
 end
 
 --- JSON jars 字段里的 prebuilts 补充: 闭包内模块声明的、不在 intermediates 的
---- 预编译 jar (androidx 等), 磁盘存在且非 turbine 桩、过 exclude_jars 才收。
+--- 预编译 jar (androidx 等), 磁盘存在且非 turbine 桩。
 ---
---- **覆盖面 (刻意的, 别当成漏洞)**: 本函数**只查 `exclude_jars`** (模块名 + jar 基名),
---- **不查** `exclude_paths` / `exclude_globs`。那两条属于**分桶引擎**
---- (process_soong_matches) 的职责 —— 它处理 intermediates 产物, 且应用全套排除规则。
---- 这里补的是树内 prebuilts (路径通常不在 out/soong 下, 没有 intermediates 那套
---- 变体结构), 两条通道的匹配对象本就不同。要排掉某个 prebuilt 请用 `exclude_jars`。
+--- [v18.24] **不过 `exclude_jars`** —— 本函数只在 soong 闭包路径上被调用, 而闭包
+--- 路径一律不叠排除规则 (见 process_soong_matches 的函数头注释): soong 的模块图
+--- 已经精确, 闭包说这个模块要编译进来, 它声明的 jar 就该在 classpath 上。
+--- (旧注释曾说"要排掉某个 prebuilt 请用 exclude_jars" —— 已作废。)
 local function add_prebuilt_jars(index, closure, aosp_root, jars, seen)
-  local java_cfg = get_cfg().java
   for name in pairs(closure) do
-    local mod_ok = true
-    for _, pat in ipairs(java_cfg.exclude_jars or {}) do
-      if name:match(pat) then
-        mod_ok = false
-        break
-      end
-    end
-    if mod_ok then
-      for _, j in ipairs(index[name].jars or {}) do
-        -- intermediates 产物由分桶引擎负责, 这里只补树内 prebuilts 路径
-        -- [v18.22] 这个 find 的第 3 参是 plain=true —— 传的是**字面量**, 不是 Lua
-        -- 模式, 所以原来写的 `"%.intermediates/"` 实际在找**带反斜杠的字符串**,
-        -- 永远匹配不到 (实测 nil; 去掉反斜杠才命中)。后果: 本守卫从不生效, 于是
-        -- 这个函数把闭包里**每个模块的每个 jar** 都塞了进来, 包括本该由分桶引擎
-        -- 负责的 intermediates 产物 —— 那批**绕过了 exclude_globs / exclude_paths**
-        -- (本函数只查 exclude_jars)。用户实测: 默认 exclude_globs 明确排除
-        -- `^prebuilts/sdk/sdk_`, 但 9 个 sdk_* 桩照样进了 Wifi 的 classpath, 且
-        -- 抢在真实现之前 (JDT 取 classpath 上第一个含该类型的条目)。
-        if j:sub(-4) == ".jar" and not j:find(".intermediates/", 1, true) then
-          local abs = (j:sub(1, 1) == "/") and j or (aosp_root .. "/" .. j)
-          local base = j:match("([^/]+)%.jar$") or ""
-          local ok_name = true
-          for _, pat in ipairs(java_cfg.exclude_jars or {}) do
-            if base:match(pat) then
-              ok_name = false
-              break
-            end
-          end
-          if
-            ok_name
-            and not j:find("turbine%-combined", 1, true)
-            and not seen[abs]
-            and vim.uv.fs_stat(abs)
-          then
-            seen[abs] = true
-            jars[#jars + 1] = abs
-          end
+    for _, j in ipairs(index[name].jars or {}) do
+      -- intermediates 产物由分桶引擎负责, 这里只补树内 prebuilts 路径
+      -- [v18.22] 这个 find 的第 3 参是 plain=true —— 传的是**字面量**, 不是 Lua
+      -- 模式, 所以原来写的 `"%.intermediates/"` 实际在找**带反斜杠的字符串**,
+      -- 永远匹配不到 (实测 nil; 去掉反斜杠才命中)。后果: 本守卫从不生效, 于是
+      -- 这个函数把闭包里**每个模块的每个 jar** 都塞了进来, 包括本该由分桶引擎
+      -- 负责的 intermediates 产物。用户实测: 9 个 sdk_* 桩经此进了 classpath。
+      if j:sub(-4) == ".jar" and not j:find(".intermediates/", 1, true) then
+        local abs = (j:sub(1, 1) == "/") and j or (aosp_root .. "/" .. j)
+        if
+          not j:find("turbine%-combined", 1, true)
+          and not seen[abs]
+          and vim.uv.fs_stat(abs)
+        then
+          seen[abs] = true
+          jars[#jars + 1] = abs
         end
       end
     end
@@ -1312,7 +1300,10 @@ function M.project_closure_jars(aosp_root, project_dir, opts)
 
   local jars, seen = {}, {}
   if #filtered > 0 then
-    process_soong_matches(aosp_root .. "/out/soong/.intermediates", filtered, jars, seen)
+    -- [v18.24] no_exclude: 闭包路径**不叠排除规则** (见 process_soong_matches 头注释)
+    process_soong_matches(aosp_root .. "/out/soong/.intermediates", filtered, jars, seen, {
+      no_exclude = true,
+    })
   end
   add_prebuilt_jars(index, closure, aosp_root, jars, seen)
   if #jars == 0 and manifest ~= nil then
