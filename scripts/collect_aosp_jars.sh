@@ -247,7 +247,8 @@ collect_from_fs() {
   [ -d "$aosp_root/out" ] || { echo "ERROR: no out/ under: $aosp_root" >&2; exit 1; }
 
   local soong_dir="" d
-  for d in "$aosp_root/out/soong/.intermediates" "$aosp_root/out/.soong/.intermediates"; do
+  # 只认 out/soong/ —— AOSP 从不生成 out/.soong/ (原候选是死路径)
+  for d in "$aosp_root/out/soong/.intermediates"; do
     if [ -d "$d" ]; then
       soong_dir=$d
       break

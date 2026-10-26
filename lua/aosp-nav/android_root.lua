@@ -4,7 +4,7 @@
 --   2. 单子项目: <root>/soc/qcom/qssi/{out, build, ...}
 --   3. 双子项目: <root>/{soc/qcom/qssi, google/aosp} 各自有 out
 --   4. 厂家自有目录: <root>/<vendor>/... (无 out) -> 借用兄弟子项目的 out
--- 关键: android_root 必须自带 out 产物目录 (后续从 out/.soong/.intermediates 取 jar)
+-- 关键: android_root 必须自带 out 产物目录 (后续从 out/soong/.intermediates 取 jar)
 local M = {}
 
 local path_util = require("aosp-nav.util.path")
@@ -30,8 +30,7 @@ local SIBLING_MAX_DEPTH = 4
 --- @param dir string 目录路径
 --- @return boolean
 function M.has_jar_source(dir)
-  return vim.fn.isdirectory(dir .. "/out/.soong/.intermediates") == 1
-    or vim.fn.isdirectory(dir .. "/out/soong/.intermediates") == 1
+  return vim.fn.isdirectory(dir .. "/out/soong/.intermediates") == 1
     or vim.fn.isdirectory(dir .. "/out/target/common/obj/JAVA_LIBRARIES") == 1
 end
 

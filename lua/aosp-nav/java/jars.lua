@@ -494,7 +494,8 @@ function M.find_android_jars(opts)
   end
 
   -- 尝试 1: soong intermediates (Android 15+, out/soong/.intermediates/)
-  for _, soong_sub in ipairs({ "/out/soong/.intermediates", "/out/.soong/.intermediates" }) do
+  -- [v18.28] 只认 out/soong/ —— AOSP 从不生成 out/.soong/ (见尝试 3 处的注释)
+  for _, soong_sub in ipairs({ "/out/soong/.intermediates" }) do
     local found, selected = scan_soong_intermediates(android_root .. soong_sub, jars, seen_paths)
     if found then
       -- 注意 fallback 目录场景 (尝试 3) 不做 pre-jarjar 处理: 目录布局镜像自
@@ -517,7 +518,10 @@ function M.find_android_jars(opts)
 
   -- 尝试 3: fallback (jar_fallback_dir, 由 :AospCollectJars 收集)
   if #source_parts == 0 then
-    for _, soong_sub in ipairs({ "/.soong/.intermediates", "/soong/.intermediates" }) do
+    -- [v18.28] 只认 /soong/ —— AOSP 从不生成 out/.soong/ (实测本机与 fallback 目录
+    -- 都只有 out/soong)。原来那个 "/.soong/.intermediates" 候选是死路径: 永不命中,
+    -- 每次白跑一次 scan_soong_intermediates。
+    for _, soong_sub in ipairs({ "/soong/.intermediates" }) do
       if scan_soong_intermediates(java_cfg.jar_fallback_dir .. soong_sub, jars, seen_paths) then
         table.insert(source_parts, "fallback")
         break
@@ -564,7 +568,7 @@ local function rescan_make_or_fallback(android_root)
   if scan_aosp_out(android_root, jars, seen_paths, seen_intermediates) then
     return jars, "make"
   end
-  for _, sub in ipairs({ "/.soong/.intermediates", "/soong/.intermediates" }) do
+  for _, sub in ipairs({ "/soong/.intermediates" }) do
     if scan_soong_intermediates(java_cfg.jar_fallback_dir .. sub, jars, seen_paths) then
       return jars, "fallback"
     end
@@ -620,7 +624,7 @@ function M.refresh_async(aosp_root)
 
   -- 存在的 soong intermediates 目录 (与同步路径的探测顺序一致)
   local soong_base = nil
-  for _, sub in ipairs({ "/out/soong/.intermediates", "/out/.soong/.intermediates" }) do
+  for _, sub in ipairs({ "/out/soong/.intermediates" }) do
     if vim.fn.isdirectory(aosp_root .. sub) == 1 then
       soong_base = aosp_root .. sub
       break

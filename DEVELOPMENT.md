@@ -1622,6 +1622,27 @@ JVM 对重复参数取**后者**, 所以生效的是用户的值, 行为正确�
 里的文件上溯落到**子项目**而非外层顶层根 / 普通子目录不被误认。
 **已验证是真闸**: 去掉第二轮 (直接 return nil) → 报红且失败项正是那条。
 
+### 2.19.5 移除死路径 `out/.soong/.intermediates` (2026-10-26)
+
+**用户指出**: AOSP 不存在 `out/.soong/` 这个目录。
+
+**实测确认**: 本机真树 `out/` 下只有 `soong/` `target/` (没有 `.soong/`);
+fallback 目录 `~/.usr/android_jars/` 下同样只有 `soong/`。
+
+**为什么代码里会有它**: 早期把 soong 产物目录写成了"两种可能"的候选列表
+(`/out/.soong/.intermediates` 与 `/out/soong/.intermediates`), 大概是想兼容某个版本差异
+—— 但 **AOSP 任何版本都不生成带点的 `.soong`**。代价是每次都要**白跑一次**
+`scan_soong_intermediates` (里头是 fd/find 子进程 + 分桶), 而且是**永不命中**的那一次。
+
+**清理范围** (共 8 处, 全仓 `grep -rn "\.soong/\.intermediates"` 应为 0 命中):
+`android_root.has_jar_source` / `java/jars.lua` ×4 (尝试 1、尝试 3 的 fallback、rescan 的
+fallback、refresh 的探测) / `kotlin/classpath.lua` 生成的 bash 脚本 ×4 (上溯条件、子项目
+扫描条件、soong_bases 两处) / `scripts/collect_aosp_jars.sh`。
+
+**注意 KLS 脚本是生成物**: 改 `classpath.lua` 里的模板后**必须重新生成**才会生效 ——
+`ensure_script()` 按配置指纹决定要不要重写, 模板变更不一定触发。本次是手动调
+`cp.ensure_script(config)` 重生成的, 并 `bash -n` 验过语法、在真树跑过一遍确认输出不变。
+
 ## 3. 导航模式
 
 **对用户只宣传两种体验** (v11 降级后), 由单个键 `java.mode` 表达:

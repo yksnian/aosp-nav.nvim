@@ -351,7 +351,8 @@ if [ -z "$root" ]; then
   fb_repo=""
   p=$PWD
   while [ "$p" != "/" ]; do
-    if [ -d "$p/out/soong/.intermediates" ] || [ -d "$p/out/.soong/.intermediates" ] \
+    # [v18.28] 只认 out/soong/ —— AOSP 从不生成 out/.soong/ (与 lua 侧同口径)
+    if [ -d "$p/out/soong/.intermediates" ] \
        || [ -d "$p/out/target/common/obj/JAVA_LIBRARIES" ]; then
       root=$p; break
     fi
@@ -377,7 +378,7 @@ if [ -z "$root" ]; then
           for c in "$d"/*; do
             [ -d "$c" ] || continue
             case "$(basename "$c")" in .*) continue ;; esac
-            if [ -d "$c/out/soong/.intermediates" ] || [ -d "$c/out/.soong/.intermediates" ] \
+            if [ -d "$c/out/soong/.intermediates" ] \
                || [ -d "$c/out/target/common/obj/JAVA_LIBRARIES" ]; then
               hits="$hits $c"
             else
@@ -416,7 +417,7 @@ fi
 
 # ---- 2. candidate bases (order mirrors java/jars.lua) ----
 soong_bases=()
-for b in "$root/out/soong/.intermediates" "$root/out/.soong/.intermediates"; do
+for b in "$root/out/soong/.intermediates"; do
   [ -d "$b" ] && soong_bases+=("$b")
 done
 make_bases=()
@@ -424,7 +425,7 @@ for b in "$root/out/target/common/obj/JAVA_LIBRARIES" "$root"/out/target/product
   [ -d "$b" ] && make_bases+=("$b")
 done
 if [ ${#soong_bases[@]} -eq 0 ] && [ ${#make_bases[@]} -eq 0 ]; then
-  for b in "$FALLBACK_DIR/soong/.intermediates" "$FALLBACK_DIR/.soong/.intermediates"; do
+  for b in "$FALLBACK_DIR/soong/.intermediates"; do
     [ -d "$b" ] && soong_bases+=("$b")
   done
 fi
