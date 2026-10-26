@@ -257,8 +257,7 @@ additionally use the **make scan**. A key marked `make scan` is inert on a moder
 
 | Option                            | Default                                                      | Applies to                                  | Description                                                  |
 | --------------------------------- | ------------------------------------------------------------ | ------------------------------------------- | ------------------------------------------------------------ |
-| android_root                      | nil                                                          | all | nil = auto-detect, or an explicit AOSP root path             |
-| sibling_projects                  | {soc/qcom/qssi, google/aosp}                                 | all | Vendor sub-project layout: when the opened file's ancestors have no `out/`, look for these sibling projects' `out/` under the closest top-level root (shared by root detection and the KLS classpath script) |
+| android_root                      | nil                                                          | all | nil = auto-detect, or an explicit AOSP root path. Detection walks up for a dir with `out/` products; below a vendor layout it also scans the top-level root for a sub-project that has them (see below) |
 | cache_dir                         | ~/.cache/nvim/aosp_nav                                       | all | jar list cache directory                                     |
 | log_level                         | warn                                                         | all | Message threshold (`debug`/`info`/`warn`/`error`/`off`); everything below is dropped silently. See [Messages and notifications](#messages-and-notifications) |
 | java.enabled                      | true                                                         | all | Enable the java sub-module                                   |

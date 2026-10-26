@@ -77,4 +77,64 @@ else
   )
 end
 
+-- ---------------------------------------------------------------------------
+-- [v18.27] 厂商布局: 子项目自动探测 (原 sibling_projects 配置已删)
+-- ---------------------------------------------------------------------------
+-- 这一段用临时目录造一棵"顶层根 + 子项目"的假树, 不碰真树。
+-- 造它是因为这块**此前零覆盖**, 而它刚被重写过 (列表 -> 自动扫描 + envsetup.sh 标记)。
+do
+  local ar = require("aosp-nav.android_root")
+  local TMP = vim.fn.tempname()
+
+  -- 顶层根: 只有 .repo 与 build/envsetup.sh, 自己**没有 out** (厂商布局的常态)
+  vim.fn.mkdir(TMP .. "/.repo", "p")
+  vim.fn.mkdir(TMP .. "/build", "p")
+  vim.fn.writefile({ "x" }, TMP .. "/build/envsetup.sh")
+
+  -- 子项目 A: 是源码树但**没编译** (envsetup.sh 在, out 不在)
+  vim.fn.mkdir(TMP .. "/soc/qcom/qssi/build", "p")
+  vim.fn.writefile({ "x" }, TMP .. "/soc/qcom/qssi/build/envsetup.sh")
+
+  -- 子项目 B: 已编译 (有 out/soong/.intermediates)
+  vim.fn.mkdir(TMP .. "/google/aosp/out/soong/.intermediates", "p")
+  vim.fn.mkdir(TMP .. "/google/aosp/build", "p")
+  vim.fn.writefile({ "x" }, TMP .. "/google/aosp/build/envsetup.sh")
+
+  -- 标记语义: 两者不可互相替代
+  H.check(ar.is_android_tree(TMP), "标记: 顶层根 (只有 envsetup.sh) 算 Android 树")
+  H.check(not ar.has_jar_source(TMP), "标记: 顶层根没有 out -> has_jar_source 为假")
+  H.check(
+    ar.is_android_tree(TMP .. "/soc/qcom/qssi") and not ar.has_jar_source(TMP .. "/soc/qcom/qssi"),
+    "标记: 未编译的子项目是树但无 jar 源 (这正是旧逻辑认不出的场景)"
+  )
+  H.check(ar.has_jar_source(TMP .. "/google/aosp"), "标记: 已编译的子项目有 jar 源")
+
+  -- 自动探测: 有 out 的优先
+  H.eq(
+    ar.find_vendor_subproject(TMP),
+    TMP .. "/google/aosp",
+    "探测: 有 out 的子项目优先 (不看名字, 只看有没有 out)"
+  )
+
+  -- 把已编译的那个删掉 -> 应退回"是源码树"的那个 (未编译也能认)
+  vim.fn.delete(TMP .. "/google", "rf")
+  H.eq(
+    ar.find_vendor_subproject(TMP),
+    TMP .. "/soc/qcom/qssi",
+    "探测: 一个都没编译时, 退回是源码树的子项目 (envsetup.sh 标记的作用)"
+  )
+
+  -- 从厂商子项目里的文件出发, 整个上溯链要落到**那棵子树**, 不是外面的顶层根
+  H.eq(
+    ar.find_android_platform_root(TMP .. "/soc/qcom/qssi/frameworks/base/Foo.java"),
+    TMP .. "/soc/qcom/qssi",
+    "上溯: 厂商子项目里的文件 -> 落到子项目 (不是它的顶层根)"
+  )
+
+  -- 非 Android 目录不得被误认
+  H.check(not ar.is_android_tree(TMP .. "/soc/qcom/qssi/frameworks"), "标记: 普通子目录不算树")
+
+  vim.fn.delete(TMP, "rf")
+end
+
 H.finish("t_root_from_cwd")

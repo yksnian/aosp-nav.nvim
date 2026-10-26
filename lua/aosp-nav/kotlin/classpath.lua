@@ -207,7 +207,8 @@ local function config_hash(cfg, branches)
   local subset = {
     cache_dir = cfg.cache_dir,
     fallback = cfg.java.jar_fallback_dir,
-    sibling_projects = cfg.sibling_projects,
+    -- sibling_projects 已删 (2026-10-26): 脚本改为自动探测带 out 的子项目, 不再有
+    -- 参与 hash 的配置项。
     exclude_jars = cfg.java.exclude_jars,
     exclude_paths = cfg.java.exclude_paths,
     jar_mode = cfg.kotlin.jar_mode,
@@ -330,17 +331,8 @@ function M.render(branches)
     table.insert(lines, "  " .. q)
   end
   table.insert(lines, ")")
-  -- [v13] 兄弟项目从配置取 (与 android_root.lua 的 sibling_projects 同一份,
-  -- 不再两处硬编码); 脚本 marker 的 hash 里也带它, 改配置即重新生成脚本
-  local siblings = {}
-  for _, s in ipairs(cfg.sibling_projects or { "soc/qcom/qssi", "google/aosp" }) do
-    local q = shq(tostring(s))
-    if not q then
-      return nil, "sibling_projects contains single quote: " .. tostring(s)
-    end
-    siblings[#siblings + 1] = q
-  end
-  table.insert(lines, "SIBLINGS=( " .. table.concat(siblings, " ") .. " )")
+  -- [v18.27] 原来这里生成 `SIBLINGS=( ... )` 供脚本按列表找兄弟项目。
+  -- 配置键 sibling_projects 已删, 改为脚本内自动探测 (见下面的 ---- 1a ---- 段)。
 
   local body = [[
 
@@ -354,6 +346,7 @@ esac
 
 # ---- 1. detect android root from $PWD (bash port of android_root.lua) ----
 if [ -z "$root" ]; then
+  fb_tree=""
   fb_mk=""
   fb_repo=""
   p=$PWD
@@ -362,18 +355,52 @@ if [ -z "$root" ]; then
        || [ -d "$p/out/target/common/obj/JAVA_LIBRARIES" ]; then
       root=$p; break
     fi
+    # [v18.27] 是 Android 源码树但还没编译 —— 与 lua 侧 is_android_tree 同一口径。
+    # envsetup.sh 从 Android 4 至今路径未变, 比 main.mk 更稳, 两者并用。
+    [ -z "$fb_tree" ] && { [ -f "$p/build/envsetup.sh" ] || [ -f "$p/build/make/core/main.mk" ]; } && fb_tree=$p
     [ -z "$fb_mk" ] && [ -f "$p/build/make/core/main.mk" ] && fb_mk=$p
     [ -z "$fb_repo" ] && [ -d "$p/.repo" ] && fb_repo=$p
     p=$(dirname "$p")
   done
   if [ -z "$root" ]; then
-    top=${fb_mk:-$fb_repo}
-    for sub in "${SIBLINGS[@]}"; do
-      if [ -n "$top" ] && { [ -d "$top/$sub/out/soong/.intermediates" ] || [ -d "$top/$sub/out/.soong/.intermediates" ]; }; then
-        root="$top/$sub"; break
-      fi
-    done
-    [ -z "$root" ] && root=${fb_mk:-$fb_repo}
+    top=${fb_tree:-${fb_mk:-$fb_repo}}
+    # [v18.27] 自动探测子项目 —— 与 lua 侧 android_root.find_vendor_subproject 同一口径
+    # (原 SIBLINGS 配置已删)。广度优先, 限深 4 层, 同层多个按名字排序取第一个。
+    # 两轮: 先找带 out 的 (能取 jar); 一个都没有时退回"是源码树"的 (没编译也能认)。
+    if [ -n "$top" ]; then
+      tree_hit=""
+      level="$top"
+      for _d in 1 2 3 4; do
+        nxt=""
+        hits=""
+        for d in $level; do
+          for c in "$d"/*; do
+            [ -d "$c" ] || continue
+            case "$(basename "$c")" in .*) continue ;; esac
+            if [ -d "$c/out/soong/.intermediates" ] || [ -d "$c/out/.soong/.intermediates" ] \
+               || [ -d "$c/out/target/common/obj/JAVA_LIBRARIES" ]; then
+              hits="$hits $c"
+            else
+              if [ -z "$tree_hit" ] && { [ -f "$c/build/envsetup.sh" ] || [ -f "$c/build/make/core/main.mk" ]; }; then
+                tree_hit="$c"
+              fi
+              nxt="$nxt $c"
+            fi
+          done
+        done
+        if [ -n "$hits" ]; then
+          # shellcheck disable=SC2086
+          root=$(printf '%s\n' $hits | sort | head -1)
+          break
+        fi
+        [ -z "$nxt" ] && break
+        level="$nxt"
+      done
+      # 没有任何带 out 的子项目: 用"是源码树"的那个 (可能还没编译)
+      [ -z "$root" ] && [ -n "$tree_hit" ] && root="$tree_hit"
+    fi
+    # 最终回退: 最近的 Android 树 -> 老 main.mk 标记 -> .repo 顶层
+    [ -z "$root" ] && root=${fb_tree:-${fb_mk:-$fb_repo}}
   fi
 fi
 

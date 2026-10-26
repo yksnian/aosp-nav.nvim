@@ -1580,6 +1580,48 @@ JVM 对重复参数取**后者**, 所以生效的是用户的值, 行为正确�
 注释里写明是 "Avoid race condition" 的刻意设计 —— 但它只影响 `configure` 被多跑几次,
 而 `configure` 对同一 `opts` 是幂等的, 实测连续 6 次调用 `exclusions` 恒为 21)。
 
+### 2.19.4 `sibling_projects` 已删: 改成自动探测 (2026-10-26)
+
+**原设计**: 配置项 `sibling_projects = { "soc/qcom/qssi", "google/aosp" }` —— 打开的文件
+祖先里没有 `out/` 时 (典型: ODM/厂商拓展目录自身不编译), 在最近的顶层根下**按这个列表
+的顺序**找兄弟子项目的 `out/`, 借它的 jar。
+
+**为什么删**: 那个列表的**唯一作用**就是回答"哪个兄弟目录有 out" —— 而这是**可以直接
+看出来的**。枚举厂商路径既不通用 (换一家高通/MTK/别的就要改配置), 又永远不可能比实际
+扫描更准。用户原话: **"是不是找哪个目录下有 out 就行, 没 out 找到也没用"** —— 完全正确。
+
+**改成**: `android_root.find_vendor_subproject(top)` —— 广度优先扫描 `top` 之下,
+限深 `SIBLING_MAX_DEPTH = 4` (高通 `soc/qcom/qssi` 是 3 层, 留 1 层余量), 跳过 `.` 开头的
+目录, 命中条件与上溯**同一套** (`has_jar_source`), 同层多个候选按**目录名排序**取第一个
+(结果稳定可复现, 不随 glob 顺序变)。
+
+**同时补了两个标记的分工** (用户指出: `out/` 要编译后才有, `build/envsetup.sh` 不编译
+也存在):
+
+| 标记 | 含义 | 用在哪 |
+| --- | --- | --- |
+| `has_jar_source` | **有 out 产物**, 能取到 jar | 上溯认根、兄弟扫描的**第一轮** |
+| `is_android_tree` | **是 Android 源码树**, 不要求已编译 | 上溯的**候选**、兄弟扫描的**第二轮** |
+
+`is_android_tree` 判据 = `build/envsetup.sh` **或** `build/make/core/main.mk`。
+选 envsetup.sh 为主: 它从 Android 4 至今路径未变, 而 `main.mk` 在 AOSP 13 往 build/soong
+迁移时路径动过 (某些厂商树里位置不同), 故两者并用、以 envsetup 更优先。
+
+**为什么需要第二轮**: 用户 `repo sync` 完还没 lunch/make 时, **任何** `out/` 都不存在。
+只做"找带 out 的兄弟"会整棵树都认不出来, 于是退到外面的 `.repo` 顶层 —— 而那层根本
+不是源码树。第二轮退回"是源码树"的子项目, 让未编译的树也能被认出来 (jar 取不到是当然的,
+等编译后在 `:AospRescan`)。
+
+**两处实现必须同步**: Lua 侧 `android_root.lua` 与 KLS 生成的 bash 脚本
+(`kotlin/classpath.lua` 的 `---- 1. detect ----` 段) 是**同一套逻辑的两个端口** ——
+脚本原先靠 `SIBLINGS=( ... )` 变量接收配置, 现改为脚本内自动探测。改一处务必改另一处,
+否则 Lua 认得的根与 KLS 认得的根会不一致 (两个 LSP 索引不同的树)。
+
+**测试**: `t_root_from_cwd.lua` 尾段加了 8 条 (此前这块**零覆盖**), 用临时假树覆盖:
+标记语义 (两者不可互替) / 有 out 的优先 / 一个都没编译时退回是源码树的 / 从厂商子项目
+里的文件上溯落到**子项目**而非外层顶层根 / 普通子目录不被误认。
+**已验证是真闸**: 去掉第二轮 (直接 return nil) → 报红且失败项正是那条。
+
 ## 3. 导航模式
 
 **对用户只宣传两种体验** (v11 降级后), 由单个键 `java.mode` 表达:
@@ -2608,16 +2650,16 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_follow.lua` | 21 | `java/workspace_follow.lua` (§2.17): `target()` 只认"树内 + 找得到项目标记"的文件 (树内无标记、树外、`""`、`nil` 一律 nil → 不动, 宁可保持当前工作区) 且第二个返回值是 AOSP 根 / 无 client 不插手 (第一台的根归 `root.lua`) / **已在目标项目之内 → 一次字符串比较后静默返回**, 子目录也算之内 / 跨项目 → 发**恰好一条** `didChangeWorkspaceFolders` 且 `added` 指向新项目 (name 是相对 AOSP 根的路径)、`removed` 是旧根 / **`mode` 为 `aosp`·`infer` 时一条都不发** / 树外文件有 client 也不把工作区搬出 AOSP 树。全部注入假 client + 临时目录, 零 LSP |
 | `t_instances.lua` | 44 | jdtls 实例自检 (§2.16), 全部走**注入的假 /proc** (不碰真进程): 盘点只认真 jdtls (命令行里只**含**那个 jar 名的 `grep`、以及 `-jar` 指向别的 jar 的 java 都不算) / 归属判定 (有主 → `owner_pid`; ppid 链到 init → `orphan`) / `ours` 按 `/proc` 缓存根前缀判 / `jdtls_holders`·`foreign_jdtls` 的旧契约 (含 nil·空串·尾斜杠归一) / **回收的两条安全闸** (孤儿+ours 才杀; 有主的、`-data` 在别处的、`enabled=false` 时都不动, 且连 `kill` 都不调) / 默认 killer 对已消失 pid **静默失败** (libuv 的 kill 失败不抛错而是返回 nil, err) / 报告文本: 无事可做时返回 `nil`、有主的重复给 `kill` 行、孤儿已自动回收**不单独通知**、全孤儿时不说"去关 nvim"、**已回收的 pid 不得在 holders 段里再出现一次** (holders 是回收**之前**那份盘点, 不按 pid 扣掉就会"列两遍 + 让你杀一个死 pid"; 这条是 configure 端到端跑出来的回归) / **`-data` 在别处的 jdtls 一律不冒头** (§2.16 把那整段报告删了): `foreign_jdtls` 只收 `data == ws_dir` 的, 别人的 JVM 结构性进不来 / **`force_kill` 的越界闸 (§2.18.1)**: `-data` 无人持有 -> 不杀 / cmd 无 `-data` -> 不杀 / nil client 不抛 / **非本进程后代 (别的 nvim 的 jdtls) -> 拒绝杀** (守卫删掉即变红) |
 | `t_proc.lua` | 19 | `util/proc`: `/proc/<pid>/cmdline` 必须**真的按 NUL 切开参数** (回归"一个 nvim 报 2 个 jdtls 实例") / `is_descendant` 自反与否定 / `comm` 认出 `nvim` (归属判定的地基) / `ancestor_named` 用注入的 reader 造链: 命中 nvim / 走到 init → 孤儿 / 起点自己命中 / comm 读不到 / 成环有上限兜底 / 超过 `limit` |
-| `t_root_from_cwd.lua` | 20 | 痛点 4 的**端到端**回归: 起在 AOSP 根、不打开任何 `.java` 文件时 `aosp_root(nil/"")` 仍拿到树根 (真树断言部分需 `AOSPNAV_LIVE_TEST=1`) |
+| `t_root_from_cwd.lua` | 28 | 痛点 4 的**端到端**回归: 起在 AOSP 根、不打开任何 `.java` 文件时 `aosp_root(nil/"")` 仍拿到树根 / **[v18.27] 厂商布局的子项目自动探测** (§2.19.4): 标记语义 (有 out vs 是源码树, 不可互替) / 有 out 的子项目优先 / 一个都没编译时退回是源码树的子项目 / 从厂商子项目里的文件上溯落到子项目而非外层顶层根 / 普通子目录不被误认 (真树断言部分需 `AOSPNAV_LIVE_TEST=1`) |
 | `t_phase.lua` | 19 | `phase` 是活状态的冻结契约: `ui.statusline()` 对 `idle`/`ready`/`indexing`/`no-out`/`failed` 五态各自的渲染 (`indexing` 必须带 `(idx)`) / `install_phase_handler` **链式**调用原有 handler (不吞掉 nvim-jdtls 的 status 消息) / 只有 `ServiceReady` 翻牌, 其余 `ServiceStatus` 不动 / `no-out`/`failed` 不被覆盖 / `err` 非空不翻牌 / 非 jdtls client 不包装 |
 | `t_source_roots.lua` | 27 | `java/source_roots` 两个入口的**模式闸门** (§5.1): `find` 只在 `mode="aosp"` 给结果、`find_for_project` 只在 `mode="project"` 给结果, 另一个一律 nil / 两者共用同一份扫描 (假项目里同样 2 条根) / 结果**全是相对项目目录**的路径, 无绝对路径 (§2.7 的硬要求) / **空项目在两处都返回 nil 而不是空表** (§2.3: 空 `sourcePaths` 会整体关闭 jdt.ls 推断, 比不注入还糟) / `nil`·`""` 入参退化不抛错 / 二次调用命中缓存结果一致。**`root.project_dir` 一节** (§3 的地雷回归): 两个不同项目给出不同根 / **绝不等于 AOSP 根** (旧 bug 的正面回归) / 树内无项目标记 → nil 不猜 / `workspace_root` 在 project 模式仍返回 nil (旧契约) / 非 project 模式退让 / 项目源码根是**项目相对**而非树相对。全部临时目录造假项目, 零 LSP |
 | `t_source_apply.lua` | 31 | `java/source_apply.lua`: `abs_of` 归一 / `installed` 解析 `.classpath` (去重、带 `excluding`、剥 `_/` 前缀、读不到返回 nil 而非空集) / 真机 `pending` 与磁盘 src 交集为 0 且有序 / 累积根"要么已装要么待装, 绝不丢弃" (**仅 aosp 模式** —— 累积账本是树级的, 只有 aosp 的 `union()` 计入; project 模式改断言核心集自洽, 2026-10-15 修) / 已装与待装不相交 (两模式共有) / 非 core 模式拒绝 / `classify` 三类真实返回值 / 无 client 时 `auto()` 惰性 / `source_apply_auto=false` → `off` / `report()` 每**棵树**只提示一次 (分区键 = workspace 根; §2.15) / **报告文案契约 (2026-10-12)**: 不再出现 `:Aosp!`, 必说"本次退回 jar"与"下次启动自动生效", 且**默认阈值 (warn) 下不可见** (§2.10.1) |
 | `t_root_fallback.lua` | 30 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 / **内存闸 (§2.13.1)**: 可用内存 < 4 GB 时退回已有台, 且发出的**必须是 warn** (默认档可见; 降回 info 则测试变红)、同项目 `once` 去重、内存恢复后照旧起新台 (闸不粘) |
 | `t_workspace.lua` | 42 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 / **`clean_workspace` 删完自动重启** (§2.18): 缓存根之外的 dir 被拒 / 非 java 缓冲只删不重启 / java 缓冲删完重放一次 `FileType` (自动重启) / **命令后窗口切走: 目录仍被删且当前缓冲跑完被还原** (`start_or_attach` 读的是 `nvim_get_current_buf()`, 不摆好窗口就重放不出来 = "清完没重启") / `buftype~=''` 的 java 缓冲不重启 (挡 §2.13 的第二台 jdtls) —— 注入 `dir`/`cache_root`/`defer=false`, 临时目录, 零 LSP | 
 
-合计 **585** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
-`t_jvm` 127 / `t_root_from_cwd` 13 / `t_source_apply` 25 / `t_conflict` 37, 共 **574**)。
-2026-10-23 本机实测默认 **574** / live **585**, 17 个套件 (差值是各套真机块按"真树齐备
+合计 **570** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
+`t_jvm` 127 / `t_root_from_cwd` 13 / `t_source_apply` 25 / `t_conflict` 37, 共 **553**)。
+2026-10-26 本机实测默认 **553** / live **570**, 18 个套件 (差值是各套真机块按"真树齐备
 + 真 jdtls 在跑"的有无整段 SKIP, 非不变量)。
 
 > **[2026-10-15] 真树块两条夹具缺陷已修** (两条都是**夹具**问题, 产品代码无缺陷):
@@ -2635,7 +2677,7 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 
 > 只有 `t_jvm` (127/127)、`t_root_from_cwd` (20/13)、`t_source_apply` (30/25) 和
 > `t_conflict` (41/37) 四个套件的条数**随环境而变** (真树块整段 SKIP 时不计数),
-> 所以 585/574 是当前环境的实测值而非不变量; 其余 13 个套件两种跑法条数相同。
+> 所以 570/553 是当前环境的实测值而非不变量; 其余 13 个套件两种跑法条数相同。
 > 特别注意 `t_jvm` 的真机块: 它要**真有 jdtls 在跑**才算数, 只设 `AOSPNAV_LIVE_TEST=1`
 > 是不够的 (本机 2026-10-10 就出现过"采样时在跑、跑测试时已退出"→ 静默少几条;
 > 2026-10-12 记 §2.10.1 那件事之后 jdtls 被 OOM 杀掉没在跑, 真机块整段 SKIP)。

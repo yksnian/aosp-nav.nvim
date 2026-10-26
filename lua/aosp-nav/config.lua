@@ -26,12 +26,11 @@ M.defaults = {
   log_level = "warn",
   -- nil = 自动检测 (从打开文件路径向上找含 out 产物的目录)
   android_root = nil,
-  -- [v13] 兄弟子项目优先级: 打开的文件自身祖先里没有 out/ 时, 在最近的顶层根下按
-  -- 此顺序找兄弟项目的 out (厂商目录自身不编译的布局, 见 android_root.lua)。
-  -- 原为 android_root.lua 写死的 { "soc/qcom/qssi", "google/aosp" } —— 别家布局要改
-  -- 插件源码才能用, 故提为配置 (kotlin classpath 脚本的 SIBLINGS 也用这一份)。
-  -- 语义 = 整表替换。
-  sibling_projects = { "soc/qcom/qssi", "google/aosp" },
+  -- [v18.27] 原来这里有个 sibling_projects = { "soc/qcom/qssi", "google/aosp" }。
+  -- **已删除** (2026-10-26): 它只是"去哪找带 out 的兄弟目录"的候选列表, 而哪棵树有
+  -- out 是**看得出来**的 —— 枚举厂商路径既不通用 (换一家就得改配置), 也不可能比
+  -- 实际扫描更准。现在由 android_root.find_vendor_subproject 自动探测 (限深 4 层,
+  -- 命中条件与上溯同一套: 必须真带 out 产物)。见该函数注释。
   -- jar 列表缓存目录 (避免每次打开 java 文件都全盘扫描)
   cache_dir = vim.fn.expand("~/.cache/nvim/aosp_nav"),
   java = {
