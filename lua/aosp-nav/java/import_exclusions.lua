@@ -214,18 +214,25 @@ end
 
 --- 组装最终注入给 jdt.ls 的 java.import.exclusions
 --- 顺序: 静态默认 -> 缓存命中的残留目录 -> 用户 import_exclusions
---- (jdt.ls 按序匹配且支持 "!" 反向放行, 用户条目必须靠后);
---- exclude_merge == "replace" 时只保留用户条目
+--- (jdt.ls 按序匹配且支持 "!" 反向放行, 用户条目必须靠后)
 --- 只读缓存, 不做扫描 -> 同步返回, 不会阻塞 jdtls 启动
 --- (缓存不判新鲜度: 过期缓存继续生效, 由 M.is_stale + M.scan_async 后台刷新)
+---
+--- [v18.26] **不受 `exclude_merge` 管辖** (原本受, 是设计错误)。
+--- 为什么分开: `exclude_jars` / `exclude_paths` / `exclude_globs` 是**用户对全树 jar 的
+--- 选择策略** —— 用户设 `replace` 说"我的规则我说了算"完全合理, 那时丢掉默认值正是他
+--- 要的。而这里这一项**不是用户的选择**: 它是插件自己扫出来的"残留 `.project` 会让
+--- 整棵树建不出不可见工程"的自检清单, 外加 jdt.ls 自带的那 6 条默认。用户通常压根不
+--- 知道它存在, 却被 `replace` 连带清空 —— 实测 (2026-10-26) 用户配了
+--- `exclude_merge = "replace"` 只为自己管 jar, 结果 `import.exclusions` 变成 0 条,
+--- `frameworks/base` 下 12 个残留 `.project` 全部漏过, 不可见工程建不出来, 跳转全废。
+--- 所以: 恒定 = 6 条默认 + 扫描结果 + 用户**追加**项。用户想排掉某条默认, 用 jdt.ls 的
+--- `"!"` 前缀反向放行 (它原生支持, 见 BasicFileDetector.isExcluded)。
 --- @param java_cfg table java 段配置
 --- @param root string|nil 扫描基准目录 (jdtls root_dir)
 --- @return table patterns
 function M.effective(java_cfg, root)
   local user = java_cfg.import_exclusions or {}
-  if java_cfg.exclude_merge == "replace" then
-    return vim.deepcopy(user)
-  end
 
   local out, seen = {}, {}
   local function add(list)

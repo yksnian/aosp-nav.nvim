@@ -102,13 +102,25 @@ H.check(eset[TMP .. "/p2"] == true, "effective: 扫描项并入 (含核心回归
 H.check(eset["/user/one"] == true, "effective: 用户项并入")
 H.check(#eff == #pats + 6 + 1, "effective: 默认 6 条 + 扫描 + 用户 1 条, 无重复")
 
--- replace 语义: 只留用户项
+-- [v18.26] exclude_merge **不管** import_exclusions —— 这是刻意的, 且是回归核心。
+-- 起因 (2026-10-26 实测): 用户配置 `exclude_merge = "replace"` (只想自己接管
+-- exclude_jars/exclude_globs), 结果 import.exclusions 被连带清空成 0 条 ->
+-- frameworks/base 下 12 个残留 .project 全部漏过 -> 不可见工程建不出来 -> 跳转全废。
+-- 判据: import_exclusions 不是"用户对全树 jar 的选择", 而是插件自扫的"骨头别啃"
+-- 清单 + jdt.ls 自带 6 条默认; 用户通常不知道它存在, 不该被 replace 清掉。
 local cfg2 = vim.deepcopy(nav.config.java)
 cfg2.exclude_merge = "replace"
 cfg2.import_exclusions = { "/only/mine" }
 local eff2 = IE.effective(cfg2, TMP)
-H.eq(#eff2, 1, "effective: exclude_merge=replace -> 只留用户项")
-H.eq(eff2[1], "/only/mine", "effective: replace 时用户项原样")
+local eset2 = {}
+for _, p in ipairs(eff2) do
+  eset2[p] = true
+end
+H.check(#eff2 > 1, "effective: replace 下 import_exclusions 仍非空 (回归: 曾被清成 0)")
+H.check(eset2["**/node_modules/**"] == true, "effective: replace 下默认项仍在 (jdt.ls 自带 6 条)")
+H.check(eset2[TMP .. "/p2"] == true, "effective: replace 下扫描项仍在 (核心: 残留 .project)")
+H.check(eset2["/only/mine"] == true, "effective: replace 下用户项照旧并入")
+H.check(#eff2 == #pats + 6 + 1, "effective: replace 不影响 import_exclusions 的合成规则")
 
 -- ---------- 缓存: 版本变了要作废 ----------
 local cache_root = vim.fn.tempname()
