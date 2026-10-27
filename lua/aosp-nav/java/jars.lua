@@ -4,6 +4,8 @@
 local M = {}
 
 local log = require("aosp-nav.util.log")
+local jar_filter = require("aosp-nav.java.jar_filter")
+local cache_header = require("aosp-nav.util.cache_header")
 
 -- 缓存格式版本: 过滤算法/缓存布局升级时 bump, 旧缓存自动作废重扫
 local CACHE_VERSION = 6 -- v6: filters 指纹进缓存头 + 目录优先级排序
@@ -44,11 +46,11 @@ end
 --- @param jars table 已排序的 jar 路径列表
 local function write_cache(cache_file, android_root, fhash, jars)
   local cache_lines = {
-    "# version=" .. CACHE_VERSION,
-    "# filters=" .. fhash,
-    "# android_root=" .. android_root,
-    "# generated=" .. os.date("%Y-%m-%d %H:%M"),
-    "# count=" .. #jars,
+    cache_header.line("version", CACHE_VERSION),
+    cache_header.line("filters", fhash),
+    cache_header.line("android_root", android_root),
+    cache_header.line("generated", os.date("%Y-%m-%d %H:%M")),
+    cache_header.line("count", #jars),
   }
   for _, j in ipairs(jars) do
     cache_lines[#cache_lines + 1] = j
@@ -148,32 +150,23 @@ end
 ---         (impl+静态依赖 fat jar) / turbine* (API 签名无方法体) 仅作兜底, 当且
 ---         仅当模块无任何自身产物时按 soong_tag_priority 取一份; java_sdk_library
 ---         的真实编译在 <name>.impl 子模块, 剥后缀归一到主模块名参与去重
----   排除: repackaged-jarjar/jarjar 类型链; exclude_jars 同时匹配 jar 名与
----         模块名 (如 "stubs" 拦住 android-non-updatable.stubs.system 等签名桩)
+---   排除: repackaged-jarjar/jarjar 类型链 (在此处); exclude_jars (同时匹配
+---         jar 名与模块名, 如 "stubs" 拦住 android-non-updatable.stubs.system 等
+---         签名桩)、exclude_paths、exclude_globs 的判定统一走
+---         java/jar_filter.lua 的 is_excluded, 判定语义与长注释随迁彼处
 --- @param base_dir string soong intermediates 根目录 (用于算相对路径)
 --- @param all_matches table 扫描出的 jar 绝对路径列表
 --- @param jars table jar 列表 (追加)
 --- @param seen_paths table 已见路径集合
 --- @return boolean found_any
 --- @return table|nil selected mod_name -> jar_path (v4: 供调用方做 pre-jarjar 后处理)
---- @param opts table|nil { no_path_exclude = boolean } —— [v18.29] true = 跳过
----   **路径类**排除 (exclude_paths / exclude_globs), 但仍应用 `exclude_jars`。
----   给 soong 闭包路径用。
----
----   为什么路径类要跳过: soong 的模块图已经是**精确**的模块级选择, 而
----   exclude_globs/exclude_paths 是给**全树扫描**写的启发式收窄 —— 它们匹配的是
----   `out/soong/.intermediates/` 之后的相对路径, 语义上属于"从几千个候选里挑",
----   闭包已经挑完了, 再叠一层只会在边界情况误伤 (默认规则里的 `^prebuilts/sdk/sdk_`
----   会排掉某些闭包图**真正依赖**的 SDK 桩, 那些桩是该闭包下框架 API 的唯一提供者)。
----
----   为什么 exclude_jars **必须**保留: 它是**名字级**规则 (jar 名 / 模块名), 不依赖
----   目录布局, 在闭包路径上与全树扫描**语义相同** —— 闭包说某模块要编译进来, 不代表
----   它声明的 jar 就该进索引: 树内可能有与框架类**同 FQN 的桩/替身**库, 它们同样会
----   进闭包并抢在真实现之前。这类排除只能靠名字规则做, 路径规则抓不到。
+--- @param opts table|nil { no_path_exclude = boolean } —— [v18.29] true = 跳过路径类
+---   排除 (exclude_paths / exclude_globs), 仍应用 exclude_jars, 给 soong 闭包路径
+---   用。为什么路径类要跳过 / 为什么 exclude_jars 必须保留的完整说明随实现迁在
+---   java/jar_filter.lua 的 is_excluded 函数头, 作为该模块的职责说明保留。
 local function process_soong_matches(base_dir, all_matches, jars, seen_paths, opts)
   local cfg = get_cfg()
   local java_cfg = cfg.java
-  local no_path_exclude = opts and opts.no_path_exclude
 
   -- [v3] type_rank 只决定兜底桶内部排序; own/fallback 的归属由 tag 名决定
   local type_rank = {}
@@ -216,30 +209,12 @@ local function process_soong_matches(base_dir, all_matches, jars, seen_paths, op
     -- 归一到主模块名, 使其与主目录的 combined 竞争同一去重键
     local mod = comps[vi - 1]:gsub("%.impl$", "")
 
-    -- [v3] 排除规则同时匹配 jar 名与模块名: "stubs" 子串可拦住
-    -- android-non-updatable.stubs.system 等签名桩 (桩 jar 名 = 模块名 + .jar)
-    -- [v18.29] **名字级**规则恒应用 —— 包括 soong 闭包路径 (见函数头注释:
-    -- 厂商 fake/stub 库靠它排掉)。
-    local jar_name = comps[#comps]
-    for _, pat in ipairs(java_cfg.exclude_jars) do
-      if jar_name:match(pat) or mod:match(pat) then
-        goto continue
-      end
-    end
-    -- [v18.29] **路径级**规则只在全树/兜底扫描应用 (闭包路径跳过, 见函数头注释)。
-    if not no_path_exclude then
-      -- 排除路径关键词 (普通字符串匹配)
-      for _, kw in ipairs(java_cfg.exclude_paths) do
-        if path:find(kw, 1, true) then
-          goto continue
-        end
-      end
-      -- [v4] Lua 模式排除: 匹配 intermediates 之后的相对路径
-      for _, pat in ipairs(java_cfg.exclude_globs or {}) do
-        if rel:match(pat) then
-          goto continue
-        end
-      end
+    -- 排除判定统一走 java/jar_filter.lua (先排除后分桶, 顺序不变):
+    -- exclude_jars 名字级恒应用 (含 soong 闭包路径); exclude_paths/exclude_globs
+    -- 路径级仅全树/兜底扫描应用 (opts.no_path_exclude 时跳过)。判定语义与
+    -- [v3]/[v4]/[v18.29] 相关注释随迁彼处, 见 is_excluded 的函数头。
+    if jar_filter.is_excluded(java_cfg, path, rel, mod, comps[#comps], opts) then
+      goto continue
     end
 
     local rank = variant_rank(comps[vi]) * 100 + (type_rank[typ] or unknown_rank)
@@ -476,9 +451,9 @@ function M.find_android_jars(opts)
       --   android_root = [#8] 缓存键旧版不单射 (/work/a/b 与 /work/a-b 同键),
       --                  头部树根不符说明这份文件是**别的树**写的, 绝不串台
       if
-        lines[1] == "# version=" .. CACHE_VERSION
-        and lines[2] == "# filters=" .. fhash
-        and lines[3] == "# android_root=" .. android_root
+        cache_header.match(lines[1], "version", CACHE_VERSION)
+        and cache_header.match(lines[2], "filters", fhash)
+        and cache_header.match(lines[3], "android_root", android_root)
       then
         local stat = vim.uv.fs_stat
         for _, line in ipairs(lines) do
@@ -1117,7 +1092,7 @@ end
 ---
 --- [v18.29] **恢复 `exclude_jars` 过滤** (v18.24 曾整个跳过): 它是名字级规则
 --- (jar 名 / 模块名), 不依赖目录布局, 在闭包路径上与全树扫描**语义相同**。
---- 见 process_soong_matches 的函数头注释。
+--- 见 java/jar_filter.lua (is_excluded) 的函数头注释。
 --- 路径级规则 (exclude_paths/globs) 仍不在本函数里 —— 本函数补的是树内 prebuilts
 --- (路径通常不在 out/soong 下), 那两条的匹配对象是 intermediates 布局, 于此无意义。
 local function add_prebuilt_jars(index, closure, aosp_root, jars, seen)

@@ -27,6 +27,7 @@
 local M = {}
 
 local log = require("aosp-nav.util.log")
+local cache_header = require("aosp-nav.util.cache_header")
 
 -- 算法版本: 变更剪枝规则或缓存格式时必须 bump, 否则旧缓存 (含已被剔掉的根,
 -- 或缺少新统计字段的旧 header) 会被继续沿用。
@@ -500,11 +501,11 @@ function M.load(root)
     return nil
   end
   -- 排除配置变了 -> 缓存里的根列表已经不成立, 必须重扫 (整行相等才算命中)
-  if (lines[2] or "") ~= "# exclude=" .. exclude_hash() then
+  if not cache_header.match(lines[2], "exclude", exclude_hash()) then
     return nil
   end
   -- [#8] 树根必须匹配: 键不单射时另一棵树/另一个项目的缓存可能写到同一文件
-  if (lines[3] or "") ~= "# root=" .. root then
+  if not cache_header.match(lines[3], "root", root) then
     return nil
   end
   local stats = { shadow_ratio = SHADOW_RATIO }
@@ -556,9 +557,9 @@ function M.save(root, roots, stats)
   local out = {
     "# aosp-nav.nvim source-roots " .. CACHE_VERSION,
     -- 排除配置指纹, 与 jar 缓存第 2 行 (# filters=) 同构
-    "# exclude=" .. exclude_hash(),
+    cache_header.line("exclude", exclude_hash()),
     -- [#8] 扫描基准 (项目目录) 记进头里, 读侧校验 —— 键不单射时防串台
-    "# root=" .. root,
+    cache_header.line("root", root),
     (
       "# stats roots=%d files=%d ancestor=%d nested=%d test=%d jre=%d shadow=%d dup=%d "
       .. "excl=%d ratio=%.2f"

@@ -22,6 +22,7 @@
 local M = {}
 
 local log = require("aosp-nav.util.log")
+local cache_header = require("aosp-nav.util.cache_header")
 
 -- [v7] 缓存版本: 扫描算法/默认模式变更时 bump, 旧缓存自动作废重扫
 -- [v18.25] 2: 判据从 ".project + .classpath 同目录" 改成 "只认 .project" (见 scan_cmd)。
@@ -114,10 +115,10 @@ function M.cached(root)
   end
 
   local lines = vim.fn.readfile(p)
-  if lines[1] ~= "# version=" .. CACHE_VERSION then
+  if not cache_header.match(lines[1], "version", CACHE_VERSION) then
     return nil
   end
-  if lines[2] ~= "# root=" .. root then
+  if not cache_header.match(lines[2], "root", root) then
     return nil
   end
   local out = {}
@@ -159,10 +160,10 @@ function M.save(root, patterns)
   local cfg = get_cfg()
   vim.fn.mkdir(cfg.cache_dir, "p")
   local lines = {
-    "# version=" .. CACHE_VERSION,
-    "# root=" .. root,
-    "# generated=" .. os.date("%Y-%m-%d %H:%M"),
-    "# count=" .. #patterns,
+    cache_header.line("version", CACHE_VERSION),
+    cache_header.line("root", root),
+    cache_header.line("generated", os.date("%Y-%m-%d %H:%M")),
+    cache_header.line("count", #patterns),
   }
   for _, p in ipairs(patterns) do
     lines[#lines + 1] = p
