@@ -384,10 +384,20 @@ local function hint_if_jar_jump(buf)
   )
 end
 
---- [v18.18] jdt:// 缓冲回填前的占位行数。取值只需覆盖 jump UI 可能设的光标行号:
---- snacks 按 LSP range 的 start.line 设光标, 反编译源码几乎不会比这更短。垫得够高
---- 就不必用 vim.wait 等真内容 —— 这是把"同步等待"换成"占位"的关键。
-local JDT_PLACEHOLDER_LINES = 200
+--- [v18.19] jdt:// 缓冲回填前的占位行数。取值只需覆盖 jump UI 可能设的光标行号:
+--- snacks 按 LSP range 的 start.line 设光标, 垫得够高就不必用 vim.wait 等真内容
+--- —— 这是把"同步等待"换成"占位"的关键。
+--- [v18.18 的 200 被实测穿透, 2026-10-27] 它只对**类型级**跳转成立 (类声明在反编译
+--- 文件头部, 实测 start=36/67); **方法级**跳转的声明行深入得多 —— NetworkStack 跳
+--- 框架类的实测 start.line: WifiManager.getConnectionInfo=510 /
+--- Context.getPackageManager=571 / Context.registerReceiver=1142 /
+--- Context.getSystemService=1286 / ConnectivityManager.startCaptivePortalApp=2209,
+--- 全部 > 200, snacks 在回填前的同步 set_cursor 仍报 "Invalid cursor line: out of
+--- range" (与 v18.18 同一堆栈: actions.lua:149)。回填完成后同缓冲同位置 set_cursor
+--- 成功 (反编译全文实测 1849~3305 行), 即"跳一次报错、再跳一次就好"的由来。
+--- 垫 10000 行 = 实测最大值 2209 的 4 倍余量; 万行空串 set_lines 微秒级, 回填整体
+--- 覆盖, 无感。
+local JDT_PLACEHOLDER_LINES = 10000
 
 --- jdt:// 缓冲的内容加载入口 (供包装体与兜底 handler 共用)。
 --- 与 nvim-jdtls open_classfile 同款的缓冲三件套 + 一次 classFileContents。

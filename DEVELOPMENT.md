@@ -966,6 +966,34 @@ reload、重复 require 出两份实例、测试清标记) 就会**再包一层*
 handler / `""` 时保留 200 行占位且重试触发 / 真内容时 4 行且 `filled=true` 停止重试 /
 `set_cursor` 不再越界。
 
+**v18.19: 200 行占位被方法级跳转穿透 (2026-10-27 headless 实测)** —— 用户再报同一堆栈
+(`snacks actions.lua:149: Invalid cursor line`)。复现脚本用真 jdtls 全链路重放:
+对 NetworkStack 的 NetworkMonitor.java 里的框架类用法发 `textDocument/definition`,
+拿 jdt:// 目标与 range, 再复刻 snacks jump 的动作 (bufadd+bufload 打开 → **立即**
+`nvim_win_set_cursor`)。实测 (`jdt://` 全部带 `?=` 段, 走我们的包装路径):
+
+| 探针 (方法级) | 反编译目标 start.line | 打开瞬间行数 | set_cursor |
+| ------------- | -------------------- | ------------ | ---------- |
+| WifiManager.getConnectionInfo | 510 | 200 (占位) | **越界报错** |
+| Context.getPackageManager | 571 | 200 | **越界报错** |
+| Context.registerReceiver | 1142 | 200 | **越界报错** |
+| Context.getSystemService | 1286 | 200 | **越界报错** |
+| ConnectivityManager.startCaptivePortalApp | 2209 | 200 | **越界报错** |
+| WifiManager (类型级) | 36 | 200 | 成功 |
+| ConnectivityManager (类型级) | 67 | 200 | 成功 |
+
+即 v18.18 的"反编译源码几乎不会比这更短"只对**类型级**声明成立 (类声明在文件头部);
+**方法级**声明深入 510~2209 行, 200 行占位撑不住。回填完成后同缓冲同位置 set_cursor
+全部成功 (反编译全文实测 1849~3305 行) —— 这正是"跳一次报错、再跳一次就好"的由来。
+v18.18 的手工验证只测了 `set_cursor(50)`, 恰好落在 200 以内, 漏掉了方法级场景。
+
+**修法**: `JDT_PLACEHOLDER_LINES` 200 → 10000 (实测最大值 2209 的 4 倍余量)。代价
+可忽略: 万行空串 `set_lines` 微秒级, 回填整体覆盖。重跑复现脚本全绿 (immediate
+set_cursor 全部成功)。Phase 3 另证: **从反编译缓冲内跳 jar 内部引用的 URI 如今也带
+`?=` 段** (FlaggedApi/WifiManager 内跳出去的 5 个探针全部 `hasq=true`), 即上游
+nvim-jdtls 的无占位路径在 definition 链路上基本踩不到; 上游仍处理 `*.class` 结尾的
+`java.decompile` 场景。
+
 ### 2.14 重复 setup 会把用户配置打回默认值 (`M.merge` 的 `base`)
 
 **症状** (用户报告): `:Aosp` 面板的 kotlin 行显示 `enabled=true mode=curated`, 可
