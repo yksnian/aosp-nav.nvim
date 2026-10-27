@@ -259,7 +259,7 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 | java.enabled                      | true                                                         | 全部 | 启用 java 子模块                                             |
 | java.jar_fallback_dir             | ~/.usr/android_jars                                          | 仅兜底 | 无编译产物时 fallback jar 目录                               |
 | java.soong_tag_priority           | {combined, turbine-combined, turbine}                        | soong 闭包 + 全树扫描 | 兜底桶内部顺序; javac/kotlinc 属自身产物桶, 恒全保留         |
-| java.exclude_jars | {R.jar, stubs.jar, lint.jar, dex.jar, srcjarsN.jar, kapt-*.jar, stubs, *-stub, jrt-fs.jar, *-headers} | 全树 + make 扫描 | 排除规则 (Lua 模式), 同时匹配 jar 名与模块名; 覆盖 API 签名桩家族 (stubs/-stub/-headers) 与 JDK 工具 jar |
+| java.exclude_jars | {R.jar, stubs.jar, lint.jar, dex.jar, srcjarsN.jar, kapt-*.jar, stubs, *-stub, jrt-fs.jar, *-headers} | 全部 | 排除规则 (Lua 模式), 同时匹配 jar 名与模块名。名字级规则, **所有收集路径都生效** —— 包括 soong 闭包: 树内可能有与框架类**同 FQN 的桩库**, 不排掉会抢在真实现之前 |
 | java.exclude_globs | {^prebuilts/sdk/sdk_} | 全树扫描 | Lua 模式排除: 匹配 .intermediates/ 之后的相对路径。默认剔除预构建 module SDK 桩; 用户自定义时与默认值**拼接** (见 exclude_merge); 锚定 ^ 可精确到顶层目录, 如 { "^external/cronet/" } |
 | java.exclude_paths | {linux_glibc_common, development/} | 全树扫描 | 排除的路径关键词 (子串匹配); 勿加 android_common_apex (会误杀只有 apex 变体的 core-oj 等模块) |
 | java.exclude_merge | append | 全树扫描 | **jar 侧**排除列表 (`exclude_jars` / `exclude_paths` / `exclude_globs`) 的合并语义: append=用户项追加到默认值后 (推荐); replace=整体替换默认值。**不适用于** `import_exclusions` —— 那一项是插件扫描推导出来的, 不是用户选的 |

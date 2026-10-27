@@ -85,10 +85,14 @@ vim.fn.mkdir(AOSP .. "/out/soong", "p")
 -- intermediates: A 的 javac jar + 闭包外模块 Z 的 jar (应被过滤)
 local IA = AOSP .. "/out/soong/.intermediates/pkg/a/A/android_common/javac/A.jar"
 local IZ = AOSP .. "/out/soong/.intermediates/pkg/z/Z/android_common/javac/Z.jar"
+-- [v18.29] 闭包内、但名字命中默认 exclude_jars 的 "stubs" 模式的模块 jar
+local IS = AOSP .. "/out/soong/.intermediates/pkg/s/viastubs/android_common/javac/viastubs.jar"
 vim.fn.mkdir(vim.fn.fnamemodify(IA, ":h"), "p")
 vim.fn.mkdir(vim.fn.fnamemodify(IZ, ":h"), "p")
+vim.fn.mkdir(vim.fn.fnamemodify(IS, ":h"), "p")
 vim.fn.writefile({ "x" }, IA)
 vim.fn.writefile({ "x" }, IZ)
+vim.fn.writefile({ "x" }, IS)
 -- prebuilt: B 声明的树内预编译 jar (androidx 形态)
 local PB = AOSP .. "/prebuilts/b.jar"
 vim.fn.mkdir(vim.fn.fnamemodify(PB, ":h"), "p")
@@ -108,7 +112,8 @@ vim.fn.writefile({
   "\t\t],",
   '\t\t"dependencies": [',
   '\t\t\t"B",',
-  '\t\t\t"P"',
+  '\t\t\t"P",',
+  '\t\t\t"viastubs"',
   "\t\t],",
   "\t},",
   '\t"B": {',
@@ -156,6 +161,21 @@ vim.fn.writefile({
   '\t\t"dependencies": [',
   "\t\t],",
   "\t},",
+  -- [v18.29] S: 闭包内、名字命中默认 exclude_jars 的 "stubs" 模式的模块。
+  -- 用来钉死"闭包路径也必须应用 exclude_jars" (见下面那条断言)。
+  '\t"viastubs": {',
+  '\t\t"module_type": "java_library",',
+  '\t\t"path": [',
+  '\t\t\t"pkg/s"',
+  "\t\t],",
+  '\t\t"srcs": [',
+  "\t\t],",
+  '\t\t"jars": [',
+  '\t\t\t"out/soong/.intermediates/pkg/s/viastubs/android_common/javac/viastubs.jar"',
+  "\t\t],",
+  '\t\t"dependencies": [',
+  "\t\t],",
+  "\t},",
   "}",
 }, AOSP .. "/out/soong/module_bp_java_deps.json")
 
@@ -163,7 +183,7 @@ vim.fn.writefile({
 -- 预写 TSV 让端到端走"完整闭包"路径 (无 TSV 时 manifest 返回 nil → 降级集)
 local json_mtime = vim.uv.fs_stat(AOSP .. "/out/soong/module_bp_java_deps.json").mtime.sec
 vim.fn.writefile(
-  { "# imj mtime=" .. json_mtime, IA },
+  { "# imj mtime=" .. json_mtime, IA, IS },
   TMP .. "/cache/" .. require("aosp-nav.util.path").cache_key(AOSP) .. ".intermediates-jars.tsv"
 )
 
@@ -193,7 +213,7 @@ H.check(
       and has[PB]
       and not has[IZ]
       and meta.origin == "soong-closure"
-      and meta.closure_n == 3
+      and meta.closure_n == 4
   end)(),
   "closure wiring: jar 集含 A javac + B prebuilt, 排除闭包外 Z"
 )
@@ -222,6 +242,24 @@ H.check(
   end)(),
   "closure wiring: intermediates 产物不由 add_prebuilt_jars 混入 (回归 plain=true 守卫)"
 )
+
+-- [v18.29] 闭包路径**必须应用 exclude_jars** (名字级规则), 只跳过路径级规则。
+-- 为什么名字级规则不能一起跳过: 闭包说某模块要编译进来, 不代表它声明的 jar 就该
+-- 进索引 —— 树里可能有与框架类**同 FQN 的桩/替身**库, 它们同样在闭包里, 且
+-- (JDT 取 classpath 上第一个含该类型的条目) 会抢在真实现之前。排掉它们只能靠
+-- **名字**规则, 路径规则抓不到这种"名字对、位置任意"的情况。
+-- 夹具里的 `viastubs` 模块名含 "stubs", 而那是默认 exclude_jars 里的一条模式 ——
+-- 它虽是 A 的**真实依赖** (在闭包内), 但 jar 必须被排除。
+do
+  local js = jars.project_closure_jars(AOSP, PROJ, { no_cache = true, no_memo = true })
+  local leaked = false
+  for _, j in ipairs(js or {}) do
+    if j == IS then
+      leaked = true
+    end
+  end
+  H.check(not leaked, "closure wiring: 闭包内但名字命中 exclude_jars 的 jar 仍被排除")
+end
 
 -- memo: 第二次调用命中会话缓存
 H.check(
