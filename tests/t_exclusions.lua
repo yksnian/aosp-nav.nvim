@@ -10,13 +10,22 @@
 -- 全部改名后 -> 立刻出现 base_93614236 不可见工程, 跳转恢复。
 --
 -- 本文件全程用临时目录造假树, 不碰真树、零 LSP。
+--
+-- [v18.30] **cache_dir 必须在 setup 时就指向临时目录。** 本套件的 `effective()` /
+-- `ensure_cached()` 会把扫描结果**落盘**到 `cache_dir`, 而 `TMP` 每次都是新的
+-- `vim.fn.tempname()` —— 用真 cache_dir 跑的话每次测试都在用户的
+-- `~/.cache/nvim/aosp_nav/` 里留一个 `import_exclusions-tmp-nvim.<pid>-<rand>-0.txt`,
+-- 且**永不清理** (实测攒了 22 个)。这里一开始就重定向, 结束时删掉。
 local here = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h")
 local PLUGIN = vim.fn.fnamemodify(here .. "/..", ":p"):gsub("/$", "")
 vim.opt.runtimepath:prepend(PLUGIN)
 local H = dofile(here .. "/helper.lua")
 
+local CACHE = vim.fn.tempname()
+vim.fn.mkdir(CACHE, "p")
+
 local nav = require("aosp-nav")
-nav.setup({})
+nav.setup({ cache_dir = CACHE })
 local IE = require("aosp-nav.java.import_exclusions")
 
 -- ---------- escape_glob ----------
@@ -123,24 +132,22 @@ H.check(eset2["/only/mine"] == true, "effective: replace 下用户项照旧并�
 H.check(#eff2 == #pats + 6 + 1, "effective: replace 不影响 import_exclusions 的合成规则")
 
 -- ---------- 缓存: 版本变了要作废 ----------
-local cache_root = vim.fn.tempname()
-vim.fn.mkdir(cache_root, "p")
-local saved_cache = nav.config.cache_dir
-nav.config.cache_dir = cache_root
+-- cache_dir 已在文件头指向 CACHE (临时), 这里不必再切。
 IE.save(TMP, { "/cached/a", "/cached/b" })
 local back = IE.cached(TMP)
 H.check(back ~= nil and #back == 2, "cache: save/cached 回读一致")
 
 -- 伪造一个旧版本缓存 -> cached() 必须视为无效 (这是 CACHE_VERSION 的作用)
-local cpath = cache_root .. "/" .. require("aosp-nav.util.path").cache_key(TMP) .. ".exclusions.txt"
+local cpath = CACHE .. "/" .. require("aosp-nav.util.path").cache_key(TMP) .. ".exclusions.txt"
 local fh = io.open(cpath, "w")
 fh:write("# version=1\n# root=" .. TMP .. "\n# count=1\n/old/stale\n")
 fh:close()
 IE.invalidate(TMP)
 H.eq(IE.cached(TMP), nil, "cache: 版本不匹配 -> 视为无缓存 (bump CACHE_VERSION 才作废得掉)")
 
-nav.config.cache_dir = saved_cache
+-- 收尾: 两个临时目录都删干净 (真 cache_dir 全程未被写过)
 vim.fn.delete(TMP, "rf")
-vim.fn.delete(cache_root, "rf")
+vim.fn.delete(CACHE, "rf")
+H.check(vim.fn.isdirectory(CACHE) == 0, "收尾: 临时 cache_dir 已删除")
 
 H.finish("exclusions")

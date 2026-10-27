@@ -2674,6 +2674,37 @@ H.check(false, "some message")   -- 才真的失败
 **教训**: 一个"恒真"的断言比没有断言更糟 —— 它占地、看着可信、且掩盖真实缺陷。
 改测试时务必确认第一参数是**表达式**而不是字符串字面量。
 
+### 10.0.1 写测试第二条: 别让测试往用户的**真缓存**里写 (2026-10-27)
+
+**症状 (用户发现)**: `~/.cache/nvim/aosp_nav/` 下攒了 **22 个**
+`import_exclusions-tmp-nvim.user-<rand>-0.txt`。每个都是**一次测试运行**留下的,
+且**永不清理** —— 文件名带 `tmp-` 前缀与随机 tempname, 一眼可辨。
+
+**根因**: `t_exclusions.lua` 用临时目录造假树, 但 `effective()` → `ensure_cached()` →
+`save()` 会把扫描结果**落盘到 `cache_dir`**。而该套件只在**后面某个块**里把 `cache_dir`
+换成临时目录, **前面的** `effective()` 调用跑在**真的** `cache_dir` 上 —— 于是每次运行
+都往用户缓存里写一个以 `TMP` (每次都是新的 `vim.fn.tempname()`) 命名的文件。
+
+**为什么其他套件没这问题**: 它们大多**不调用**会落盘的接口 (`scan_sync` 纯读不写);
+凡是会写的, 都必须像本节这样把 `cache_dir` 重定向到临时目录。
+
+**修法**: `nav.setup({ cache_dir = CACHE })` —— **在文件头 setup 时就重定向**, 而不是
+中途改; 收尾删掉 `CACHE`。中途改的问题是"改之前的那段仍然写真的"。
+(旧版还有 `saved_cache` 保存/恢复的写法 —— 现在整场都在 `CACHE` 里, 不需要恢复。)
+
+**验收方式 (值得复用)**: 跑测试**前后 diff 真缓存目录**, 断言无新文件:
+```bash
+ls ~/.cache/nvim/aosp_nav/ > /tmp/before.txt
+bash tests/run.sh
+ls ~/.cache/nvim/aosp_nav/ > /tmp/after.txt
+diff /tmp/before.txt /tmp/after.txt     # 必须无输出
+```
+`AOSPNAV_LIVE_TEST=1` 那轮同样要跑一遍 (真树块可能触发更多落盘)。
+
+**教训**: 测试"用了临时目录"不等于"没碰真实环境" —— 只要被测代码内部有**自己的落盘
+路径** (缓存/顺序文件/日志), 就必须显式把它也指向临时目录。判断方法是问一句:
+**这段代码会不会写磁盘? 写到哪?**
+
 ### 10.1 仓库内的套件 (维护入口)
 
 `tests/` 是本仓库**唯一被跟踪**的测试, 一条命令跑全部:
@@ -2695,7 +2726,7 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_commands.lua` | 17 | 命令面冻结契约: 恰好 5 个 `:Aosp*` 命令 (含 `:AospDebug`), 且删掉的那 7 个一个都不在; `:Aosp`/`:AospDebug` 都是 bang 命令 |
 | `t_conflict.lua` | 41 | 会话隔离 (§2.16.1): `session_conflict.check` 四种情形 (有**主的**别的 jdtls 占同一 `-data` → 冲突 / 无 → 不冲突 / 只剩孤儿 → 不冲突 / `-data` 在别处 → 不冲突; 全部注入假依赖, 不碰真 `/proc`) 且同一 `ws_dir` 只扫一次 (结果按会话缓存, configure 与 project_name 包装器共用同一判定) / 算不出 `-data` 时不扫 foreign 且不冲突 / `isolation_name` = `base.."-nvim"..pid`, 同 base 换 pid 换名字 (隔离成立的前提)、同会话稳定、空/nil base → nil / `cleanup` 的归属闸 (`isolation_dir_owned`): 缓存根之下 + **本进程** `-nvim<pid>` 后缀才认, 隔离根与其 `workspace/` 子目录两形态都认; 共用 `qssi/workspace`、别人的后缀、别处 `-data`、`/`、nil、空串、`<cache_root>-evil` 兄弟目录一律判否 / `isolation_root` 归约 (workspace 子路径 → 根) / **端到端**: 只剩 `config/` 的泄漏目录被 `cleanup(不存在的 workspace)` 整个删掉 (回归 2026-10-13 泄漏), 共用的 `qssi/workspace` 不动 / **`configure` 集成回归闸**: 无冲突时 `opts.project_name` **逐引用相同**、照旧返回 basename —— "不影响单 nvim 正常路径"的证据 / **收尾回归闸**: 全程把 `SC.set_cache_root` 指向临时目录, 断言真缓存根里没被写进任何 `-nvim<pid>` 目录 (回归 2026-10-13 "测试在真缓存里留下 `qssi-nvim<pid>`"; 真树那块需 `AOSPNAV_LIVE_TEST=1`) / **真树块**: 冲突时 `project_name` 变隔离名 + `state.get(<AOSP 根>).limited == true` **且** `state.get().limited == false` (钉住 §2.15 `#3` 的"状态按树分区"契约; 2026-10-15 修) |
 | `t_config.lua` | 37 | 本轮重构引入/删除的键: 死键静默丢弃 (不映射、不告警) / `merge` 不改调用方的表 / `source_apply_max_roots` 不再是配置键 / **重复 setup 不得打回默认值** (见 §2.14): 空参 `setup()` 后 `kotlin.jar_mode`·`log_level` 仍是用户值 / 第二次带参 setup 不丢上一次的键 / 新表产出且旧表不被就地改写 / 排除名单 append 语义未回归 / **合并结果不与 `M.defaults` 共享子表**, 就地改它不污染默认值 (标量+列表) |
-| `t_exclusions.lua` | 25 | `java/import_exclusions.lua` (§2.19): `escape_glob` 转义 `[ ] * { }` / 扫描判据 = **只认 `.project`** (jdt.ls 的 EclipseProjectImporter 就凭它导入; 多要一个 `.classpath` 会让"有 .project 无 .classpath"的 Gradle 工程漏网, 而一个漏网的可见工程足以废掉整棵树的不可见工程) / 只有 `.classpath` 的目录不排除 / 深层 (dir-depth 5, jdt.ls 的边界) 够得着 / 产出全是**目录**不含文件名 / `effective` 合成规则 (6 条默认 + 扫描 + 用户追加, 去重) / **`exclude_merge` 不管 `import_exclusions`** (回归: replace 曾把它清成 0) / 缓存版本不匹配视为无缓存 |
+| `t_exclusions.lua` | 26 | `java/import_exclusions.lua` (§2.19): `escape_glob` 转义 `[ ] * { }` / 扫描判据 = **只认 `.project`** (jdt.ls 的 EclipseProjectImporter 就凭它导入; 多要一个 `.classpath` 会让"有 .project 无 .classpath"的 Gradle 工程漏网, 而一个漏网的可见工程足以废掉整棵树的不可见工程) / 只有 `.classpath` 的目录不排除 / 深层 (dir-depth 5, jdt.ls 的边界) 够得着 / 产出全是**目录**不含文件名 / `effective` 合成规则 (6 条默认 + 扫描 + 用户追加, 去重) / **`exclude_merge` 不管 `import_exclusions`** (回归: replace 曾把它清成 0) / 缓存版本不匹配视为无缓存 |
 | `t_jvm.lua` | 127 | `util/jvm.assess` (此前**完全没有**测试): `-Xmx6G` 判否 / `--jvm-arg=` 前缀剥离 / 重复 `-Xmx` 后者胜 / `UseParallelGC` 识别 / 无值·无键·nil cmd 不崩 / **`xmx_over_host`** (§8.1.2): `-Xmx16G` 在 512G 宿主静默·在 15G 宿主报警且建议**调小** (不得误报 `xmx_small`) / 80% 边界恰好不报·超过才报 / `MemTotal` 读不到时跳过该检查 / `host_mem_total()` 真读 `/proc/meminfo` (正数或 nil, 不崩)。`util/jvm_live` (**活进程遥测**, §8.1.1): PerfCounter 解析 (去引号、值含 `=`、缺键) / uptime 与 `/proc/<pid>/status` (读不到是 nil 而非 0) / heap_info 三种形态 / young·major 按**名字**分类 (G1 的第三个 collector **不得**算 major) / 间隔按 `uptime/invocations` **自算**(不信 `avg*IntervalTime`) / 五条 fixture 的判定 (实测形态 → 三条 info 且零 warn; 6G 死亡螺旋 → 三条 warn; 健康 G1 → 零 finding; **G1 但新生代 <5% → 仍零 finding**, `young_gen_tiny` 只对 ParallelGC 报; 空快照不崩) / `find_jcmd` 三条回退路径 (注入式, 不碰 `/proc`) / jcmd 对死 pid 的失败路径 (退出码不可靠, 空 stdout 必须自己判失败) / `render` 的每一项都不得含换行 (`nvim_buf_set_lines` 会直接抛) |
 | `t_log.lua` | 54 | `util/log.lua`: 四档阈值比较 / `log.user` 绕过阈值 / 会话内 `once` 去重 / `once` 被阈值挡下时**不消费**登记 / 消息前缀 |
 | `t_module_deps.lua` | 22 | `java/jars` 的 **soong 依赖闭包** (§2.19): `module_bp_java_deps.json` 解析 (依赖图去重 / 传递闭包 / 缺文件退化) / manifest TSV 读回与 mtime 失效 / 闭包缓存按 (树, 项目) 键控且随产物 mtime 失效 / 降级集 ⊆ 完整集 (热补只增不减) / **闭包路径仍应用 `exclude_jars`** (§2.19.6): 闭包内但名字命中排除模式的 jar 必须被排掉 (回归 v18.24 的 no_exclude 矫枉过正) |
@@ -2711,8 +2742,8 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_root_fallback.lua` | 30 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 / **内存闸 (§2.13.1)**: 可用内存 < 4 GB 时退回已有台, 且发出的**必须是 warn** (默认档可见; 降回 info 则测试变红)、同项目 `once` 去重、内存恢复后照旧起新台 (闸不粘) |
 | `t_workspace.lua` | 42 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 / **`clean_workspace` 删完自动重启** (§2.18): 缓存根之外的 dir 被拒 / 非 java 缓冲只删不重启 / java 缓冲删完重放一次 `FileType` (自动重启) / **命令后窗口切走: 目录仍被删且当前缓冲跑完被还原** (`start_or_attach` 读的是 `nvim_get_current_buf()`, 不摆好窗口就重放不出来 = "清完没重启") / `buftype~=''` 的 java 缓冲不重启 (挡 §2.13 的第二台 jdtls) —— 注入 `dir`/`cache_root`/`defer=false`, 临时目录, 零 LSP | 
 
-合计 **625** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
-`t_jvm` 127 / `t_root_from_cwd` 21 / `t_source_apply` 25 / `t_conflict` 37, 共 **608**)。
+合计 **626** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
+`t_jvm` 127 / `t_root_from_cwd` 21 / `t_source_apply` 25 / `t_conflict` 37, 共 **609**)。
 2026-10-27 本机实测默认 **608** / live **625**, 18 个套件 (差值是各套真机块按"真树齐备
 + 真 jdtls 在跑"的有无整段 SKIP, 非不变量)。
 
@@ -2731,7 +2762,7 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 
 > 只有 `t_jvm` (127/127)、`t_root_from_cwd` (20/13)、`t_source_apply` (30/25) 和
 > `t_conflict` (41/37) 四个套件的条数**随环境而变** (真树块整段 SKIP 时不计数),
-> 所以 625/608 是当前环境的实测值而非不变量; 其余 13 个套件两种跑法条数相同。
+> 所以 626/609 是当前环境的实测值而非不变量; 其余 13 个套件两种跑法条数相同。
 > 特别注意 `t_jvm` 的真机块: 它要**真有 jdtls 在跑**才算数, 只设 `AOSPNAV_LIVE_TEST=1`
 > 是不够的 (本机 2026-10-10 就出现过"采样时在跑、跑测试时已退出"→ 静默少几条;
 > 2026-10-12 记 §2.10.1 那件事之后 jdtls 被 OOM 杀掉没在跑, 真机块整段 SKIP)。
