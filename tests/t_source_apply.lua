@@ -71,7 +71,8 @@ vim.fn.delete(TMP, "rf")
 -- [2026-10-15] 累积根不变量已按其真正的作用域分叉: 它是 source_inject 的**树级** LRU
 -- 账本, 只有 mode="aosp" 的 union() 才计入。v18.8 起默认 "project", union() 只回核心集,
 -- Wifi 的累积根与本次会话无关, 故 project 分支改为断言核心集自洽 (见下方 in-block 注释)。
-local LIVE = (vim.env.HOME or "") .. "/project/aosp"
+-- 真树路径可配 (AOSPNAV_LIVE_TREE); 缺省 ~/aosp —— 仓库里不落任何个人环境路径
+local LIVE = os.getenv("AOSPNAV_LIVE_TREE") or ((vim.env.HOME or "") .. "/aosp")
 local HANDLER = LIVE .. "/frameworks/base/core/java/android/os/Handler.java"
 if vim.env.AOSPNAV_LIVE_TEST == "1" and vim.fn.filereadable(HANDLER) == 1 then
   local pending, err = sa.pending(HANDLER)

@@ -54,7 +54,7 @@ end
 --- 退路只在"buf 0 根本不是 java 文件"时启用 (任取一个已加载且落在 AOSP 树内的
 --- .java 缓冲)。buf 0 是 java 文件就一律照旧 —— 否则在同一会话里同时开 AOSP 与
 --- 普通 java 工程时, 后者会被拽进 AOSP 配置。
---- [v10] 一个 .java 缓冲都没有时 (例如 `cd ~/project/aosp && nvim` 无文件启动,
+--- [v10] 一个 .java 缓冲都没有时 (例如 `cd ~/aosp && nvim` 无文件启动,
 --- 或从 picker/dashboard 打开): 退回 util.path.start_dir("") = cwd 作为探测起点。
 --- 没有这条, 下游 jar 收集 / sourcePaths / exclusions 全都拿不到根而**整体静默
 --- 失效** (aosp_root=nil -> is_android=false)。注意必须走 path.start_dir: 空串在
@@ -835,6 +835,22 @@ local function step_session_state(st)
   --     树"由面板的 "aosp root: <not an AOSP file>" 行表达, 状态栏对它返回空串。
   if is_android then
     local jar_status = jars_mod.cache_status(jar_root_found)
+    -- [v18.20] 写 key 必须与读 key 同源。state 的分区键是**树级 aosp_root**
+    -- (sibling=false 语义) —— tree_key/panel_basis (展示侧)、翻牌钩子
+    -- (install_phase_handler)、hotpatch 回填 (hotpatch_instance) 全用这个语义;
+    -- 唯独这里曾用 find_android_jars 的 jar_root_found (sibling=true 语义)。
+    -- 两个语义在 vendor 布局下分叉 (2026-10-27 实测复现):
+    --   <top>/{aosp/out, vendor/ext/frameworks/base} —— 顶层无 out,
+    --   产物在兄弟子项目 aosp 下, framework 拓展目录自身不编译。
+    --   此时 jar_root_found = <top>/aosp (sibling 扫描命中), 而
+    --   aosp_root(bufname) = <top> (sibling=false 回退 fallback_tree)。
+    --   于是 indexing/jars/origin 写进 <top>/aosp 槽, 面板读 <top> 槽 ——
+    --   从未写过, 恒显示 idle/0/nil (索引与跳转完全正常, 纯展示错位); 且翻牌
+    --   钩子因该槽 phase 恒 blank 而永不翻牌, 连锁失效。
+    -- aosp_root 与 jar_root_found 同生共死: sibling 扫描的前提是 fallback 链
+    -- 命中, 而 fallback 收集在 sibling=false 的同一段上溯里照做 —— 两者同时
+    -- nil/非 nil, 这里不会引入新的 nil; 兜底 jar_root_found 仅作保险。
+    local state_key = require("aosp-nav.java.root").aosp_root(st.bufname) or jar_root_found
     require("aosp-nav.state").set({
       -- phase 由**真信号**驱动 (见下面的 11b): 这里先给出"jdt.ls 即将导入+构建"
       -- 这个初值, 等 jdt.ls 自己报 ServiceReady 才翻成 "ready"。绝不在 configure
@@ -854,7 +870,7 @@ local function step_session_state(st)
       -- 面板靠它解释"为什么这个窗口跳转落 jar"。
       limited = limited or false,
       isolated_index = limited and conflict.ws_dir or nil,
-    }, jar_root_found)
+    }, state_key)
   end
 
   -- 11b. phase 的**第二个写入者**: jdt.ls 报导入+构建结束时翻牌 (实现与理由见

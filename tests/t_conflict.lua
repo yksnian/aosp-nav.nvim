@@ -247,7 +247,8 @@ local opts_repo = make_opts()
 H.check(pcall(javainit.configure, opts_repo), "configure (本仓库, 非 AOSP) 不抛异常")
 
 -- 真树: 有冲突 -> 隔离生效 (project_name 被包装, 带本进程后缀)
-local LIVE = (vim.env.HOME or "") .. "/project/aosp"
+-- 真树路径可配 (AOSPNAV_LIVE_TREE); 缺省 ~/aosp —— 仓库里不落任何个人环境路径
+local LIVE = os.getenv("AOSPNAV_LIVE_TREE") or ((vim.env.HOME or "") .. "/aosp")
 if vim.env.AOSPNAV_LIVE_TEST == "1" and vim.fn.isdirectory(LIVE) == 1 then
   local HANDLER = LIVE .. "/frameworks/base/core/java/android/os/Handler.java"
   if vim.fn.filereadable(HANDLER) == 1 then

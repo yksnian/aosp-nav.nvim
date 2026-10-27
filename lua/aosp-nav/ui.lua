@@ -154,9 +154,12 @@ local function source_root_counts(fname)
     local pend = sa.pending(bufname)
     return { view = "disk", installed = #installed, pending = pend and #pend or 0, ws_dir = ws_dir }
   end
-  -- 内存账本也要按**当前 buffer 的树**取: 全局账本在多树会话里会混进另一棵树的项目
-  local st =
-    require("aosp-nav.java.source_inject").state(require("aosp-nav.java.root").aosp_root(bufname))
+  -- 内存账本要按**当前 buffer 的树**取: 全局账本在多树会话里会混进另一棵树的项目。
+  -- [v18.21] 账本键是**取 jar 根** (sibling=true 语义; configure 记账用它), 不是树级
+  -- aosp_root (sibling=false) —— vendor 布局 (out 在兄弟子项目、工作文件在无 out 的
+  -- 拓展目录) 下两键分叉, 按 aosp_root 取会读空槽。这里复用 basis.jar_root, 与 jar
+  -- 缓存行 / :AospRescan 的重扫路径同一套解析 (DEVELOPMENT.md §2.20)。
+  local st = require("aosp-nav.java.source_inject").state(basis_mod.jar_root(bufname))
   return { view = "memory", installed = st.installed, pending = st.pending, ws_dir = ws_dir }
 end
 
@@ -930,7 +933,9 @@ local function source_roots_section(fname)
   -- [#3] 面板缓冲上运行时按 panel_basis 回退 (与 diagnose 同一基准)
   local aosp_root = basis_mod.panel_basis(bufname)
   local mode = mode_of(cfg)
-  local st = require("aosp-nav.java.source_inject").state(aosp_root)
+  -- [v18.21] 账本键 = jar 根 (与 configure 记账同源), 不是 panel_basis 的树根:
+  -- vendor 布局下两键分叉, 直接用树根读到空账本 (同 source_root_counts 的注释)
+  local st = require("aosp-nav.java.source_inject").state(basis_mod.jar_root(aosp_root))
   local counts = source_root_counts(aosp_root)
   local acc_roots = 0
   for _, p in ipairs(st.projects) do

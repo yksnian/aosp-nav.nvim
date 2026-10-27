@@ -47,7 +47,7 @@ mkdir(proj("pathonly_proj") .. "/org.eclipse.jdt.core")
 mkdir(proj("jdt.ls-java-project"))
 
 write(res .. "/.root/7.tree", {
-  "aosp_3f7ad7da",
+  "aosp_30a30216",
   "live_proj",
   "intree_proj",
   "/tmp/src/pathonly_proj/inner",

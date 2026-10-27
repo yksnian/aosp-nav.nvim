@@ -277,7 +277,7 @@ if (hasTargetFile(dir)) directories.add(dir);        // 命中 .project/.classpa
 
 即 `<root_dir 的 basename>_<Java hashCode 的无符号 16 进制>`。Lua 侧按 `h = h*31 + byte`
 + 2^32 环绕 + `%x` 复算即可 (`ui.invisible_project_name`)。已知向量:
-`~/project/aosp` → `aosp_3f7ad7da` (与本机真实工作区一致)。
+`/opt/aosp` → `aosp_30a30216` (按上式可复算)。
 有了它, 一次 `glob` 就能把"本该存在的 invisible project"与"外部可见工程"分开 ——
 前缀匹配会误伤名字恰好以 `aosp_` 开头的正常工程。见 `ui.workspace_blockers`。
 
@@ -1454,7 +1454,7 @@ workspace 无直接效果。
 ```
 Connectivity/workspace → Connectivity_6ab51fcc, jdt.ls-java-project
 Wifi/workspace         → Wifi_e774a2a
-aosp/workspace         → aosp_3f7ad7da      (10-13 旧默认模式的遗留, 现已无法再生成)
+aosp/workspace         → aosp_30a30216      (10-13 旧默认模式的遗留, 现已无法再生成)
 base/workspace         → base_93614236
 ```
 
@@ -1774,6 +1774,85 @@ ASfP 是 IDE 插件, 给每个模块建独立 **iml** 并靠**模块间依赖**�
 并导出 `jars._closure_excluded` 供直接断言。钉三件事: 不过闸时它在闭包内 (对照) /
 过闸时它消失 / 名册外的模块 (含 `framework`) **不受影响** —— 最后一条正是"名册相较
 路径前缀"的关键差别。**已验证是真闸**: 把闸改成恒 `false` → 3 条断言报红。
+
+### 2.20 state 会话槽写键/读键分叉: vendor 布局下面板恒 idle (2026-10-27)
+
+**症状** (用户报, 另一台机器): 索引早已完成、跳转正常, `:Aosp` 面板的 session 行却恒
+显示 `phase=idle jars=0 origin=nil` —— 纯展示错位, 功能本身 (jar 收集 / 注入 / 跳转)
+自始至终正常。
+
+**布局** (vendor 拓展形态, 虚拟命名):
+
+```
+<top>/
+  aosp/frameworks/base          <- 主树源码
+  aosp/out                      <- 产物
+  vendor/ext/frameworks/base    <- framework 拓展 (自身不编译, 无 out)
+```
+
+关键: **顶层无 out**, 产物在子目录 `aosp` 下; 拓展目录与主树源码平级。
+
+**根因**: sibling 语义在两个解析器之间分叉。§2.19.4 之后 `find_android_platform_root`
+有两个语义: `sibling=false` (只认文件真实祖先) 与默认 `sibling=true` (顶层没 out 时
+回退扫描兄弟子项目)。state 的分区键契约 (§2.15 `#3`) 是**树级 aosp_root** —— 展示侧
+(`basis.tree_key`/`panel_basis`)、翻牌钩子 (`install_phase_handler`)、hotpatch 回填
+(`hotpatch_instance`) 全部走 `java/root.lua` 的 `aosp_root` (sibling=false)。唯独
+`configure` 管道里的 `step_session_state` 用了 `find_android_jars` 的第二返回值
+`jar_root_found` (sibling=true) 当 key:
+
+* 写侧: `aosp_root(拓展目录的文件)` → sibling=false → 顶层无 out、祖先链无 out →
+  回退 `fallback_tree` = `<top>`;
+* 读侧: `find_android_jars` 的 jar 根解析 → sibling=true → `find_vendor_subproject`
+  扫到带 out 的子项目 = `<top>/aosp` (取 jar 语义**正确**: jar 就在那里);
+* 于是 `indexing/jars/origin` 写进 `<top>/aosp` 槽, 面板读 `<top>` 槽
+  —— 从未被写过, 恒 `blank()` = idle/0/nil;
+* 连锁: 翻牌钩子的 key 也是树级 `<top>`, 该槽 phase 恒 blank → ServiceReady
+  永远翻不动牌。
+
+**fixture 实测** (纯文件系统探针, 零 jdtls): 造
+`/tmp/fx/android/{build/envsetup.sh, vendor/ext/frameworks/base/core/java/A.java}`,
+out 产物放**兄弟子项目** (`aosp/out`, 等比模拟布局里带 out 的主树子项目)。
+前两轮 (out 放顶层 / 放文件祖先链上) **都复现不了** —— 两个解析器都直接命中同一层,
+key 一致; 分叉只在"out 在兄弟子项目、工作文件在无 out 的拓展目录"这一种组合下出现。
+第三轮精确复现 (修复前):
+
+```
+WRITE find_android_jars jar_root_found = /tmp/fx/android/aosp
+READ  panel_basis(panel_buf)           = /tmp/fx/android
+state[/tmp/fx/android]                 = idle / 0 / nil          <- 面板读的槽
+state[/tmp/fx/android/aosp]            = indexing / 1289 / cache <- 写了没人读
+```
+
+**修法** (v18.20): `step_session_state` 的写键改为与读键同源:
+
+```lua
+local state_key = require("aosp-nav.java.root").aosp_root(st.bufname) or jar_root_found
+```
+
+不会引入新 nil: `aosp_root` 与 `jar_root_found` **同生共死** —— sibling 扫描的前提是
+fallback 链命中, 而 fallback 收集在 sibling=false 的同一段上溯里照做, 两者同时
+nil/非 nil; 兜底 `jar_root_found` 仅作保险。**取 jar 语义不动**: `find_android_jars` /
+`cache_status` / state 的 `android_root` 字段仍用 sibling=true 的 jar 根 (jar 必须从
+带 out 的子项目取)。修复后同 fixture:
+
+```
+state[/tmp/fx/android]      = phase=indexing jars=1289 origin=cache
+state[/tmp/fx/android/aosp] = idle / 0 / nil   <- 旧槽不再接收
+```
+
+**同类隐患 (v18.21 已修)**: `ui.lua` 的 `source_root_counts` (内存视图) 与面板
+source-roots 区读的是 `source_inject.state(aosp_root(bufname))`, 而 `source_inject`
+的账本以**取 jar 根**为键 (`configure` 记账用 `source_inject.state(jar_root_found)`)
+—— vendor 布局下 memory 视图会读到空账本。仅影响 aosp 模式的展示计数。修法**不改账本
+键** (账本键 = jar 根是对的), 改读侧: 两处都先经 `basis.jar_root(...)` 解析再取 ——
+与 jar 缓存行、`:AospRescan` 的重扫路径同一套解析 (重扫路径本就以此为准, 键位一直是
+对的)。探针补一条对齐断言, fixture 实测:
+
+```
+READ ledger: basis.jar_root(panel_basis)     = /tmp/fx/android/aosp   == jar_root_found (key aligned)
+```
+
+**测试**: 19 个套件全过; stylua v0.20.0 `--check` 过。
 
 ## 3. 导航模式
 
@@ -2272,7 +2351,7 @@ reset()  再清一次 (用户真的按了 :AospRescan)
 >
 > **确认**: 同一个累积 workspace (`src=247` 在 lib 之前) 放到索引稳定后再探,
 > `definition(Handler)` 第一次就返回
-> `file://~/project/aosp/frameworks/base/core/java/android/os/Handler.java`
+> `file://~/aosp/frameworks/base/core/java/android/os/Handler.java`
 > (`t=309 s err=nil`)。所以"累计 247 根仍然能跳到真实 .java"是成立的, 之前
 > 的 <nil> 全是被索引期掩盖的。
 
@@ -2305,7 +2384,7 @@ jar)。README 的 AIDL FAQ 保留这一段结论, 机制在此。
 | 观测 | 值 |
 | --- | --- |
 | 日志里的 JVM 启动次数 | **4**(20:54:46 / 22:22:38 / 00:10:28 / 00:31:54) |
-| `Finished creating the Java project aosp_3f7ad7da` | **1**(只有第 1 次) |
+| `Finished creating the Java project aosp_30a30216` | **1**(只有第 1 次) |
 | `Updating classpath` / `Adding … to the classpath` | 每次启动都做, 合计 3701 条 (每次 800–1126) |
 | `build jobs finished` | 每次启动都有 |
 | 每次启动后的**无日志高 CPU 静默期** | 1h24m / 1h46m / 20m / 5.5m |
@@ -2553,7 +2632,7 @@ OOM-kill (`GC Thread#6 invoked oom-killer`: 一个正在 GC 的线程触发的)�
 
 | 场景 | `.projects/` 内容 | invisible project |
 | ---- | ---- | ---- |
-| 全新 `-data` + 完整 init_options | `aosp_3f7ad7da` | ✅ 建出来了 |
+| 全新 `-data` + 完整 init_options | `aosp_30a30216` | ✅ 建出来了 |
 | 全新 `-data`, 但 `configure` 取错起点文件 (§2.8) | `app`, `jdt.ls-java-project` | ❌ |
 | 全新 `-data`, init 里没有 gradle 禁用 | `Spa`, `TouchLatency`, `app`, `gradle-sample`, `jdt.ls-java-project` | ❌ |
 
@@ -2570,7 +2649,7 @@ OOM-kill (`GC Thread#6 invoked oom-killer`: 一个正在 GC 的线程触发的)�
 `~/.cache/nvim/jdtls/aosp/workspace` (本机真实工作区)。
 
 **测量 1 — 工程源码索引这次真的落盘了。**
-`aosp_3f7ad7da/.metadata/.plugins/org.eclipse.jdt.core/264720899.index` 现在 **72.5 MB**,
+`aosp_30a30216/.metadata/.plugins/org.eclipse.jdt.core/264720899.index` 现在 **72.5 MB**,
 mtime 17:27; 而 2026-09-30 同一文件只有 **25 字节** (空)。索引总量: **1129 个 `.index`
 文件 / 931 MB**, 其中 **1126 个是 jar 索引**, 缓存自 10-01。
 方法: `stat` 目标文件 + `find … -name '*.index' | wc -l` 与 `du -sh` 统计全量。
@@ -2674,7 +2753,7 @@ section 4 会 `si.reset()` 再手工写回 —— 在飞扫描一度把写回的
 # 闸门 A: 冷缓存 + 新工作区 -> 排除项齐了, invisible project 建得出来
 nvim --headless -l /tmp/aospnav-e2e/gate.lua
 #   exclusions 含 .../frameworks/base/tests/TouchLatency/app  (冷缓存同步扫描生效)
-#   projects (1): aosp_3f7ad7da          <- 只有它, 没有 app
+#   projects (1): aosp_30a30216          <- 只有它, 没有 app
 #   VERDICT: invisible=true stray_visible=false
 
 # 闸门 B: 先不带排除项起一次 (污染), 再带排除项起同一个 -data
@@ -2860,7 +2939,8 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 不启 jdtls, 不依赖任何测试框架 (断言宏就在 `tests/helper.lua` 的 ~50 行里)。
 
 **默认跳过真树检查**: 带 `AOSPNAV_LIVE_TEST=1` 时才会去**读** `~/.cache/nvim/jdtls/`
-下的活工作区与 `~/project/aosp` —— 只读, 不写不删 (§硬约束)。没有那棵树/
+下的活工作区与真树 —— 只读, 不写不删 (§硬约束)。真树路径取 `AOSPNAV_LIVE_TREE`
+(缺省 `~/aosp`; 仓库里不落任何个人环境路径, 机器布局不同就设这个变量)。没有那棵树/
 那个工作区时相关断言自动 SKIP, 不会失败。
 
 | 套件 | 断言 | 覆盖 |
@@ -2892,12 +2972,13 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 > **[2026-10-15] 真树块两条夹具缺陷已修** (两条都是**夹具**问题, 产品代码无缺陷):
 >
 > - `t_conflict.lua`: 旧夹具用无 key 的 `state.get()` 断言 `limited`, 而 `limited` 的
->   写入方 `configure` 是**按树分区**写 (`state.set({...}, jar_root_found)`, §2.15 的
->   `#3` 重构) —— 无 key 读落 `"_"` 兜底槽, 恒为 false (实测 `get()=false` /
+>   写入方 `configure` 是**按树分区**写 (`state.set({...}, aosp_root(st.bufname) or
+>   jar_root_found)`, §2.15 的 `#3` 重构; v18.20 起写键统一为树级 aosp_root, 见
+>   §2.20) —— 无 key 读落 `"_"` 兜底槽, 恒为 false (实测 `get()=false` /
 >   `get(<AOSP 根>)=true`)。面板 (`ui.lua`) 读的是带 key 的那份, 产品正确。现改读带 key
 >   的状态, 并**额外加一条断言钉住这条分区契约** (无 key 读不到是设计使然)。
 > - `t_source_apply.lua`: "累积根绝不丢弃"不变量写于默认模式还是 `aosp` 的年代, 它隐含
->   读 `aosp/workspace/aosp_3f7ad7da/.classpath`。v18.8 起默认 `"project"`, `union()` 只
+>   读 `aosp/workspace/aosp_30a30216/.classpath`。v18.8 起默认 `"project"`, `union()` 只
 >   回核心集 (本机 2 条), Wifi 的累积根**本就是 aosp 模式的树级账本**, 与 project 会话
 >   无关 —— 断言它不丢是把 aosp 的前提套到了 project 上。现按模式分叉: aosp 保持原不变量,
 >   project 改断言核心集自洽 + 两模式共有"已装与待装不相交"。

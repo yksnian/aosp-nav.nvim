@@ -78,7 +78,7 @@ end
 ---     = <File(path).getName()>_<Integer.toHexString(path.toPortableString().hashCode())>
 --- 这里在 Lua 里复算: Java 的 31 进制 hashCode + 32 位环绕, toHexString 把 int
 --- 当**无符号**打印 -> string.format("%x", h) (h 已按 2^32 取模)。
---- 实测 root=~/project/aosp 复算出 aosp_3f7ad7da, 与真实工作区一致。
+--- 已知向量: root=/opt/aosp 复算出 aosp_30a30216 (按上式可复算)。
 --- 用途: 在一次 glob 之后**精确**区分"本该有的 invisible project"与"外部工程",
 --- 名字前缀匹配 (aosp_) 会误伤名字恰好以它开头的正常工程。
 --- @param root string jdtls root_dir (无尾斜杠)
