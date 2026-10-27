@@ -61,7 +61,10 @@ local keep = ui.invisible_project_name(root)
 -- ---------------------------------------------------------------------------
 local blockers = ui.workspace_blockers(tmp, root)
 H.eq(#blockers, 4, "blockers = 4 (假工程与 invisible project 都不算)")
-H.check(not vim.tbl_contains(blockers, "jdt.ls-java-project"), "jdt.ls-java-project 不算外部工程")
+H.check(
+  not vim.tbl_contains(blockers, "jdt.ls-java-project"),
+  "jdt.ls-java-project 不算外部工程"
+)
 H.check(
   not vim.tbl_contains(blockers, keep),
   "本该存在的 invisible project (" .. keep .. ") 不算外部工程"

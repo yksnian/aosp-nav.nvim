@@ -82,10 +82,7 @@ H.check(got[TMP .. "/p3"] == true, "scan: 裸 .project -> 也必须排除 (jdt.l
 H.check(got[TMP .. "/p4"] ~= true, "scan: 只有 .classpath -> 不排除 (不是工程)")
 H.check(got[TMP .. "/p5"] ~= true, "scan: 空目录 -> 不排除")
 H.check(got[TMP .. "/p1/.classpath"] ~= true, "scan: 排除的是**目录**, 不是文件路径")
-H.check(
-  got[deep] == true,
-  "scan: 深层 (dir-depth 5, jdt.ls 的边界) 也要够得着"
-)
+H.check(got[deep] == true, "scan: 深层 (dir-depth 5, jdt.ls 的边界) 也要够得着")
 
 -- 排除项里绝不该出现 .project / .classpath 文件本身的路径
 local file_leak = false
@@ -126,8 +123,14 @@ for _, p in ipairs(eff2) do
   eset2[p] = true
 end
 H.check(#eff2 > 1, "effective: replace 下 import_exclusions 仍非空 (回归: 曾被清成 0)")
-H.check(eset2["**/node_modules/**"] == true, "effective: replace 下默认项仍在 (jdt.ls 自带 6 条)")
-H.check(eset2[TMP .. "/p2"] == true, "effective: replace 下扫描项仍在 (核心: 残留 .project)")
+H.check(
+  eset2["**/node_modules/**"] == true,
+  "effective: replace 下默认项仍在 (jdt.ls 自带 6 条)"
+)
+H.check(
+  eset2[TMP .. "/p2"] == true,
+  "effective: replace 下扫描项仍在 (核心: 残留 .project)"
+)
 H.check(eset2["/only/mine"] == true, "effective: replace 下用户项照旧并入")
 H.check(#eff2 == #pats + 6 + 1, "effective: replace 不影响 import_exclusions 的合成规则")
 
@@ -143,7 +146,11 @@ local fh = io.open(cpath, "w")
 fh:write("# version=1\n# root=" .. TMP .. "\n# count=1\n/old/stale\n")
 fh:close()
 IE.invalidate(TMP)
-H.eq(IE.cached(TMP), nil, "cache: 版本不匹配 -> 视为无缓存 (bump CACHE_VERSION 才作废得掉)")
+H.eq(
+  IE.cached(TMP),
+  nil,
+  "cache: 版本不匹配 -> 视为无缓存 (bump CACHE_VERSION 才作废得掉)"
+)
 
 -- 收尾: 两个临时目录都删干净 (真 cache_dir 全程未被写过)
 vim.fn.delete(TMP, "rf")

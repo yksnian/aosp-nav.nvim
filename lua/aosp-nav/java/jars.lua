@@ -783,6 +783,15 @@ inm && /^\t\t"module_type": "/ { t = $0; sub(/^\t\t"module_type": "/, "", t); su
 inm && /^\t\t"path": \[/ { mode = "path"; next }
 inm && /^\t\t"jars": \[/ { mode = "jars"; next }
 inm && /^\t\t"dependencies": \[/ { mode = "deps"; next }
+# [v18.31] static_libs / libs 与 dependencies **一并**并入 deps 列。
+# 依据: ASfP 的 BuildArtifactMergedModuleInfo 合并 jdeps 时, 把
+# dependencies U static_libs U libs 三者取并集当依赖集。我们原先只读
+# dependencies, 会漏掉只在后两者里声明的依赖。
+# 实测本树: 15356 个有依赖的模块中只有 55 个因此多出依赖 (共 95 条引用) ——
+# 影响很小, 但语义上对齐上游, 且代价为零 (同一遍 awk, 同一列, TSV 格式不变)。
+# 注意: 这里面不能写 Lua 注释 —— 本字符串整体交给 awk 执行。
+inm && /^\t\t"static_libs": \[/ { mode = "deps"; next }
+inm && /^\t\t"libs": \[/ { mode = "deps"; next }
 inm && /^\t+\],?/ { mode = ""; next }
 inm && mode != "" && /^\t\t\t"[^"]*",?$/ {
   s = $0; sub(/^\t+"/, "", s); sub(/",?$/, "", s)
@@ -897,13 +906,19 @@ end
 --- 依赖闭包: 从种子模块出发 BFS dependencies 字段。
 --- @param index table M.module_deps_index 的结果
 --- @param seeds table 种子模块名列表
---- @param opts table|nil { max_depth = number|nil (缺省不限) }
---- @return table 闭包模块名集合 (含种子; 未知模块名不进闭包)
+--- @param opts table|nil { max_depth = number|nil (缺省不限),
+---                         exclude = fun(name):boolean|nil (排除闸, 见 closure_excluded) }
+--- @return table 闭包模块名集合 (含种子; 未知模块名不进闭包; 被 exclude 的也不进)
 function M.module_closure(index, seeds, opts)
   local max_depth = opts and opts.max_depth
+  local exclude = opts and opts.exclude
+  local function blocked(dep)
+    return exclude and exclude(dep) or false
+  end
   local closure, seen, frontier = {}, {}, {}
   for _, s in ipairs(seeds or {}) do
-    if index[s] then
+    -- 种子同样过闸: 项目目录下也可能正好有个被排除的模块
+    if index[s] and not blocked(s) then
       closure[s] = true
       seen[s] = true
       frontier[#frontier + 1] = s
@@ -914,7 +929,7 @@ function M.module_closure(index, seeds, opts)
     local next_frontier = {}
     for _, name in ipairs(frontier) do
       for _, dep in ipairs(index[name].deps or {}) do
-        if not seen[dep] and index[dep] then
+        if not seen[dep] and index[dep] and not blocked(dep) then
           seen[dep] = true
           closure[dep] = true
           next_frontier[#next_frontier + 1] = dep
@@ -1044,6 +1059,41 @@ local PROJECT_SEED_TYPES = {
   java_sdk_library = true,
   android_library = true,
 }
+
+-- [v18.31] 不进闭包的模块名册 (逐字取自 ASfP BuildArtifactMergedModuleInfo
+-- 的 EXCLUDED_MODULES)。
+--
+-- 为什么要它: 这些模块声明的 jar 里含**与框架类同 FQN 但没有真实现**的桩/替身,
+-- 而 jdt.ls 取 classpath 上第一个含该类型的条目 —— 于是跳转落进几十行的假类。
+-- 在**构图阶段**就剔掉比事后靠名字/路径排除更根本 (那两个是启发式, 这个是事实)。
+--   fake-framework              框架的假实现
+--   okhttp-android-util-log     替掉 android.util.Log
+--   sysprop-library-stub-*      SystemProperties 的桩
+--   ravenwood-*                 host 侧测试用的替身运行时
+-- 其中前两项与 java.exclude_jars 的默认值重叠 —— 两处都留: 排除规则用户可改,
+-- 本名册是插件自己的硬闸。
+--
+-- 只按**模块名**排, 不按路径前缀 (ASfP 的 NO_BUILD_PATH_PREFIXES /
+-- NO_BUILD_EXACT_PATHS 未采纳, 理由是实测它们会把关键类的 provider 清零 ——
+-- 见 DEVELOPMENT.md §2.19.7)。
+local CLOSURE_EXCLUDE_MODULES = {
+  ["fake-framework"] = true,
+  ["okhttp-android-util-log"] = true,
+  ["ravenwood-runtime"] = true,
+  ["ravenwood-helper-runtime"] = true,
+  ["ravenwood-helper-libcore-runtime"] = true,
+  ["ravenwood-helper-libcore-runtime.host"] = true,
+  ["sysprop-library-stub-platform"] = true,
+  ["sysprop-library-stub-product"] = true,
+  ["sysprop-library-stub-vendor"] = true,
+}
+
+--- 该模块是否应被排除出闭包。
+--- @param name string 模块名
+--- @return boolean
+local function closure_excluded(name)
+  return CLOSURE_EXCLUDE_MODULES[name] == true
+end
 
 --- 发现项目目录内的种子模块: index.path 以 project_dir (树相对) 为前缀且类型
 --- 在白名单内。ASfP 用显式 include 白名单, 这里自动推导 (项目目录即白名单)。
@@ -1313,7 +1363,7 @@ function M.project_closure_jars(aosp_root, project_dir, opts)
   if #seeds == 0 then
     return nil, { reason = "no-seed-modules" }
   end
-  local closure = M.module_closure(index, seeds, {})
+  local closure = M.module_closure(index, seeds, { exclude = closure_excluded })
 
   -- intermediates 清单走树级缓存 (memo + 持久 TSV), 过滤到闭包模块后交现有
   -- 分桶引擎 —— 候选收窄, 选择规则零漂移。[v18.17b] TSV 未就绪时 manifest 为
@@ -1414,5 +1464,8 @@ end
 
 --- 测试钩子: 种子发现 (与 workspace.workspace_dir / source_apply._classify 同惯例)
 M._project_seed_modules = project_seed_modules
+--- 测试钩子: 闭包排除闸 (见 CLOSURE_EXCLUDE_MODULES)。导出供 t_module_deps
+--- 直接断言"名册里的模块被挡、名册外的不被挡", 不必绕经 manifest 分桶。
+M._closure_excluded = closure_excluded
 
 return M

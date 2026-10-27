@@ -242,7 +242,9 @@ do
   -- 守卫删掉也不会红 (踩过)。必须挑一个**真的有 JVM 持有**的 dir。
   -- 找不到就跳过: 这条只在用户真开着 jdtls 时有意义, 不能因此判失败。
   local target
-  for _, d in ipairs(vim.fn.glob(vim.fn.expand("~/.cache/nvim/jdtls") .. "/*/workspace", false, true)) do
+  for _, d in
+    ipairs(vim.fn.glob(vim.fn.expand("~/.cache/nvim/jdtls") .. "/*/workspace", false, true))
+  do
     local c = { config = { cmd = { "jdtls", "-data", d } } }
     if ui.jdtls_pid(c) then
       target = c
@@ -251,8 +253,15 @@ do
   end
   if target then
     -- 前置条件: jdtls_pid 确实看得见它 (证明后面 nil 是**守卫**拦下的, 不是"没找到")
-    H.check(ui.jdtls_pid(target) ~= nil, "force_kill 前置: 该 dir 确有活 JVM 被 jdtls_pid 看见")
-    H.eq(ui.force_kill(target), nil, "force_kill: 非本进程后代 (别的 nvim 的 jdtls) -> 拒绝杀 (越界闸)")
+    H.check(
+      ui.jdtls_pid(target) ~= nil,
+      "force_kill 前置: 该 dir 确有活 JVM 被 jdtls_pid 看见"
+    )
+    H.eq(
+      ui.force_kill(target),
+      nil,
+      "force_kill: 非本进程后代 (别的 nvim 的 jdtls) -> 拒绝杀 (越界闸)"
+    )
   else
     io.write("SKIP: no live jdtls to test the cross-process guard\n")
   end

@@ -47,7 +47,10 @@ local function set_mode(m)
 end
 
 -- ---------------------------------------------------------------------------
-H.check(type(SR.find) == "function" and type(SR.find_for_project) == "function", "两个入口都是函数")
+H.check(
+  type(SR.find) == "function" and type(SR.find_for_project) == "function",
+  "两个入口都是函数"
+)
 
 -- mode="aosp": M.find 给结果, M.find_for_project 退让
 set_mode("aosp")

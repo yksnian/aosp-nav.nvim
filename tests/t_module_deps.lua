@@ -113,7 +113,8 @@ vim.fn.writefile({
   '\t\t"dependencies": [',
   '\t\t\t"B",',
   '\t\t\t"P",',
-  '\t\t\t"viastubs"',
+  '\t\t\t"viastubs",',
+  '\t\t\t"fake-framework"',
   "\t\t],",
   "\t},",
   '\t"B": {',
@@ -172,6 +173,22 @@ vim.fn.writefile({
   "\t\t],",
   '\t\t"jars": [',
   '\t\t\t"out/soong/.intermediates/pkg/s/viastubs/android_common/javac/viastubs.jar"',
+  "\t\t],",
+  '\t\t"dependencies": [',
+  "\t\t],",
+  "\t},",
+  -- [v18.31] 闭包排除名单里的模块名 (照搬 ASfP EXCLUDED_MODULES)。
+  -- 它在闭包内 (A 的直接依赖), 但**必须被排除** —— 它是框架的假实现,
+  -- 留着会让同 FQN 的框架类跳进假类。见下面那条断言。
+  '\t"fake-framework": {',
+  '\t\t"module_type": "java_library",',
+  '\t\t"path": [',
+  '\t\t\t"pkg/fake"',
+  "\t\t],",
+  '\t\t"srcs": [',
+  "\t\t],",
+  '\t\t"jars": [',
+  '\t\t\t"out/soong/.intermediates/pkg/fake/fake-framework/android_common/javac/fake-framework.jar"',
   "\t\t],",
   '\t\t"dependencies": [',
   "\t\t],",
@@ -261,6 +278,31 @@ do
   H.check(not leaked, "closure wiring: 闭包内但名字命中 exclude_jars 的 jar 仍被排除")
 end
 
+-- [v18.31] 闭包排除名册 (照搬 ASfP EXCLUDED_MODULES) 必须生效。
+-- 夹具里的 `fake-framework` 是 A 的直接依赖 (在闭包内), 但它是框架的假实现 ——
+-- 留着会让同 FQN 的框架类跳进假类, 所以生产路径必须把它剔掉。
+-- 断言落在**闭包**上而不是 jar 列表上: jar 要经 manifest 分桶才产生, 而这里
+-- 要钉的是"闭包层就把它挡掉"这件事本身 (两个闸的先后也正是如此)。
+do
+  local idx = jars.module_deps_index(AOSP, { no_cache = true })
+  H.check(idx and idx["fake-framework"] ~= nil, "夹具: fake-framework 已在索引里")
+  -- 对照: 不过闸时它确实在闭包里 (证明下面测的是闸, 不是它本来就不在)
+  local raw = jars.module_closure(idx, { "A" }, {})
+  H.check(raw["fake-framework"] == true, "对照: 不过闸时 fake-framework 在闭包内")
+  -- 过闸: 同一份种子 + 生产用的那个闸 -> 它必须消失, 而普通模块 (B/P) 不受影响
+  local gated = jars.module_closure(idx, { "A" }, { exclude = jars._closure_excluded })
+  H.check(gated["fake-framework"] ~= true, "闸: 名册里的 fake-framework 被挡在闭包外")
+  H.check(
+    gated["B"] == true and gated["viastubs"] == true,
+    "闸: 名册外的模块不受影响 (闸只排名册, 不误伤)"
+  )
+  H.check(jars._closure_excluded("fake-framework"), "闸: fake-framework 判否")
+  H.check(
+    not jars._closure_excluded("framework") and not jars._closure_excluded("B"),
+    "闸: 真实现与普通模块不判否 (这是它相较于路径前缀排除的关键 —— 后者会误杀)"
+  )
+end
+
 -- memo: 第二次调用命中会话缓存
 H.check(
   (function()
@@ -316,19 +358,19 @@ do
   vim.lsp.get_clients = real_get
 
   H.check(
-  #notifies == 1 and notifies[1].method == "workspace/didChangeConfiguration",
-  "hotpatch: didChangeConfiguration 发出"
-)
+    #notifies == 1 and notifies[1].method == "workspace/didChangeConfiguration",
+    "hotpatch: didChangeConfiguration 发出"
+  )
   local prj = notifies[1] and notifies[1].params.settings.java.project
   H.check(
-  prj and prj.referencedLibraries and #(prj.referencedLibraries.include or {}) == 2,
-  "hotpatch: refLibs = 闭包集 (IA javac + PB prebuilt, 2 个)"
-)
+    prj and prj.referencedLibraries and #(prj.referencedLibraries.include or {}) == 2,
+    "hotpatch: refLibs = 闭包集 (IA javac + PB prebuilt, 2 个)"
+  )
   H.check(prj.sourcePaths == nil, "hotpatch: sourcePaths 键被删除")
   H.check(
-  #(client.config.settings.java.project.referencedLibraries.include or {}) == 2,
-  "hotpatch: config 同步 (面板读这里)"
-)
+    #(client.config.settings.java.project.referencedLibraries.include or {}) == 2,
+    "hotpatch: config 同步 (面板读这里)"
+  )
   -- [v18.19] 返回值: hotpatch_reflibs 靠它累加计数 (旧版该变量根本没定义,
   -- `patched > 0` 每次抛 "attempt to compare nil with number", 被调用点的
   -- pcall 静默吞掉)。这里钉住"真补了 -> true"。
@@ -363,12 +405,12 @@ do
   javainit._hotpatch_instance(client)
   vim.lsp.get_clients = real_get
   H.check(
-  client.config.settings
+    client.config.settings
       and client.config.settings.java
       and client.config.settings.java.project
       and #(client.config.settings.java.project.referencedLibraries.include or {}) == 2,
-  "hotpatch: 无 settings 表也建表同步 (面板不再假报 0)"
-)
+    "hotpatch: 无 settings 表也建表同步 (面板不再假报 0)"
+  )
 end
 
 -- ---------------------------------------------------------------------------

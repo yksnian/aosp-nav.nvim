@@ -132,7 +132,10 @@ do
   )
 
   -- 非 Android 目录不得被误认
-  H.check(not ar.is_android_tree(TMP .. "/soc/qcom/qssi/frameworks"), "标记: 普通子目录不算树")
+  H.check(
+    not ar.is_android_tree(TMP .. "/soc/qcom/qssi/frameworks"),
+    "标记: 普通子目录不算树"
+  )
 
   vim.fn.delete(TMP, "rf")
 end

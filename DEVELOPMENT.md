@@ -1675,6 +1675,55 @@ fallback、refresh 的探测) / `kotlin/classpath.lua` 生成的 bash 脚本 ×4
 **已验证是真闸**: 把 `exclude_jars` 也塞回 `no_path_exclude` 里 → 报红。
 (第一版夹具漏了 TSV 那一步, 断言两头都绿 —— 记个教训: 夹具要让它**真的走到**被测代码。)
 
+### 2.19.7 闭包排除名册: 只排"名字明确的假实现" (2026-10-27)
+
+**背景**: 跳转落到与框架类同 FQN 的**假实现**(桩/替身)上。ASfP 对此有两套机制, 我们
+逐条实测后**只采用了其中一套**。
+
+**采用: `CLOSURE_EXCLUDE_MODULES`** —— 逐字取 ASfP 的 `EXCLUDED_MODULES` 九个名字:
+`fake-framework` / `okhttp-android-util-log` / `ravenwood-runtime` /
+`ravenwood-helper-runtime` / `ravenwood-helper-libcore-runtime` /
+`ravenwood-helper-libcore-runtime.host` / `sysprop-library-stub-{platform,product,vendor}`。
+它们是**明确的假实现**, 不是框架 API 的正常来源, 排掉不产生空洞。
+
+**不采用 (重要): ASfP 的 `NO_BUILD_PATH_PREFIXES` / `NO_BUILD_EXACT_PATHS`**
+(`frameworks/base/api`、`tools/metalava`、`prebuilts/sdk`)。
+**照搬会打断跳转**, 实测 (Wifi 闭包):
+
+| | 照搬路径前缀 | 只排名册 |
+| --- | --- | --- |
+| 闭包模块数 | 482 → **222** | 482 → **481** |
+| `android.os.Message` provider | 4 → **0** | 4 → 1 |
+| `android.os.Parcel` provider | 4 → **0** | 4 → 1 |
+| `android.util.Log` provider | 7 → 1 | 7 → 3 |
+
+**为什么 ASfP 能排而我们不能**(架构差异, 不是它错):
+ASfP 是 IDE 插件, 给每个模块建独立 **iml** 并靠**模块间依赖**传递 API ——
+屏蔽签名桩之后, 模块仍能经由依赖看到框架类。
+我们只能给 jdt.ls 一个**扁平 jar 列表**, 排掉桩就是**彻底没有来源**。
+而且实测 `android.os.Message` 的 4 个 provider **全部**位于那两个目录, Wifi 的闭包
+又够不着 `framework.jar` —— 排掉 = 整片框架 API 跳不动。
+
+**连带否证的两个假设** (别再重走):
+1. "`closure_jars` 绕过了分桶引擎" —— **否**。生产路径 `project_closure_jars` 确实走
+   分桶引擎; 只有诊断用的 `compare_module_vs_glob` 才用 `closure_jars`。
+2. "变体选择有问题, turbine 抢了 combined" —— **否**。实测选定结果
+   `turbine=15 / non-turbine=125` —— 真实现占绝大多数。问题从来不是"选错 jar",
+   而是 `framework` / `framework-minus-apex` **压根不在 Wifi 闭包里**
+   (`in-closure = false`), 变体优先级无候选可挑。
+
+**顺带否证的"补真身"思路** (用户提议, 思路正确但映射不可行): "依赖了 API 桩就把对应的
+真 jar 加进来"。三条映射路径实测**都不通** ——
+(a) 依赖图: 桩侧永远到不了 `framework-minus-apex` (实测 False);
+(b) 命名剥离后缀: 大多匹配到自身;
+(c) 按"含相同类"反查: 可行但要自建索引, 且要把 **52 MB** 的 `framework.jar` 塞进
+单模块实例, 违背"每项目一台省内存"的初衷。
+
+**测试**: `t_module_deps.lua` 夹具加模块 `fake-framework` (A 的直接依赖, 在闭包内),
+并导出 `jars._closure_excluded` 供直接断言。钉三件事: 不过闸时它在闭包内 (对照) /
+过闸时它消失 / 名册外的模块 (含 `framework`) **不受影响** —— 最后一条正是"名册相较
+路径前缀"的关键差别。**已验证是真闸**: 把闸改成恒 `false` → 3 条断言报红。
+
 ## 3. 导航模式
 
 **对用户只宣传两种体验** (v11 降级后), 由单个键 `java.mode` 表达:
@@ -2705,6 +2754,48 @@ diff /tmp/before.txt /tmp/after.txt     # 必须无输出
 路径** (缓存/顺序文件/日志), 就必须显式把它也指向临时目录。判断方法是问一句:
 **这段代码会不会写磁盘? 写到哪?**
 
+### 10.0.2 改写历史前必须**在仓库外**先验证 (2026-10-27, 踩过)
+
+**事故**: 要把用户名从历史里洗掉, 用了 `git filter-repo --replace-text`, 规则文件里
+留了一条**被解析成空模式**的行 —— 结果全文所有 `#` 被替换成 `***REMOVED***`
+(1943 处, 波及 `tests/run.sh` / CI yml / 两个 README / 几乎所有 `lua/` 文件), 骨架
+直接语法错误。更糟的是**退路也没了**: 事先建的 `backup/*` 分支和 `origin/*` 的
+remote-tracking refs **都被同一次 filter-repo 一并改写**, 原对象随即被 GC, `git cat-file`
+再也取不到。
+
+**四条硬规矩** (按重要性排序):
+
+1. **在仓库外的临时 clone 上先跑一遍**。改写历史是"要么全对要么全毁"的操作:
+   `git clone <repo> /tmp/x && cd /tmp/x && <改写命令>`, 验证通过 (跑测试 + 抽查内容 +
+   `git grep` 目标串) 再对本体动手。本次修复阶段照此做了, 才敢动真仓库。
+2. **`--replace-text` 的规则文件要当成"会被解析的语言"对待, 不是一个字符串**。
+   写完先确认**解析结果**, 别直接 `--force`。空模式规则会静默匹配一切 —— 这是本次
+   炸掉的直接原因。规则文件也不要写注释行 (以 `#` 开头), 免得和"要替换的 `#`"搅在一起。
+3. **不要把 backup 建在同一个会被改写的仓库里**。`filter-repo` 改写**所有** refs,
+   连同你刚建的 backup 分支 —— 等于把安全绳系在要跳的崖上。退路必须是**仓库外**的
+   一份 clone, 或 `git bundle` 到别处。
+4. **挑选影响面最小的工具**。本次需求只动 **16 个未 push 的本地提交**, 却用了全历史
+   改写, 把上游 56 个提交的哈希也一起改了。若只是"本地未 push 的提交要清理",
+   用交互式 rebase / 逐个 amend 就够, 上游不动。
+
+**万一还是炸了**: 先判断变形是否**可逆**。本次 `***REMOVED***` 与 `#` 是精确一一对应,
+逆替换即可完全还原 (注意 `t_config.lua` 里有个**真变量**叫 `REMOVED`, 只匹配
+`***REMOVED***` 形式就不会误伤)。验证可逆性的方法是: 逆替换后跑
+`bash tests/run.sh` + `loadfile` 语法检查 + 抽查被改文件。
+
+**上游哈希不变的正确做法** (本次最终采用, 可复用):
+在**仓库外新 clone** 一份上游, 把本地提交做成 patch 再 `git am` 上去 ——
+```bash
+# 1. 先确认本地 16 个提交的基线: 用 **tree** 比对而不是数提交数
+git rev-parse <base>^{tree}          # 旧仓库
+git rev-parse HEAD^{tree}            # 新 clone (须相同 => 基线对上了)
+# 2. 导出并重放到新 clone
+git format-patch <base>..HEAD -o /tmp/patches --no-signature
+cd /tmp/new-clone && git am /tmp/patches/*.patch
+```
+这样上游提交哈希**原样保留**, 只有本地那几个是新哈希, push 是**快进**
+(`git rev-list --left-right --count origin/master...HEAD` 得 `0\t16`), 不需要 `--force`。
+
 ### 10.1 仓库内的套件 (维护入口)
 
 `tests/` 是本仓库**唯一被跟踪**的测试, 一条命令跑全部:
@@ -2729,7 +2820,7 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_exclusions.lua` | 26 | `java/import_exclusions.lua` (§2.19): `escape_glob` 转义 `[ ] * { }` / 扫描判据 = **只认 `.project`** (jdt.ls 的 EclipseProjectImporter 就凭它导入; 多要一个 `.classpath` 会让"有 .project 无 .classpath"的 Gradle 工程漏网, 而一个漏网的可见工程足以废掉整棵树的不可见工程) / 只有 `.classpath` 的目录不排除 / 深层 (dir-depth 5, jdt.ls 的边界) 够得着 / 产出全是**目录**不含文件名 / `effective` 合成规则 (6 条默认 + 扫描 + 用户追加, 去重) / **`exclude_merge` 不管 `import_exclusions`** (回归: replace 曾把它清成 0) / 缓存版本不匹配视为无缓存 |
 | `t_jvm.lua` | 127 | `util/jvm.assess` (此前**完全没有**测试): `-Xmx6G` 判否 / `--jvm-arg=` 前缀剥离 / 重复 `-Xmx` 后者胜 / `UseParallelGC` 识别 / 无值·无键·nil cmd 不崩 / **`xmx_over_host`** (§8.1.2): `-Xmx16G` 在 512G 宿主静默·在 15G 宿主报警且建议**调小** (不得误报 `xmx_small`) / 80% 边界恰好不报·超过才报 / `MemTotal` 读不到时跳过该检查 / `host_mem_total()` 真读 `/proc/meminfo` (正数或 nil, 不崩)。`util/jvm_live` (**活进程遥测**, §8.1.1): PerfCounter 解析 (去引号、值含 `=`、缺键) / uptime 与 `/proc/<pid>/status` (读不到是 nil 而非 0) / heap_info 三种形态 / young·major 按**名字**分类 (G1 的第三个 collector **不得**算 major) / 间隔按 `uptime/invocations` **自算**(不信 `avg*IntervalTime`) / 五条 fixture 的判定 (实测形态 → 三条 info 且零 warn; 6G 死亡螺旋 → 三条 warn; 健康 G1 → 零 finding; **G1 但新生代 <5% → 仍零 finding**, `young_gen_tiny` 只对 ParallelGC 报; 空快照不崩) / `find_jcmd` 三条回退路径 (注入式, 不碰 `/proc`) / jcmd 对死 pid 的失败路径 (退出码不可靠, 空 stdout 必须自己判失败) / `render` 的每一项都不得含换行 (`nvim_buf_set_lines` 会直接抛) |
 | `t_log.lua` | 54 | `util/log.lua`: 四档阈值比较 / `log.user` 绕过阈值 / 会话内 `once` 去重 / `once` 被阈值挡下时**不消费**登记 / 消息前缀 |
-| `t_module_deps.lua` | 22 | `java/jars` 的 **soong 依赖闭包** (§2.19): `module_bp_java_deps.json` 解析 (依赖图去重 / 传递闭包 / 缺文件退化) / manifest TSV 读回与 mtime 失效 / 闭包缓存按 (树, 项目) 键控且随产物 mtime 失效 / 降级集 ⊆ 完整集 (热补只增不减) / **闭包路径仍应用 `exclude_jars`** (§2.19.6): 闭包内但名字命中排除模式的 jar 必须被排掉 (回归 v18.24 的 no_exclude 矫枉过正) |
+| `t_module_deps.lua` | 28 | `java/jars` 的 **soong 依赖闭包** (§2.19): `module_bp_java_deps.json` 解析 (依赖图去重 / 传递闭包 / 缺文件退化) / manifest TSV 读回与 mtime 失效 / 闭包缓存按 (树, 项目) 键控且随产物 mtime 失效 / 降级集 ⊆ 完整集 (热补只增不减) / **闭包路径仍应用 `exclude_jars`** (§2.19.6): 闭包内但名字命中排除模式的 jar 必须被排掉 (回归 v18.24 的 no_exclude 矫枉过正) |
 | `t_multi_tree.lua` | 29 | **两棵树共用一个 nvim 会话** (§2.15): 假树造 A/B 两棵树, 零 LSP。两棵树各自推断出正确的根与项目 / 会话切到 B 后**不继承** A 的项目 (旧实现会) / 同一会话里 A·B 同时活动时 `union` 互不污染 / `state(A)` ≠ `state(B)` / 两棵树各有自己的顺序文件且内容不交叉 / `reset(A)` 不动 B / `client(fname)` 按 buffer 的 client 选 (旧实现取 `get_clients()[1]`) / `_is_applied` 按树分开 |
 | `t_path.lua` | 14 | `util/path.start_dir`: `nil`/`""` 归一成 cwd, 绝不能给 `"."` (§7 痛点 4 的根因) |
 | `t_follow.lua` | 21 | `java/workspace_follow.lua` (§2.17): `target()` 只认"树内 + 找得到项目标记"的文件 (树内无标记、树外、`""`、`nil` 一律 nil → 不动, 宁可保持当前工作区) 且第二个返回值是 AOSP 根 / 无 client 不插手 (第一台的根归 `root.lua`) / **已在目标项目之内 → 一次字符串比较后静默返回**, 子目录也算之内 / 跨项目 → 发**恰好一条** `didChangeWorkspaceFolders` 且 `added` 指向新项目 (name 是相对 AOSP 根的路径)、`removed` 是旧根 / **`mode` 为 `aosp`·`infer` 时一条都不发** / 树外文件有 client 也不把工作区搬出 AOSP 树。全部注入假 client + 临时目录, 零 LSP |
@@ -2742,9 +2833,9 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_root_fallback.lua` | 30 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 / **内存闸 (§2.13.1)**: 可用内存 < 4 GB 时退回已有台, 且发出的**必须是 warn** (默认档可见; 降回 info 则测试变红)、同项目 `once` 去重、内存恢复后照旧起新台 (闸不粘) |
 | `t_workspace.lua` | 42 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 / **`clean_workspace` 删完自动重启** (§2.18): 缓存根之外的 dir 被拒 / 非 java 缓冲只删不重启 / java 缓冲删完重放一次 `FileType` (自动重启) / **命令后窗口切走: 目录仍被删且当前缓冲跑完被还原** (`start_or_attach` 读的是 `nvim_get_current_buf()`, 不摆好窗口就重放不出来 = "清完没重启") / `buftype~=''` 的 java 缓冲不重启 (挡 §2.13 的第二台 jdtls) —— 注入 `dir`/`cache_root`/`defer=false`, 临时目录, 零 LSP | 
 
-合计 **626** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
-`t_jvm` 127 / `t_root_from_cwd` 21 / `t_source_apply` 25 / `t_conflict` 37, 共 **609**)。
-2026-10-27 本机实测默认 **608** / live **625**, 18 个套件 (差值是各套真机块按"真树齐备
+合计 **639** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
+`t_jvm` 127 / `t_root_from_cwd` 21 / `t_source_apply` 25 / `t_conflict` 37, 共 **615**)。
+2026-10-27 本机实测默认 **615** / live **639**, 18 个套件 (差值是各套真机块按"真树齐备
 + 真 jdtls 在跑"的有无整段 SKIP, 非不变量)。
 
 > **[2026-10-15] 真树块两条夹具缺陷已修** (两条都是**夹具**问题, 产品代码无缺陷):
@@ -2762,7 +2853,7 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 
 > 只有 `t_jvm` (127/127)、`t_root_from_cwd` (20/13)、`t_source_apply` (30/25) 和
 > `t_conflict` (41/37) 四个套件的条数**随环境而变** (真树块整段 SKIP 时不计数),
-> 所以 626/609 是当前环境的实测值而非不变量; 其余 13 个套件两种跑法条数相同。
+> 所以 639/615 是当前环境的实测值而非不变量; 其余 13 个套件两种跑法条数相同。
 > 特别注意 `t_jvm` 的真机块: 它要**真有 jdtls 在跑**才算数, 只设 `AOSPNAV_LIVE_TEST=1`
 > 是不够的 (本机 2026-10-10 就出现过"采样时在跑、跑测试时已退出"→ 静默少几条;
 > 2026-10-12 记 §2.10.1 那件事之后 jdtls 被 OOM 杀掉没在跑, 真机块整段 SKIP)。
