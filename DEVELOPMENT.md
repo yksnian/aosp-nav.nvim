@@ -23,6 +23,8 @@ setup(opts)
        │    ├─ java/root.lua           aosp_root / workspace_root / jdtls root_dir 回调
        │    │    └─ java/projects.lua  项目边界识别 (.git / .project)
        │    ├─ java/jars.lua           soong intermediates -> referencedLibraries
+       │    │    └─ java/jar_filter    jar 候选排除规则统一入口 (名字级恒应用 / 闭包跳路径级)
+       │    ├─ java/jdt_uri.lua        jdt:// 反编译缓冲链路 (占位块 / 回填 / 空内容重试)
        │    ├─ java/import_exclusions  import 排除 (异步 grep 范式来源)
        │    ├─ java/source_roots.lua   项目源码根扫描 (算法见 §5, 缓存见 §6)
        │    ├─ java/source_inject.lua  注入编排: 核心集 + 增量累积 (见 §7)
@@ -32,6 +34,7 @@ setup(opts)
        │    ├─ java/session_conflict   双 nvim 抢同一份 -data 时的会话隔离
        │    └─ java/contract.lua       jdt.ls 内部实现的运行期契约自检
        ├─ kotlin/init.lua              KLS 接线 (classpath 脚本 + 分发表)
+       ├─ basis.lua                    "哪棵树"基准解析 (tree_key / panel_basis / jar_root)
        └─ ui.lua                       :Aosp / :AospDebug / 状态栏 (纯展示层)
 ```
 
@@ -104,6 +107,26 @@ Eclipse 元数据手术台和进程管理器, 而 `java/init.lua`/`session_confl
     提权+jar 增量 = 完成后自动一条 reorder 通知 (`maybe_reorder`, 幂等:
     磁盘 classpath `src-first` 时不发); `:AospCleanWorkspace` 只剩清 969 stale /
     全新导入的整理场景。
+* **[2026-10-27 模块化]** code review 后的四项**纯搬移**重构 (a5d0a22 / 7d11e12 /
+  ae2dacf / 2609d76; 19 个测试全绿, stylua 0.20.0 预检过):
+  * `jdt://` 链路 (§2.13.2) 从 `java/init.lua` 拆到 **`java/jdt_uri.lua`**:
+    占位块 / classFileContents 回填 / 空内容重试 / open_classfile 包装安装,
+    configure 只剩一行 `install_handlers()`。顺带两处 review 修复: 重试耗尽从
+    `log.debug` 提到 **warn** (默认阈值 warn, 原本用户完全看不见), `client:request`
+    包 pcall (非标准台同步抛错不炸 BufReadCmd/tick 回调)。测试钩子
+    `_retry_interval_ms` / `_reset_for_test`, 覆盖在 `tests/t_jdt_uri.lua`。
+  * 树基准解析 (`tree_key` / `panel_basis` / `jar_root`) 从 `ui.lua` 拆到
+    **`basis.lua`** —— 那是事实判定不是渲染; 非展示层模块要复用时不得反向依赖 ui。
+  * 排除判定从 `jars.process_soong_matches` 拆到 **`java/jar_filter.lua`**
+    (`is_excluded`): 语义逐字不变 —— `exclude_jars` 名字级恒应用 (含 soong 闭包),
+    路径级 `exclude_paths`/`exclude_globs` 闭包跳过 ([v18.29] 的理由注释随迁彼处)。
+  * 三处缓存头 (jar / source_roots / import_exclusions) 的拼行与整行校验统一到
+    **`util/cache_header.lua`**: 只统一**机制**, 字段名 / 行序 / 字节不变 ——
+    磁盘上的旧缓存必须继续命中, 各模块 CACHE_VERSION 未动; TSV 类头
+    (`# imj mtime=` 等) 是另一种格式, 不在范围。
+  * `configure()` 的 13 段巨函数拆成 15 个命名 step + `STEPS` 顺序表 + 共享状态表
+    `st` (字段与生产者注释在表上方)。逐字搬移: 原 body 无早退 (enabled 检查留在
+    `M.configure`), 历史步骤编号原样保留 (§2 各节的引用不受影响)。
 
 两条时间线, 贯穿全部设计:
 
