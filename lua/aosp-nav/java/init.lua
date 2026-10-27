@@ -387,30 +387,33 @@ local function hint_if_jar_jump(buf)
   )
 end
 
---- 注入 AOSP 特化配置到 jdtls opts
---- 不覆盖用户已有配置 (deep_extend force 合并, AOSP 字段优先)
---- @param opts table jdtls opts
---- @return table opts 修改后的 opts
---- [#2] opts 可带第二参 ctx: { fname = string, reentry = boolean }。
----   fname = 组装的基准文件 (重入时是 root_dir fn 拿到的**真实**文件);
----   reentry = 本次是 root_dir fn 触发的重入 (跳过重复包装)。
-function M.configure(opts, ctx)
-  local cfg = require("aosp-nav").config
-  if not cfg or not cfg.java.enabled then
-    return opts
-  end
+-- ============================================================================
+-- configure 的阶段化 (纯结构搬移, 零逻辑变更): 原巨函数 M.configure 的各步骤段
+-- (编号 1 / 1b / 2 / 3 / 5 / 6 / 7 / 8 / 9 / 9b / 10 / 11 / 11b / 12 / 13+14 / 15;
+-- 4 与 14 缺失是历史遗留, DEVELOPMENT.md 引用了这些编号) 拆成模块级局部函数,
+-- 由下方 STEPS 顺序表编排。M.configure 只建共享状态表 st、按序执行、返回 opts。
+-- ============================================================================
 
-  local java_cfg = cfg.java
-  -- 确保 settings 表存在 (capabilities 不在这里动: nvim-jdtls 会自行把用户值与
-  -- 默认 capabilities 合并; 本插件只做 attach 后摘除, 见下面的 strip_caps)
-  opts.settings = opts.settings or {}
-
-  local root_mod = require("aosp-nav.java.root")
-  -- [#2] 组装基准文件: 首次 = probe_file 的最佳猜测 (lazy 求 opts 时机里 buf 0 未必
-  -- 是触发 ft=java 的那个文件); 重入 = root_dir fn 拿到的真实文件, 不再猜。
-  local bufname = (ctx and ctx.fname) or probe_file(root_mod)
-  local session_conflict = require("aosp-nav.java.session_conflict")
-
+-- 共享状态表 st 的字段 (含义 / 生产者):
+--   opts / ctx        configure 的两个入参, 原样透传 (M.configure)
+--   cfg / java_cfg    require("aosp-nav").config 与其 .java 段 (M.configure)
+--   root_mod          aosp-nav.java.root 模块 (M.configure)
+--   bufname           组装基准文件: ctx.fname 或 probe_file 推断 (M.configure)
+--   session_conflict  aosp-nav.java.session_conflict 模块 (M.configure)
+--   conflict          session_conflict.check(bufname) 的结果 (step_session_isolation, 1b)
+--   limited           本会话是否因会话隔离而限制注入 (step_session_isolation, 1b)
+--   aosp_root         jar 收集 / exclusions 的基准根, 恒为 AOSP 根 (1b)
+--   root_path         sourcePaths 注入基准 = workspace_root or aosp_root (1b)
+--   jars_mod          aosp-nav.java.jars 模块 (step_collect_jars, 2)
+--   jars              收集到的 jar 列表 (2)
+--   jar_root_found    jar 缓存按树的状态键 (2)
+--   is_android        bufname 是否落在 AOSP 树内 (2)
+--   source_inject     aosp-nav.java.source_inject 模块, 仅 aosp 注入模式非 nil (3)
+--   source_paths      待注入的 sourcePaths, 可为 nil (step_source_roots, 3)
+--   inlay_mode        inlay hints 模式 (step_inlay_hints, 5)
+--   aosp_settings     待 step_merge_settings 深度合并的 AOSP settings (step_build_settings, 7)
+local function step_workspace_root(st)
+  local opts, cfg, root_mod, bufname = st.opts, st.cfg, st.root_mod, st.bufname
   -- 1. workspace root: "aosp" 模式下 = AOSP 根, 整棵树共用一个索引; "project"
   --    模式下交还给 .git/.project 就近取根 (旧行为)。非 AOSP 时原样交还用户的
   --    root_dir。必须在收集 jar 之前装好 —— 后面所有步骤都以它为准。
@@ -474,7 +477,11 @@ function M.configure(opts, ctx)
       return r
     end
   end
+end
 
+local function step_session_isolation(st)
+  local opts, root_mod, bufname = st.opts, st.root_mod, st.bufname
+  local session_conflict = st.session_conflict
   -- 1b. [v12] 会话隔离: 另一个 nvim 已经占着这棵树本该用的 `-data` 时, 本会话改用一份
   --     独立索引 (换 project_name -> 派生出不同的 -data/-configuration), 并**限制**本
   --     会话的注入 (sourcePaths/jars 不注入)。机制与代价见 java/session_conflict.lua。
@@ -507,7 +514,11 @@ function M.configure(opts, ctx)
   local aosp_root = root_mod.aosp_root(bufname)
   local workspace_root = root_mod.project_dir(bufname) or root_mod.workspace_root(bufname)
   local root_path = workspace_root or aosp_root
+  st.conflict, st.limited, st.aosp_root, st.root_path = conflict, limited, aosp_root, root_path
+end
 
+local function step_collect_jars(st)
+  local bufname = st.bufname
   -- 2. JAR 收集 (jars.lua 自己按 android_root 检测/缓存)。
   --    fname 显式传入: jars.lua 若自己读 buf 0, 会与上面的 probe_file 得出不同的
   --    AOSP 根 (或取不到), jar 与 sourcePaths/exclusions 就不同源了。
@@ -516,7 +527,14 @@ function M.configure(opts, ctx)
   local jars_mod = require("aosp-nav.java.jars")
   local jars, jar_root_found = jars_mod.find_android_jars({ fname = bufname })
   local is_android = jar_root_found ~= nil
+  st.jars_mod, st.jars = jars_mod, jars
+  st.jar_root_found, st.is_android = jar_root_found, is_android
+end
 
+local function step_source_roots(st)
+  local java_cfg, bufname = st.java_cfg, st.bufname
+  local limited, aosp_root, root_path = st.limited, st.aosp_root, st.root_path
+  local is_android = st.is_android
   -- 3. 源码根 (java.project.sourcePaths)。
   --    显式 java.source_paths 非空时完全接管; 否则 mode == "aosp" 走
   --    source_inject (预置核心集 + 打开过的项目, 见 java/source_inject.lua)。
@@ -550,7 +568,11 @@ function M.configure(opts, ctx)
       no_cache = false, -- 允许读缓存; 冷启动时同步扫一次 (与 aosp 的核心集同量级)
     })
   end
+  st.source_inject, st.source_paths = source_inject, source_paths
+end
 
+local function step_inlay_hints(st)
+  local java_cfg, is_android = st.java_cfg, st.is_android
   -- 5. inlay hints: android 项目 -> off (避签名损坏 NPE), 非 android -> all
   local inlay_mode
   if java_cfg.inlay_hints_mode == "auto" then
@@ -558,7 +580,11 @@ function M.configure(opts, ctx)
   else
     inlay_mode = java_cfg.inlay_hints_mode
   end
+  st.inlay_mode = inlay_mode
+end
 
+local function step_strip_capabilities(st)
+  local java_cfg, inlay_mode = st.java_cfg, st.inlay_mode
   -- 6. 禁用 foldingRange (服务端 FoldingRangeHandler 在特定 token 上抛
   --    NegativeArraySizeException -> jdtls -32603 Internal error)
   --    注意: capabilities.textDocument.foldingRange 不能设为 false —
@@ -613,7 +639,11 @@ function M.configure(opts, ctx)
   -- 销毁重建 (闭包与 _retrying 表都是新的), 同一个 buffer 可能被两条链同时盯上。
   -- 切项目恰恰是最可能同时有待重试 buffer 的时刻, 所以这不是理论问题。
   jdt_uri.install_handlers()
+end
 
+local function step_build_settings(st)
+  local limited, jars = st.limited, st.jars
+  local source_paths, inlay_mode = st.source_paths, st.inlay_mode
   -- 7. 构造 AOSP 特化 settings
   -- sourcePaths 只在确有内容时才出现: 注入这个 key 会关闭 jdt.ls 的逐文件
   -- source root 推断 (见 config.lua java.mode 注释)
@@ -644,7 +674,12 @@ function M.configure(opts, ctx)
       },
     },
   }
+  st.aosp_settings = aosp_settings
+end
 
+local function step_import_extras(st)
+  local opts, java_cfg, aosp_root = st.opts, st.java_cfg, st.aosp_root
+  local source_paths, is_android, aosp_settings = st.source_paths, st.is_android, st.aosp_settings
   -- 8. java.import.* 注入 (gradle/maven 禁用 + import.exclusions)
   -- 时序关键: 仅放 opts.settings 会走 workspace/didChangeConfiguration, 配置到达时
   -- GradleProjectImporter 可能已开始 gradle sync, 工程导入也可能已经开始; jdt.ls
@@ -703,10 +738,16 @@ function M.configure(opts, ctx)
     opts.init_options.settings =
       vim.tbl_deep_extend("force", opts.init_options.settings or {}, init_settings)
   end
+end
 
+local function step_merge_settings(st)
+  local opts, aosp_settings = st.opts, st.aosp_settings
   -- 9. 深度合并: AOSP 字段优先, 但不覆盖用户其他 settings (如 completion, signatureHelp 等)
   opts.settings = vim.tbl_deep_extend("force", opts.settings, aosp_settings)
+end
 
+local function step_runtime_hooks(st)
+  local java_cfg, bufname, source_inject = st.java_cfg, st.bufname, st.source_inject
   -- 9b. mode == "aosp" 的运行时编排。注意运行期**不会**再往 jdt.ls 下发 sourcePaths:
   --     只有导入期注入才能得到 "src 在 lib 之前" 的类路径顺序 (见
   --     java/source_inject.lua 文件头)。这里只装钩子; 新累积的项目落盘缓存,
@@ -771,12 +812,21 @@ function M.configure(opts, ctx)
   --     [v18.8] 钩子退役: "每项目一台"方案下 root_dir 直接返回项目目录, nvim 层
   --     自动复用/新起, 不再需要 didChangeWorkspaceFolders 换根
   --     (workspace_follow.on_buf_enter 保留但不再挂载)。
+end
 
+local function step_schedule_refresh(st)
+  local java_cfg, aosp_root, is_android = st.java_cfg, st.aosp_root, st.is_android
   -- 10. 后台刷新残留 Eclipse 元数据排除 (不阻塞 jdtls 启动; 静默, 见函数注释)
   if is_android then
     schedule_exclusions_refresh(java_cfg, aosp_root)
   end
+end
 
+local function step_session_state(st)
+  local java_cfg, jars_mod, jars = st.java_cfg, st.jars_mod, st.jars
+  local jar_root_found = st.jar_root_found
+  local root_path, source_paths, source_inject = st.root_path, st.source_paths, st.source_inject
+  local limited, conflict, is_android = st.limited, st.conflict, st.is_android
   -- 11. 会话状态 (供 :Aosp / statusline 读取)。[#3 重构] **按树分区**写入: key 用
   --     aosp_root (与 jars/source_inject 的分区键同一套); 展示方 (ui.status) 按当前
   --     buffer 所属的树取自己那份 —— 双树会话不再"谁后 configure 谁说了算"。
@@ -832,7 +882,10 @@ function M.configure(opts, ctx)
       end)
     end,
   })
+end
 
+local function step_stale_jar_refresh(st)
+  local jars_mod, jar_root_found, is_android = st.jars_mod, st.jar_root_found, st.is_android
   -- 12. jar 缓存陈旧 (AOSP 重新编译过): 不再打扰用户。安排一次**静默**后台重扫,
   --     让下次会话开箱即用。绝不在 configure 里同步扫描 —— 那是
   --     out/soong/.intermediates 的全树 walk, 数秒级, 会卡启动。
@@ -866,7 +919,11 @@ function M.configure(opts, ctx)
       end
     end
   end
+end
 
+local function step_workspace_blockers(st)
+  local java_cfg, root_path, bufname = st.java_cfg, st.root_path, st.bufname
+  local limited, is_android = st.limited, st.is_android
   -- 13. 工作区污染自检 + 空壳自清。AOSP 根下只要存在**可见工程**, jdt.ls 的
   --     InvisibleProjectImporter 就被第一道闸挡死
   --     (ProjectUtils.getVisibleProjects(rootPath).isEmpty()), 整个根再也建不出
@@ -988,7 +1045,10 @@ function M.configure(opts, ctx)
       log.user(msg, { id = "instances:" .. (ws_dir or "?"), timeout = 20000 })
     end
   end
+end
 
+local function step_isolation_cleanup(st)
+  local limited, conflict, session_conflict = st.limited, st.conflict, st.session_conflict
   -- 15. [v12] 会话隔离的退出清理 (见 java/session_conflict.lua)。
   --     limited 时本会话用的是自己那份 `<base>-nvim<pid>` 的 `-data`, 退出时删掉,
   --     不在磁盘上累积 (AOSP 全量索引 = 数 GB)。**只删自己那份** —— 归属由
@@ -1009,6 +1069,64 @@ function M.configure(opts, ctx)
         pcall(session_conflict.cleanup, root)
       end,
     })
+  end
+end
+
+local STEPS = {
+  step_workspace_root, -- 1
+  step_session_isolation, -- 1b
+  step_collect_jars, -- 2
+  step_source_roots, -- 3
+  step_inlay_hints, -- 5
+  step_strip_capabilities, -- 6
+  step_build_settings, -- 7
+  step_import_extras, -- 8
+  step_merge_settings, -- 9
+  step_runtime_hooks, -- 9b
+  step_schedule_refresh, -- 10
+  step_session_state, -- 11 + 11b
+  step_stale_jar_refresh, -- 12
+  step_workspace_blockers, -- 13 + 14
+  step_isolation_cleanup, -- 15
+}
+
+--- 注入 AOSP 特化配置到 jdtls opts
+--- 不覆盖用户已有配置 (deep_extend force 合并, AOSP 字段优先)
+--- @param opts table jdtls opts
+--- @return table opts 修改后的 opts
+--- [#2] opts 可带第二参 ctx: { fname = string, reentry = boolean }。
+---   fname = 组装的基准文件 (重入时是 root_dir fn 拿到的**真实**文件);
+---   reentry = 本次是 root_dir fn 触发的重入 (跳过重复包装)。
+function M.configure(opts, ctx)
+  local cfg = require("aosp-nav").config
+  if not cfg or not cfg.java.enabled then
+    return opts
+  end
+
+  local java_cfg = cfg.java
+  -- 确保 settings 表存在 (capabilities 不在这里动: nvim-jdtls 会自行把用户值与
+  -- 默认 capabilities 合并; 本插件只做 attach 后摘除, 见下面的 strip_caps)
+  opts.settings = opts.settings or {}
+
+  local root_mod = require("aosp-nav.java.root")
+  -- [#2] 组装基准文件: 首次 = probe_file 的最佳猜测 (lazy 求 opts 时机里 buf 0 未必
+  -- 是触发 ft=java 的那个文件); 重入 = root_dir fn 拿到的真实文件, 不再猜。
+  local bufname = (ctx and ctx.fname) or probe_file(root_mod)
+  local session_conflict = require("aosp-nav.java.session_conflict")
+
+  -- 编排: 建共享状态表 st -> 按序执行 STEPS -> 返回 opts。各 step 逐字读写 st
+  -- 的字段 (字段清单见 STEPS 上方注释), 原步骤编号标注在 STEPS 各行。
+  local st = {
+    opts = opts,
+    ctx = ctx,
+    cfg = cfg,
+    java_cfg = java_cfg,
+    root_mod = root_mod,
+    bufname = bufname,
+    session_conflict = session_conflict,
+  }
+  for _, step_fn in ipairs(STEPS) do
+    step_fn(st)
   end
 
   return opts
