@@ -100,6 +100,46 @@ for _, m in ipairs({ "aosp", "project" }) do
   H.check(("空项目 (%s): 不得返回空表, 必须 nil"):format(m), r == nil)
 end
 
+-- [v18.23] 空/失败告警每 root 每会话一次: 空结果**不进缓存**, configure 每次重入
+-- 都会重扫 —— 不去重的话同一工程会连收 N 条同样的 warn (普通工程实测 3 条)。
+-- 复位走 M.reset (同时清内存缓存与去重账本, 重扫语义下告警也该重新出声)。
+do
+  set_mode("project")
+  SR.reset(EMPTY_PROJ)
+  local function count_warns(fn)
+    local w = 0
+    for _, note in ipairs(H.capture_notify(fn)) do
+      if note.level == vim.log.levels.WARN then
+        w = w + 1
+      end
+    end
+    return w
+  end
+  H.eq(
+    count_warns(function()
+      SR.find_for_project(EMPTY_PROJ)
+    end),
+    1,
+    "空项目首次扫描恰一条 warn"
+  )
+  H.eq(
+    count_warns(function()
+      SR.find_for_project(EMPTY_PROJ)
+    end),
+    0,
+    "空项目第二次扫描不再重复告警"
+  )
+  -- :AospRescan (M.reset) 之后允许重新出声 —— "重扫过"是新事件
+  SR.reset(EMPTY_PROJ)
+  H.eq(
+    count_warns(function()
+      SR.find_for_project(EMPTY_PROJ)
+    end),
+    1,
+    "reset 后告警重新出声"
+  )
+end
+
 -- 入参退化: nil / "" 一律 nil, 不抛错
 set_mode("project")
 H.eq(SR.find_for_project(nil), nil, "find_for_project(nil) -> nil")

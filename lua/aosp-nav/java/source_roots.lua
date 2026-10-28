@@ -599,6 +599,12 @@ function M.stale(root)
   return vim.fn.getftime(ninja) > vim.fn.getftime(f)
 end
 
+-- [v18.23] 空/失败告警的去重账本 (每 root 每会话一次)。空结果**不进缓存** (save 只在
+-- 非空时执行), 于是 configure 的每次重入都会重扫并重复告警 —— 实测在一个非 AOSP 工程
+-- 上连收 3 条同样的 warn。结果本身照旧返回 nil: 空结果缓存不值得, 项目加了 .java
+-- 就该被下一次扫描发现。
+local _empty_warned = {}
+
 --- 编排入口: 缓存命中即返回; 冷缓存同步扫描。
 --- 只读缓存/同步扫描的判据是"必须在 jdt.ls 的 initialize 请求里就位", 异步会
 --- 错过导入期 —— 启动路径 (source_inject.inject_sync) 因此**只读缓存不扫描**,
@@ -649,12 +655,16 @@ local function scan_cached(root, opts)
   if not list or #list == 0 then
     -- [v18.17] 带 root: 无 .java 的项目 (纯 native/资源目录) 也会走到这,
     -- 与真失败 (grep 报错) 需要区分得开
-    log.warn(
-      (
-        "source-root scan empty/failed for %s; falling back to jdt.ls inference — "
-        .. "cross-module jumps will land in jars"
-      ):format(root)
-    )
+    -- [v18.23] 每会话每 root 只出一次声 (见 _empty_warned 注释)
+    if not _empty_warned[root] then
+      _empty_warned[root] = true
+      log.warn(
+        (
+          "source-root scan empty/failed for %s; falling back to jdt.ls inference — "
+          .. "cross-module jumps will land in jars"
+        ):format(root)
+      )
+    end
     return nil
   end
   M.save(root, list, stats)
@@ -724,6 +734,7 @@ end
 function M.reset(root, opts)
   local r = root or _root
   _list, _root, _stats = nil, nil, nil
+  _empty_warned = {} -- [v18.23] 重扫语义下告警也应重新出声 (t_source_roots 也用它复位)
   if not (opts and opts.delete_file) then
     return nil
   end

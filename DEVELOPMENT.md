@@ -1891,6 +1891,43 @@ jdt.ls (Eclipse JDT) 的行为形态, VSCode 侧同样存在。
 t_phase 锁: 无 attached_buffers / 空 / 非 java / jdt:// (nofile) 跳过 / uri 正确 /
 2s 节流。
 
+### 2.22 非 AOSP 工程的静默与面板形态 (2026-10-28, v18.23)
+
+**症状 (用户实测)**: 打开一个普通 java 工程 (无 envsetup.sh/.repo, 不在 AOSP 树内),
+aosp-nav 仍接管了 project 模式的源码根注入链:
+* configure 每次重入都对它跑全项目 grep 扫源码根, 扫空后以 warn 播 AOSP 术语告警
+  ("...cross-module jumps will land in jars"), 一个会话连收 3 条;
+* 面板满屏 "!": referencedLibraries=0 -> 建议 :AospRescan (对普通工程就是一次无谓
+  的全树 grep)、sourcePaths "not injected"、import.exclusions 0、gradle/maven nil
+  —— 对 jdt.ls 原生管理的工程全是伪故障;
+* source-roots 段 "0 root(s) injected / other modules jump to jars" 对普通工程是
+  错误陈述。
+
+**根因**: "插件只接管 AOSP 树内工程" 的契约 (root.lua 头注释、面板 aosp root 行)
+在两条实现路径上失守:
+* configure 的 project 模式 sourcePaths 分支只有 `root_path` 闸门, 没有 aosp 分支
+  同款的 `is_android` —— jar_root_found 为 nil 的普通工程也走扫描+注入;
+* 空扫描结果**不进缓存** (save 只在非空时执行), configure 每次重入都重扫+重告警,
+  告警本身无去重。
+
+**修法 (v18.23)**:
+* `java/init.lua` project 分支加 `and is_android` (与 aosp 分支对称)。普通工程一律
+  交还 jdt.ls 原生处理 —— 不扫描、不注入、不告警。这同时堵住一个更深的越权:
+  扫描非空时会把 sourcePaths 注入非 AOSP 工程, 可能干扰 jdt.ls 对 gradle/maven
+  工程的原生导入 (invisible project 的 sourcePaths 会关掉逐文件推断)。
+* `source_roots.scan_cached` 空/失败告警加 `_empty_warned[root]` 每会话每 root 一次
+  (AOSP 工程的真异常也只出一声; `M.reset`/`:AospRescan` 清账, 重扫后允许重新出声)。
+* `ui.lua` 面板: 四行 AOSP 专属行 (referencedLibraries / sourcePaths /
+  import.exclusions / gradle-maven) 收进 `in_aosp` 闸 (按选中 client 的 root_dir
+  判 aosp_root); 非 AOSP 时整块跳过, 由 aosp root 行的 "<not an AOSP file>" 交代。
+  source-roots 段 project 分支对非 AOSP proj 显示 "n/a (not an AOSP tree; jdt.ls
+  handles this project natively)", 不再触发 find_for_project 扫描。
+* `find_for_project` 本身**刻意保持 AOSP 无关** (t_source_roots 的非 AOSP fixture
+  契约; workspace_follow 等调用方语境不同), 语境闸门放在各调用方。
+
+**测试**: t_source_roots 锁告警去重 (首次恰一条 / 重扫不重复 / reset 后重新出声);
+19 套件全过; stylua v0.20.0 `--check` 过。
+
 ## 3. 导航模式
 
 **对用户只宣传两种体验** (v11 降级后), 由单个键 `java.mode` 表达:

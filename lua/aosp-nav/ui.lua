@@ -203,116 +203,125 @@ function M.diagnose(basis, src_file)
     -- 面板底部与 :AospDebug 自己的面板都会写明这条命令。据实测教训 (一台 -Xmx8G 配置
     -- 完全正确的机器上新生代被压到 19MB、18.5% 墙钟在 GC, 静态检查照样绿灯), 要判活
     -- 进程就得读活进程, 那件事整体归 :AospDebug。
-    -- referencedLibraries / import 设置
-    local s = c.config and c.config.settings or {}
-    local rl = s.java and s.java.project and s.java.project.referencedLibraries
-    local n_rl = type(rl) == "table" and #rl or 0
-    -- [v18.19] 面板读的是 client.config.settings —— 那是 **initialize 时刻的本地表**,
-    -- 热补 (didChangeConfiguration) 只在 client.config 里**已有** settings.java.project
-    -- 时才回写 (用户配置没写 opts.settings 时那张表不存在)。于是"jdt.ls 实际有 243 个
-    -- jar、跳转完全正常"的机器上, 这一行仍显示 0 —— 面板在说谎 (用户实测报过)。
-    -- 真值以 state 为准 (热补成功时它被写成 cache_origin="soong-closure" + jars=N);
-    -- 仅在它比本地表**更可信**时采用 (即本地表给 0 而 state 有正值)。
-    local st_jars = require("aosp-nav.state").get(basis).jars or 0
-    local st_origin = require("aosp-nav.state").get(basis).cache_origin
-    local rl_from_state = n_rl == 0 and st_jars > 0 and st_origin == "soong-closure"
-    if rl_from_state then
-      n_rl = st_jars
-    end
-    -- [v18.17c] project 模式的后台采集链运行中: 0 是**设计内的临时态**
-    -- (jdt.ls 逐文件推断兜底, 链完成 didChangeConfiguration 热补), 不是故障 ——
-    -- 老语义的红警告 + ":AospRescan" 建议在此场景全是误导。
-    local warming = mode == "project"
-      and require("aosp-nav.java.jars").warming((function()
-        local rd0 = c.root_dir or (c.config and c.config.root_dir)
-        return rd0 and require("aosp-nav.java.root").aosp_root(rd0) or nil
-      end)())
-    if warming then
-      lines[#lines + 1] = line(
-        "referencedLibraries",
-        "collecting in background (jdt.ls infers per file; hotpatched when ready)",
-        true
-      )
-    else
-      lines[#lines + 1] = line(
-        "referencedLibraries",
-        rl_from_state and ("%d (hotpatched, from session state)"):format(n_rl) or tostring(n_rl),
-        n_rl > 0,
-        action_if(n_rl > 0, ":AospRescan")
-      )
-    end
-    -- sourcePaths: 按模式给不同的判据。
-    --   aosp:    注入**开着** —— "未注入"是故障 (推断被关掉又没有替代)。
-    --   project: 注入**开着** (v11 起注入本项目自己的根) —— 同样"未注入"是故障。
-    --   infer:   注入**关着** —— "未注入"才是预期 (它靠 jdt.ls 逐文件推断)。
-    -- 注意这里问的是"注入开没开", 不是"根是不是 AOSP 根"。
-    --
-    -- [v18.19] project 模式下**不能**用 client.config.settings 判这一行: 本项目自己的
-    -- 源码根走的是 source_roots + 运行期 addToSourcePath (见 source_apply.lua 函数头),
-    -- **故意不写进 settings.java.project.sourcePaths** —— 上面那行 `settings.java.
-    -- project.sourcePaths = nil` 就是明证。所以按 settings 判必然报 "NOT injected (...!)",
-    -- 而同一份面板下面的 == source roots == 段却写着 "4 root(s) injected", 自相矛盾
-    -- (用户实测报过)。project 模式改读 source_roots 的记账 (与下面那段同源)。
-    local sp = s.java and s.java.project and s.java.project.sourcePaths
-    local sp_n = type(sp) == "table" and #sp or 0
-    if mode == "project" then
-      -- 与下面 == source roots == 段**同源** (它也是问运行中那台的 root_dir +
-      -- find_for_project), 免得同一份面板自相矛盾。基准**不能**用 basis: 那是树的
-      -- 根, 而 source_roots 是按**项目目录**键控的 (实测 树根=0 / 项目目录=4)。
-      -- 也**不能**用 cur_file —— 它在本函数后面才算出来 (v18.19 初版踩过 nil)。
-      local proj_roots = 0
-      local live = require("aosp-nav.java.workspace_follow").client()
-      local proj = live and (live.root_dir or (live.config and live.config.root_dir)) or nil
-      if proj then
-        local ok_sr, list = pcall(require("aosp-nav.java.source_roots").find_for_project, proj)
-        if ok_sr and list then
-          proj_roots = #list
-        end
+    -- [v18.23] AOSP 专属行 (referencedLibraries / sourcePaths / import.exclusions /
+    -- gradle-maven) 只对 AOSP 树内的 jdtls 有意义。非 AOSP 工程 (用户拿普通 java
+    -- 项目实测过) 下它们全是 "!" 加 AOSP 口吻的行动建议 —— 0 个 jar 建议去
+    -- :AospRescan (在普通工程里就是一次无谓的全树 grep)、sourcePaths "not
+    -- injected" 其实是 jdt.ls 原生管理的正常态。整块收进 in_aosp 闸; "这台 jdtls
+    -- 不是 AOSP 的" 由后面的 aosp root 行交代 ("<not an AOSP file>")。
+    local in_aosp = rd and require("aosp-nav.java.root").aosp_root(rd) ~= nil or false
+    if in_aosp then
+      -- referencedLibraries / import 设置
+      local s = c.config and c.config.settings or {}
+      local rl = s.java and s.java.project and s.java.project.referencedLibraries
+      local n_rl = type(rl) == "table" and #rl or 0
+      -- [v18.19] 面板读的是 client.config.settings —— 那是 **initialize 时刻的本地表**,
+      -- 热补 (didChangeConfiguration) 只在 client.config 里**已有** settings.java.project
+      -- 时才回写 (用户配置没写 opts.settings 时那张表不存在)。于是"jdt.ls 实际有 243 个
+      -- jar、跳转完全正常"的机器上, 这一行仍显示 0 —— 面板在说谎 (用户实测报过)。
+      -- 真值以 state 为准 (热补成功时它被写成 cache_origin="soong-closure" + jars=N);
+      -- 仅在它比本地表**更可信**时采用 (即本地表给 0 而 state 有正值)。
+      local st_jars = require("aosp-nav.state").get(basis).jars or 0
+      local st_origin = require("aosp-nav.state").get(basis).cache_origin
+      local rl_from_state = n_rl == 0 and st_jars > 0 and st_origin == "soong-closure"
+      if rl_from_state then
+        n_rl = st_jars
       end
+      -- [v18.17c] project 模式的后台采集链运行中: 0 是**设计内的临时态**
+      -- (jdt.ls 逐文件推断兜底, 链完成 didChangeConfiguration 热补), 不是故障 ——
+      -- 老语义的红警告 + ":AospRescan" 建议在此场景全是误导。
+      local warming = mode == "project"
+        and require("aosp-nav.java.jars").warming((function()
+          local rd0 = c.root_dir or (c.config and c.config.root_dir)
+          return rd0 and require("aosp-nav.java.root").aosp_root(rd0) or nil
+        end)())
+      if warming then
+        lines[#lines + 1] = line(
+          "referencedLibraries",
+          "collecting in background (jdt.ls infers per file; hotpatched when ready)",
+          true
+        )
+      else
+        lines[#lines + 1] = line(
+          "referencedLibraries",
+          rl_from_state and ("%d (hotpatched, from session state)"):format(n_rl) or tostring(n_rl),
+          n_rl > 0,
+          action_if(n_rl > 0, ":AospRescan")
+        )
+      end
+      -- sourcePaths: 按模式给不同的判据。
+      --   aosp:    注入**开着** —— "未注入"是故障 (推断被关掉又没有替代)。
+      --   project: 注入**开着** (v11 起注入本项目自己的根) —— 同样"未注入"是故障。
+      --   infer:   注入**关着** —— "未注入"才是预期 (它靠 jdt.ls 逐文件推断)。
+      -- 注意这里问的是"注入开没开", 不是"根是不是 AOSP 根"。
+      --
+      -- [v18.19] project 模式下**不能**用 client.config.settings 判这一行: 本项目自己的
+      -- 源码根走的是 source_roots + 运行期 addToSourcePath (见 source_apply.lua 函数头),
+      -- **故意不写进 settings.java.project.sourcePaths** —— 上面那行 `settings.java.
+      -- project.sourcePaths = nil` 就是明证。所以按 settings 判必然报 "NOT injected (...!)",
+      -- 而同一份面板下面的 == source roots == 段却写着 "4 root(s) injected", 自相矛盾
+      -- (用户实测报过)。project 模式改读 source_roots 的记账 (与下面那段同源)。
+      local sp = s.java and s.java.project and s.java.project.sourcePaths
+      local sp_n = type(sp) == "table" and #sp or 0
+      if mode == "project" then
+        -- 与下面 == source roots == 段**同源** (它也是问运行中那台的 root_dir +
+        -- find_for_project), 免得同一份面板自相矛盾。基准**不能**用 basis: 那是树的
+        -- 根, 而 source_roots 是按**项目目录**键控的 (实测 树根=0 / 项目目录=4)。
+        -- 也**不能**用 cur_file —— 它在本函数后面才算出来 (v18.19 初版踩过 nil)。
+        local proj_roots = 0
+        local live = require("aosp-nav.java.workspace_follow").client()
+        local proj = live and (live.root_dir or (live.config and live.config.root_dir)) or nil
+        if proj then
+          local ok_sr, list = pcall(require("aosp-nav.java.source_roots").find_for_project, proj)
+          if ok_sr and list then
+            proj_roots = #list
+          end
+        end
+        lines[#lines + 1] = line(
+          "sourcePaths",
+          proj_roots > 0
+              and ("injected via runtime apply (%d root(s), not in settings)"):format(proj_roots)
+            or "not injected yet (no source roots found for this project)",
+          proj_roots > 0,
+          action_if(proj_roots > 0, "open a .java file of this project to accumulate its roots")
+        )
+      elseif mode == "infer" then
+        lines[#lines + 1] = line(
+          "sourcePaths",
+          sp_n > 0 and ("injected (%d entries)"):format(sp_n)
+            or "not injected (jdt.ls infers per file)",
+          sp_n == 0,
+          sp_n > 0 and ("mode=" .. tostring(mode)) or nil
+        )
+      elseif warming then
+        lines[#lines + 1] = line(
+          "sourcePaths",
+          "not injected yet — jdt.ls infers per file until the background chain completes",
+          true
+        )
+      else
+        -- aosp / project 都应当注入: aosp 注入核心集+累积, project 注入本项目自己的根
+        local what = mode == "project" and "this project's source roots"
+          or "java.core_source_roots / open a .java file"
+        lines[#lines + 1] = line(
+          "sourcePaths",
+          sp_n > 0 and ("injected (%d entries)"):format(sp_n)
+            or ("NOT injected (mode=" .. tostring(mode) .. "!)"),
+          sp_n > 0,
+          action_if(sp_n > 0, "check " .. what)
+        )
+      end
+      local imp = s.java and s.java.import
+      local ex_n = imp and imp.exclusions and #imp.exclusions or 0
+      lines[#lines + 1] = line("import.exclusions", tostring(ex_n), ex_n > 0)
+      local g = imp and imp.gradle and imp.gradle.enabled
+      local m = imp and imp.maven and imp.maven.enabled
       lines[#lines + 1] = line(
-        "sourcePaths",
-        proj_roots > 0
-            and ("injected via runtime apply (%d root(s), not in settings)"):format(proj_roots)
-          or "not injected yet (no source roots found for this project)",
-        proj_roots > 0,
-        action_if(proj_roots > 0, "open a .java file of this project to accumulate its roots")
+        "gradle/maven import",
+        ("gradle=%s maven=%s"):format(tostring(g), tostring(m)),
+        g == false and m == false
       )
-    elseif mode == "infer" then
-      lines[#lines + 1] = line(
-        "sourcePaths",
-        sp_n > 0 and ("injected (%d entries)"):format(sp_n)
-          or "not injected (jdt.ls infers per file)",
-        sp_n == 0,
-        sp_n > 0 and ("mode=" .. tostring(mode)) or nil
-      )
-    elseif warming then
-      lines[#lines + 1] = line(
-        "sourcePaths",
-        "not injected yet — jdt.ls infers per file until the background chain completes",
-        true
-      )
-    else
-      -- aosp / project 都应当注入: aosp 注入核心集+累积, project 注入本项目自己的根
-      local what = mode == "project" and "this project's source roots"
-        or "java.core_source_roots / open a .java file"
-      lines[#lines + 1] = line(
-        "sourcePaths",
-        sp_n > 0 and ("injected (%d entries)"):format(sp_n)
-          or ("NOT injected (mode=" .. tostring(mode) .. "!)"),
-        sp_n > 0,
-        action_if(sp_n > 0, "check " .. what)
-      )
-    end
-    local imp = s.java and s.java.import
-    local ex_n = imp and imp.exclusions and #imp.exclusions or 0
-    lines[#lines + 1] = line("import.exclusions", tostring(ex_n), ex_n > 0)
-    local g = imp and imp.gradle and imp.gradle.enabled
-    local m = imp and imp.maven and imp.maven.enabled
-    lines[#lines + 1] = line(
-      "gradle/maven import",
-      ("gradle=%s maven=%s"):format(tostring(g), tostring(m)),
-      g == false and m == false
-    )
+    end -- [v18.23] in_aosp: 非 AOSP 工程跳过上面四行
   end
 
   -- workspace root / 模式
@@ -961,14 +970,23 @@ local function source_roots_section(fname)
     -- 只会让人以为坏了。改为报告本项目自己的根。 (见 java/source_roots.find_for_project)
     local live = require("aosp-nav.java.workspace_follow").client()
     local proj = live and (live.root_dir or (live.config and live.config.root_dir)) or nil
+    -- [v18.23] 非 AOSP 工程 (find_for_project 刻意 AOSP 无关, 任何目录都能答):
+    -- 这里问的是 aosp-nav 的注入账本, 对普通工程问"注入了几个根"只会白付一次
+    -- 全项目扫描, 且 "0 root(s) injected / other modules jump to jars" 对 jdt.ls
+    -- 原生管理的工程是错误陈述 —— n/a 一行带过。
+    local proj_in_aosp = proj and require("aosp-nav.java.root").aosp_root(proj) ~= nil
     local n = 0
-    if proj then
+    if proj and proj_in_aosp then
       local list = require("aosp-nav.java.source_roots").find_for_project(proj)
       n = list and #list or 0
     end
     out[#out + 1] = ("project     : %s"):format(proj or "<no running jdtls>")
-    out[#out + 1] = ("src roots   : %d root(s) of this project injected"):format(n)
-    out[#out + 1] = "  -> only the current project is indexed; other modules jump to jars."
+    if proj and not proj_in_aosp then
+      out[#out + 1] = "src roots   : n/a (not an AOSP tree; jdt.ls handles this project natively)"
+    else
+      out[#out + 1] = ("src roots   : %d root(s) of this project injected"):format(n)
+      out[#out + 1] = "  -> only the current project is indexed; other modules jump to jars."
+    end
   else
     out[#out + 1] = ("preset core : %d active of %d configured"):format(
       st.core,

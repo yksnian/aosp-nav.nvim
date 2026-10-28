@@ -607,7 +607,13 @@ local function step_source_roots(st)
     source_inject = require("aosp-nav.java.source_inject")
     -- 同步 + 只读缓存: sourcePaths 必须出现在 initialize 请求里
     source_paths = source_inject.inject_sync(java_cfg, aosp_root, bufname)
-  elseif java_cfg.mode == "project" and root_path then
+  elseif java_cfg.mode == "project" and root_path and is_android then
+    -- [v18.23] is_android 闸门与上面的 aosp 分支对称: 插件只接管 AOSP 树内工程
+    -- (root.lua 的契约, 面板也写着 "only manages roots inside an AOSP tree")。
+    -- 缺了它, 普通 java 工程 (无 envsetup.sh/.repo) 也会被全项目 grep 扫源码根,
+    -- 扫空了还以 warn 口吻播 AOSP 术语告警 (实测一个普通工程连收 3 条);
+    -- 扫不空时更会把 sourcePaths 注入非 AOSP 工程 —— 越权且可能干扰 jdt.ls 对
+    -- gradle/maven 工程的原生导入。普通工程一律交还 jdt.ls 原生处理。
     -- [v11] project 模式注入**本项目自己的**源码根 (相对该项目 = 相对 workspace 根)。
     -- 不注入的后果是: 从本项目跳到同项目里没打开过的类也会落 jar —— 明明索引的就是
     -- 这一个模块, 却因为 jdt.ls 的推断只认"打开过的文件"而失手 (用户实测面板里
