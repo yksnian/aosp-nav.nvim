@@ -1854,6 +1854,43 @@ READ ledger: basis.jar_root(panel_basis)     = /tmp/fx/android/aosp   == jar_roo
 
 **测试**: 19 个套件全过; stylua v0.20.0 `--check` 过。
 
+### 2.21 导入完成后自动刷新陈旧诊断 (`:e!` 的替代) (2026-10-27, v18.22)
+
+**症状 (用户实测)**: 导入完成后, 已打开的 `.java` 缓冲上仍挂着导入窗口期的诊断
+(`The import X cannot be resolved` 一类), 必须 `:e!` 手动清。
+
+**根因**: jdt.ls 在导入窗口期对已打开的编译单元 reconcile 过一次, 那时 classpath
+尚不完整 → 无法解析的 import 作为诊断**定格**; 导入完成 (ServiceReady / 热补
+didChangeConfiguration) 后 Eclipse 的 reconciler **不会**自动重跑已打开的 CU
+—— classpath 变更不触发 open editor 的重新分析。这不是插件的键位/时序 bug, 是
+jdt.ls (Eclipse JDT) 的行为形态, VSCode 侧同样存在。
+
+**修法 (v18.22)**: `java/init.lua` 新增 `M.refresh_open_diagnostics(client)` ——
+对该 client 挂着的每个**真实文件** java 缓冲 (buftype=="" 且 .java) 补发一次
+`textDocument/didSave`。didSave 走 jdt.ls DocumentLifeCycleHandler 的 reconcile
+路径, 重新 publish 全量诊断, 陈旧的 cannot-be-resolved 被正确诊断覆盖。挂在两个
+"导入完成"信号上:
+
+| 信号 | 场景 | 位置 |
+| ---- | ---- | ---- |
+| `language/status` ServiceReady | 导入完成 (双模式通用) | `install_phase_handler` |
+| 热补 `didChangeConfiguration` 发出后 | 降级集启动 → manifest 采集追平 (aosp) | `hotpatch_instance` |
+
+同一 LSP 通道按序处理通知, didSave 的 reconcile 必然用到补过的 classpath。
+每 client 2s 节流 (多工程连发 ServiceReady 只补一波)。
+
+**为什么不用别的手段**:
+* `vim.diagnostic.reset`: 只清不补 —— 服务端不重发的话, 导入后的**真实**错误
+  也一起没了, 界面"干净"是假象。
+* 自动 `:e!`: 重读磁盘 + 丢 undo/视图状态, 对未保存修改还有破坏风险。
+* 重发 didOpen: 违反 LSP 生命周期约定 (jdt.ls openBuffers 状态表会错乱)。
+
+**验证边界**: didSave → reconcile → republish 是 jdt.ls 的公开行为形态 (VSCode
+保存后诊断刷新即此路径), 本仓未反编译 jdt.ls 验证其 reconcile 触发条件 —— 若
+真机上 didSave 不触发重发, 兜底仍是手动 `:e!`, 本助手无副作用 (仅一条通知)。
+t_phase 锁: 无 attached_buffers / 空 / 非 java / jdt:// (nofile) 跳过 / uri 正确 /
+2s 节流。
+
 ## 3. 导航模式
 
 **对用户只宣传两种体验** (v11 降级后), 由单个键 `java.mode` 表达:

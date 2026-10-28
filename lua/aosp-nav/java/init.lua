@@ -177,6 +177,53 @@ function M.install_phase_handler(client)
         key
       )
     end
+    -- [v18.22] 导入完成 → 补发 didSave, 刷新导入窗口期定格的陈旧诊断 (见函数注释)
+    M.refresh_open_diagnostics(client)
+  end
+end
+
+--- [v18.22] 导入完成后自动刷新已打开缓冲的陈旧诊断。
+--- 背景 (用户实测): jdt.ls 在导入窗口期对已打开的编译单元做过一次 reconcile, 那时
+--- classpath 还不完整, "The import X cannot be resolved" 之类诊断就此定格; 导入
+--- 完成 (ServiceReady / 热补 didChangeConfiguration) 后 Eclipse 的 reconciler
+--- **不会**自动重跑已打开的 CU, 用户只能 :e! 手动触发重分析。这里对该 client 挂着
+--- 的每个**真实文件** java 缓冲补发一次 textDocument/didSave —— jdt.ls 的
+--- DocumentLifeCycleHandler 在 didSave 上重新 reconcile 并重新 publish, 陈旧诊断
+--- 被正确诊断覆盖 (didSave→reconcile 是 jdt.ls 公开行为形态, 仓内未反编译验证;
+--- 若真机无效则兜底仍是 :e!, 本助手无副作用)。
+--- 不用 vim.diagnostic.reset: 那只清不补 —— 服务端不重发的话, 导入后的**真实**
+--- 错误也一起没了。也不用自动 :e!: 重读磁盘 + 丢 undo/视图, 代价远大于一条通知。
+--- 防御 (R6): 测试假 client 无 attached_buffers/notify 时静默返回; jdt:// 反编译
+--- 缓冲 (buftype ~= "") 与非 java 缓冲跳过; 每 client 2s 节流 (多工程连发
+--- ServiceReady 只补一波)。
+--- @param client table|nil
+function M.refresh_open_diagnostics(client)
+  if not (client and type(client.notify) == "function") then
+    return
+  end
+  local attached = client.attached_buffers
+  if not attached then
+    return
+  end
+  local now = vim.uv.now()
+  if client._aosp_nav_did_save_at and now - client._aosp_nav_did_save_at < 2000 then
+    return
+  end
+  client._aosp_nav_did_save_at = now
+  for buf in pairs(attached) do
+    if
+      vim.api.nvim_buf_is_valid(buf)
+      and vim.api.nvim_buf_is_loaded(buf)
+      and vim.bo[buf].filetype == "java"
+      and vim.bo[buf].buftype == ""
+      and vim.api.nvim_buf_get_name(buf) ~= ""
+    then
+      -- notify 是 fire-and-forget, 同步发即可; 同一 LSP 通道按序处理通知 ——
+      -- 热补路径上 didSave 必然排在 didChangeConfiguration 之后被 jdt.ls 消费
+      pcall(client.notify, client, "textDocument/didSave", {
+        textDocument = { uri = vim.uri_from_bufnr(buf) },
+      })
+    end
   end
 end
 
@@ -255,6 +302,9 @@ local function hotpatch_instance(client)
   pcall(function()
     require("aosp-nav.state").set({ jars = #jars, cache_origin = "soong-closure" }, aosp)
   end)
+  -- [v18.22] 热补追平 classpath 后同样补发 didSave: 降级集窗口里 reconcile 过的
+  -- 缓冲带着同一类陈旧诊断; 同通道按序处理, reconcile 用的就是刚补的 classpath。
+  M.refresh_open_diagnostics(client)
   return true
 end
 M._hotpatch_instance = hotpatch_instance

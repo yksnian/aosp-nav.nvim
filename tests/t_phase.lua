@@ -87,5 +87,54 @@ javainit.install_phase_handler(nil) -- 不该抛
 javainit.install_phase_handler({ name = "jdtls" }) -- 无 handlers 字段
 H.check(true, "nil / 无 handlers 的 client 不抛异常")
 
+-- ------------------------------- ServiceReady 后自动刷新陈旧诊断 (v18.22)
+do
+  local notes = {}
+  local c = {
+    name = "jdtls",
+    notify = function(_, method, params)
+      notes[#notes + 1] = { method = method, params = params }
+    end,
+  }
+  c._aosp_nav_did_save_at = nil
+  javainit.refresh_open_diagnostics(c)
+  H.check(#notes == 0, "refresh: 无 attached_buffers 静默返回")
+  c.attached_buffers = {}
+  c._aosp_nav_did_save_at = nil
+  javainit.refresh_open_diagnostics(c)
+  H.check(#notes == 0, "refresh: 空 attached_buffers 不发")
+  local tmp = vim.fn.tempname() .. ".java"
+  vim.fn.writefile({ "class A {}" }, tmp)
+  local b = vim.fn.bufadd(tmp)
+  vim.fn.bufload(b) -- bufadd 不加载; is_loaded 守卫会拦下未加载缓冲
+  vim.bo[b].filetype = "java"
+  c.attached_buffers = { [b] = true }
+  c._aosp_nav_did_save_at = nil
+  javainit.refresh_open_diagnostics(c)
+  H.check(
+    #notes == 1 and notes[1].method == "textDocument/didSave",
+    "refresh: java 缓冲补发 didSave"
+  )
+  H.eq(notes[1].params.textDocument.uri, vim.uri_from_bufnr(b), "refresh: uri 对应缓冲")
+  javainit.refresh_open_diagnostics(c)
+  H.check(#notes == 1, "refresh: 2s 节流, 不重发")
+  -- buftype ~= "" (jdt:// 反编译视图形态) 与非 java 缓冲跳过
+  local nfile = vim.api.nvim_create_buf(false, true)
+  vim.bo[nfile].buftype = "nofile"
+  vim.bo[nfile].filetype = "java"
+  vim.api.nvim_buf_set_name(nfile, "jdt://contents/x/Bar.class")
+  local other = vim.api.nvim_create_buf(false, true)
+  vim.bo[other].filetype = "python"
+  vim.api.nvim_buf_set_name(other, vim.fn.tempname() .. ".py")
+  c.attached_buffers = { [nfile] = true, [other] = true } -- 换掉 b, 只留两类该跳的
+  c._aosp_nav_did_save_at = nil
+  javainit.refresh_open_diagnostics(c)
+  H.check(#notes == 1, "refresh: jdt:// 与非 java 缓冲跳过")
+  vim.api.nvim_buf_delete(nfile, { force = true })
+  vim.api.nvim_buf_delete(other, { force = true })
+  vim.api.nvim_buf_delete(b, { force = true })
+  os.remove(tmp)
+end
+
 state.set({ phase = "idle" }) -- 复位, 免得污染同进程里跑的其他文件
 H.finish("t_phase")
