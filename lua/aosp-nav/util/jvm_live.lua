@@ -323,10 +323,15 @@ function M.verdict(snap)
     if a.xmx == nil then
       add("xmx_missing", "warn", "the jdtls cmd has no -Xmx", a.advice)
     elseif not a.xmx_ok then
+      -- [v18.25] floor 文案由 jvm.assess 按 java.mode 生成 (全树 8G / project 6G),
+      -- 这里不再写死 "full AOSP tree"
       add(
         "xmx_small",
         "warn",
-        ("-Xmx%s is below the measured floor for a full AOSP tree"):format(tostring(a.xmx_text)),
+        ("-Xmx%s is below the heap floor (%s)"):format(
+          tostring(a.xmx_text),
+          a.floor_text or "full AOSP tree measured a 4G live set"
+        ),
         a.advice
       )
     elseif not a.host_ok then

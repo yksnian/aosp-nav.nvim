@@ -70,6 +70,12 @@ end
 -- 存活集实测 4.0G, 给 2 倍余量 —— 并行 GC 只有给足 old gen 才不会退化成 full GC。
 M.MIN_XMX = 8 * 1024 * 1024 * 1024
 
+-- project 模式 (java.mode=project, 只导一个项目) 的堆下限。live set 是全树
+-- 的子集; 实测 6G 够用 (2026-10-28: 单项目 1344 jar, 15G 宿主上 -Xmx8G 把宿主
+-- 顶进 global OOM, 内核连杀两个 jdtls —— 降到 6G 后索引正常)。全套判定见
+-- :AospDebug (静态 xmx 行 + 动态 GC 行, 调小后盯一眼 full GC 间隔)。
+M.MIN_XMX_PROJECT = 6 * 1024 * 1024 * 1024
+
 -- -Xmx 占物理内存的比例上限。超过它就是"JVM 的堆上限比机器还大": 它自己永远够不着
 -- 那个上限, 内核先一步 OOM/换页。实测 15G 机器上 -Xmx16G 把 jdtls 拖进 GC 死亡螺旋,
 -- 被全局 OOM-killer 杀掉两次 —— 而堆内部指标 (old gen %、full GC 间隔) 全绿, 旧版
@@ -79,16 +85,27 @@ M.HOST_RATIO_WARN = 0.80
 --- 评估一份 jdtls cmd 的 JVM 参数是否够用
 --- @param args table jdtls 的 cmd 列表
 --- @param mem_total integer|nil 物理内存字节数; 缺省时自行读 /proc/meminfo
+--- @param opts table|nil { mode = string } java.mode。堆下限按模式分档:
+---   aosp/infer (缺省, 全树口径) 8G; project (单项目) 6G
 --- @return table { xmx = integer|nil, xmx_text = string|nil, xmx_ok = boolean,
 ---                 parallel_gc = boolean, mem_total = integer|nil,
----                 host_ratio = number|nil, host_ok = boolean, advice = string|nil }
-function M.assess(args, mem_total)
+---                 host_ratio = number|nil, host_ok = boolean, advice = string|nil,
+---                 mode = string, min_xmx = integer, floor_text = string }
+function M.assess(args, mem_total, opts)
   args = args or {}
   local raw = flag_value(args, "-Xmx")
   local xmx = raw and parse_size(raw) or nil
   if mem_total == nil then
     mem_total = M.host_mem_total()
   end
+
+  -- [v18.25] 下限随 java.mode 分档: project 只导一个项目, live set 比全树小。
+  -- 未传 mode 的调用方按全树口径 (保守)。
+  local mode = (opts and opts.mode) or "aosp"
+  local min_xmx = (mode == "project") and M.MIN_XMX_PROJECT or M.MIN_XMX
+  local floor_text = (mode == "project")
+      and "project mode: single-project import, 6G is the working baseline"
+    or "full AOSP tree measured a 4G live set"
 
   local parallel_gc = false
   for _, a in ipairs(args) do
@@ -102,17 +119,20 @@ function M.assess(args, mem_total)
   local host_ratio = (xmx and mem_total and mem_total > 0) and (xmx / mem_total) or nil
   local host_ok = not (host_ratio and host_ratio > M.HOST_RATIO_WARN)
 
-  local ok = xmx ~= nil and xmx >= M.MIN_XMX
+  local ok = xmx ~= nil and xmx >= min_xmx
   local advice = nil
   if xmx == nil then
     advice = "add --jvm-arg=-Xmx8G to the jdtls cmd"
   elseif not ok then
     -- 实测口径: 堆不够时 jdtls 的表现是"CPU 打满但索引不动", 而不是报错 ——
     -- 所以这里必须按数值判, 不能按"-Xmx 串存在"判
-    advice = (
-      "-Xmx%s too small (full AOSP tree measured a 4G live set; use >= 8G): "
-      .. "change to --jvm-arg=-Xmx8G"
-    ):format(raw)
+    local min_g = min_xmx / (1024 ^ 3)
+    advice = ("-Xmx%s too small (%s; use >= %dG): change to --jvm-arg=-Xmx%dG"):format(
+      raw,
+      floor_text,
+      min_g,
+      min_g
+    )
   elseif not host_ok then
     -- 堆够大, 但比机器还大: 该往下调, 不是往上调。ceil 到整 G 便于抄。
     local suggested = math.max(1, math.floor(mem_total * M.HOST_RATIO_WARN / (1024 ^ 3)))
@@ -136,6 +156,9 @@ function M.assess(args, mem_total)
     host_ratio = host_ratio,
     host_ok = host_ok,
     advice = advice,
+    mode = mode,
+    min_xmx = min_xmx,
+    floor_text = floor_text,
   }
 end
 

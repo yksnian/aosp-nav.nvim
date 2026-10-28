@@ -2035,6 +2035,17 @@ git 短哈希 (`aosp-nav.nvim ` 前缀同因删除); `generated:` 保留 (标快
 固定名 `aosp-nav://debug` 一并消失。t_panel 追加断言: debug 浮窗形态、双面板并存
 各持一份 buffer、两浮窗都能 `q` 关闭。20 套件全过; stylua v0.20.0 `--check` 过。
 
+**[同日追加二] 面板可复制 + Xmx 下限按 java.mode 分档**: (1) 浮窗加 `Y` 键: 整块
+内容 → `+` (系统剪贴板), 无剪贴板提供器时退回 `"` 寄存器并在消息区说明; 视觉选中
++ y 本就可用 (nomodifiable 不拦 yank)。(2) 背景: 用户 15G 宿主 (swap 4G 满载) 上
+-Xmx8G 的 project 实例两次被内核 global OOM SIGKILL (dmesg 取证, anon-rss 8.7G),
+降到 6G 后索引正常。据此 `jvm.assess` 增加第三参 `opts.mode`: 全树口径 (aosp/infer,
+缺省) 沿用 8G 下限 (§8.1 实测 live set 4G); project 模式 (单项目, live set 是全树
+的子集) 下限 6G —— `MIN_XMX_PROJECT`, 建议值与 floor 文案随模式生成,
+`jvm_live` 的 `xmx_small` verdict 不再写死 "full AOSP tree", `:AospDebug` 的静态
+检查按当前 java.mode 传入。t_jvm 追加: project 6G 通过 / project 4G 报且建议 6G /
+缺省保持全树口径。20 套件全过; stylua v0.20.0 `--check` 过。
+
 ## 3. 导航模式
 
 **对用户只宣传两种体验** (v11 降级后), 由单个键 `java.mode` 表达:

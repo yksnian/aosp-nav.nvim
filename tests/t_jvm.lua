@@ -76,6 +76,29 @@ check(a8p.xmx_ok == true, "assess: 8G is enough")
 check(a8p.parallel_gc == true, "assess: UseParallelGC recognised")
 eq(a8p.advice, nil, "assess: no advice when the heap is fine")
 
+-- [v18.25] project 模式: 下限按模式分档 (单项目导入, live set 是全树的子集)。
+-- 2026-10-28 实测: 1344 jar 单项目 6G 索引正常; 8G 在 15G 宿主 + swap 满载时
+-- 反而把宿主顶进 global OOM (内核 SIGKILL, 连杀两个)。
+local a6p = jvm.assess({ "--jvm-arg=-Xmx6G" }, 64 * G, { mode = "project" })
+check(a6p.xmx_ok == true, "assess: 6G is enough in project mode")
+check(
+  a6p.floor_text ~= nil and a6p.floor_text:find("project", 1, true) ~= nil,
+  "assess: project floor text names the mode"
+)
+local a4p = jvm.assess({ "--jvm-arg=-Xmx4G" }, 64 * G, { mode = "project" })
+check(a4p.xmx_ok == false, "assess: 4G is still too small in project mode")
+check(
+  a4p.advice:find("Xmx6G", 1, true) ~= nil,
+  "assess: project-mode advice points at 6G, not the full-tree 8G"
+)
+-- 缺省 (不传 mode) 保持全树口径
+local a6d = jvm.assess({ "--jvm-arg=-Xmx6G" }, 64 * G)
+check(a6d.xmx_ok == false, "assess: no mode arg keeps the full-tree floor")
+check(
+  a6d.floor_text:find("full AOSP tree", 1, true) ~= nil,
+  "assess: default floor text is the full-tree one"
+)
+
 -- 两者都给时后者胜 (与 HotSpot 一致)
 local alast = jvm.assess({ "-Xmx4G", "--jvm-arg=-Xmx8G" }, 64 * G)
 eq(alast.xmx, 8 * 1024 ^ 3, "assess: repeated -Xmx, the last one wins")

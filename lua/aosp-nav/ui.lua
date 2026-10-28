@@ -687,6 +687,19 @@ local function open_float(reg, srcwin, out, opts)
   end
   vim.keymap.set("n", "q", closer, { buffer = buf, nowait = true, silent = true })
   vim.keymap.set("n", "<Esc>", closer, { buffer = buf, nowait = true, silent = true })
+  -- [v18.25] 内容可复制: 视觉选中 + y 本来就可用 (nomodifiable 不拦 yank), 但面板
+  -- 的典型用法是整块抄走 —— Y 一键把全部内容送进系统剪贴板 ("+); 没有剪贴板提供
+  -- 器时退回匿名寄存器 (p 可粘), 消息区说明去向。
+  vim.keymap.set("n", "Y", function()
+    local body = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local text = table.concat(body, "\n") .. "\n"
+    vim.fn.setreg('"', text)
+    if pcall(vim.fn.setreg, "+", text) then
+      vim.notify(("aosp-nav: %d lines copied to the system clipboard (+)"):format(#body))
+    else
+      vim.notify('aosp-nav: no clipboard provider — copied to the " register (paste with p)')
+    end
+  end, { buffer = buf, nowait = true, silent = true })
   -- 浮窗被关 (q 已在 closer 里走过一遍, 这里是外部 :close 等路径) 或源窗口被关
   -- 时清账; once 避免常驻 autocmd 越攒越多。
   vim.api.nvim_create_autocmd("WinClosed", {
@@ -760,7 +773,13 @@ function M.debug_panel(bang)
     if not pid then
       out[#out + 1] = "jvm    : " .. tostring(why)
     else
-      local static = require("aosp-nav.util.jvm").assess(client.config and client.config.cmd)
+      -- [v18.25] 堆下限按当前 java.mode 分档 (全树 8G / 单项目 6G), 否则 project
+      -- 模式会被 "full AOSP tree" 的 8G 口径误报 (用户实测)
+      local static = require("aosp-nav.util.jvm").assess(
+        client.config and client.config.cmd,
+        nil,
+        { mode = mode_of(get_cfg()) }
+      )
       local snap, err = jl.snapshot(pid, static)
       if not snap then
         out[#out + 1] = "jvm    : pid " .. pid .. ", but the live snapshot failed:"
