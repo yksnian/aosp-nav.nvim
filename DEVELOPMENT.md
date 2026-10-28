@@ -1995,6 +1995,46 @@ t_multi_tree (累积文件断言改用 `cache_key`, 旧的裸 `gsub("/", "-")` �
 缓存路径改树目录; 非 AOSP root 顺带钉住 cache_file 的自键回退分支)。
 19 套件全过; stylua v0.20.0 `--check` 过。
 
+### 2.24 面板浮窗化: 每个源窗口一个实例 (2026-10-28, v18.25)
+
+**动机 (用户多窗口实测)**: 旧实现 `botright new` + 固定名 `aosp-nav://panel`, 多窗口
+下各敲 `:Aosp` 坏两种方式: (1) 旧面板 buffer 还显示在别的窗口 (`bufhidden=wipe`
+对**正在显示**的 buffer 不生效), 第二次 `nvim_buf_set_name` 撞名报错; (2) 就算打开,
+面板基准在 `M.diagnose` 里从"当前 buffer"再推导 —— 面板 buffer 自身取不到树, 回退链
+(client[1] / active 槽) 把每个窗口的面板串成同一棵树, 状态行全是别的窗口的
+(用户面板上 `! session phase=idle jars=0 origin=nil` 正是它)。
+
+**改造** ([ui.lua](../lua/aosp-nav/ui.lua) 的 `M.panel`):
+* **浮窗形态**: 匿名 scratch buffer (`nvim_create_buf`) + 居中浮窗
+  (`nvim_open_win`, rounded 边框 + 标题, 尺寸贴内容、上限 90% 屏, `style=minimal`)。
+  `q` / `<Esc>` 关闭 (buffer-local 映射)。
+* **按源窗口记账**: `_panel_floats[源窗口 winid] = {buf, win}` —— 每个源窗口一个
+  实例互不共用; 同一窗口再敲 `:Aosp` 先收旧实例换新快照; 在浮窗里敲 `:Aosp` 把
+  该浮窗当源窗口先收掉 (防叠浮窗); 源窗口关闭时经 `WinClosed` (once) 连带收掉。
+* **基准显式串参**: `M.panel` 打开浮窗**之前**按调用方文件算好
+  `panel_basis(src_file)` 传进 `M.diagnose(basis, …)` / `source_roots_section(src_file)`;
+  `M.diagnose` 改为 `basis = basis or (按 src_file / 当前 buffer 推导)` —— 面板路径
+  不再从匿名 buffer 推导, 其它调用方语义不变。jdtls 行的 client 选择同样改用
+  src_file 判"当前 buffer 挂着的" (匿名 buffer 下旧写法恒落到 client[1])。
+
+**测试**: 新增 t_panel (零 LSP 假树): 浮窗匿名 buffer + 非空内容; 两窗口两实例
+buffer 互不覆盖; 同窗口重开换快照且别窗实例原样保留; `q` 关窗删 buffer; 源窗口
+关闭浮窗连带收掉; 固定名 `aosp-nav://panel` 不再被创建。20 套件全过; stylua
+v0.20.0 `--check` 过。
+
+**[同日追加] 面板瘦身 + :AospDebug 浮窗化**: (1) 面板/调试面板的头部标题行
+(`aosp-nav` / `aosp-nav debug`) 删掉 —— 浮窗标题已经顶着它, `plugin` 行只留
+git 短哈希 (`aosp-nav.nvim ` 前缀同因删除); `generated:` 保留 (标快照时间,
+同窗口重开换新快照时看得出刷新过)。其余行逐一过堂: 底部命令提示、`gradle/maven`
+(校验线, 误开会变 `!`)、kotlin 三行 (含 AospCollectJars 行动提示) 均有信息量, 不删。
+顺带删除确认无调用方的死 API `M.render_diagnostics` (它的 `aosp-nav diagnostics`
+头部正是被删的概念)。(2) `:AospDebug` 同步浮窗化: 浮窗打开/关闭/记账逻辑上提为
+`open_float(reg, srcwin, out, opts)` / `close_float(reg, srcwin)` 公共体,
+`:Aosp` 与 `:AospDebug` 用**两张登记表** (`_panel_floats` / `_debug_floats`) ——
+两种面板要在同一窗口**并存** (plugin/aosp-nav.lua 的并存理由), 各自换快照互不挤掉。
+固定名 `aosp-nav://debug` 一并消失。t_panel 追加断言: debug 浮窗形态、双面板并存
+各持一份 buffer、两浮窗都能 `q` 关闭。20 套件全过; stylua v0.20.0 `--check` 过。
+
 ## 3. 导航模式
 
 **对用户只宣传两种体验** (v11 降级后), 由单个键 `java.mode` 表达:

@@ -171,12 +171,19 @@ function M.diagnose(basis, src_file)
   -- [#3] 面板按 panel_basis 取树 (当前 buffer 不在树里时回退 client / active) ——
   -- :Aosp 常在面板缓冲自己上被再次运行, 按 buffer 硬取会把状态行全显示成 idle。
   -- statusline 才是"严格按当前 buffer"的语义 (非 AOSP 必须空串)。
-  -- 重声明遮蔽签名参数 (原实现同形): 下游的 basis 都是这份解析结果
-  local basis = basis_mod.panel_basis(vim.api.nvim_buf_get_name(0))
+  -- [v18.25] 面板入口 (M.panel) 已按**调用方文件**算好基准显式传入: 浮窗 buffer
+  -- 是匿名的, 从当前 buffer 再推导只能走回退链 (client[1] / active 槽), 多窗口
+  -- (多项目/多树) 下各窗口的面板会全部串成同一棵树 (用户实测的 phase=idle jars=0)。
+  -- 显式传参之外的调用方保持原语义: 按 src_file (若有) 或当前 buffer 推导。
+  basis = basis
+    or basis_mod.panel_basis(
+      (src_file and src_file ~= "") and src_file or vim.api.nvim_buf_get_name(0)
+    )
   local st = require("aosp-nav.state").get(basis)
   local lines = {}
 
-  table.insert(lines, line("plugin", "aosp-nav.nvim " .. plugin_version(), true))
+  -- [v18.25] 只留版本号: 插件名与浮窗标题重复
+  table.insert(lines, line("plugin", plugin_version(), true))
 
   -- jdtls client ([v18.8] 每项目一台: **当前 buffer 挂着的优先**, 不再取 [1] ——
   -- 否则面板在多台并存时串台显示别的项目的 root/sourcePaths/-data)
@@ -184,7 +191,7 @@ function M.diagnose(basis, src_file)
   if #clients == 0 then
     lines[#lines + 1] = line("jdtls", "not attached", false, "open a .java file in the AOSP tree")
   else
-    local cur_name = vim.api.nvim_buf_get_name(0)
+    local cur_name = (src_file and src_file ~= "") and src_file or vim.api.nvim_buf_get_name(0)
     local c = clients[1]
     for _, cc in ipairs(clients) do
       if cc.attached_buffers and cur_name ~= "" and cc.attached_buffers[vim.fn.bufnr(cur_name)] then
@@ -592,19 +599,6 @@ local function diagnostics_body(lines)
   return out
 end
 
---- 渲染诊断行 (VSCode printDiagnostics 的等价物)
---- @param lines table
---- @return table string 行列表
-function M.render_diagnostics(lines)
-  local out = {
-    "aosp-nav diagnostics",
-    "generated: " .. os.date("%Y-%m-%d %H:%M:%S"),
-    "",
-  }
-  vim.list_extend(out, diagnostics_body(lines))
-  return out
-end
-
 -- [#1 重构] 工作区元数据 (_workspace_dir / expected_workspace_dir /
 -- invisible_project_name / workspace_projects / workspace_blockers /
 -- project_location / orphan_project / remove_project_metadata /
@@ -619,6 +613,97 @@ end
 -- foreign_jdtls / reap_orphan_jdtls / instances_message / data_dir / root_dir /
 -- tree_name / jdtls_pid) 已整体搬到 java/instances.lua —— /proc 的底层读取在
 -- util/proc.lua, 本模块只调用它们的结论做展示。
+
+-- :Aosp / :AospDebug 的浮窗登记表: 源窗口 winid -> { buf = bufnr, win = 浮窗 winid }。
+-- [v18.25] 每个源窗口一个浮窗实例, 互不共用 buffer。旧实现 `botright new` + 固定名
+-- ("aosp-nav://panel" / "aosp-nav://debug") 在多窗口下坏两种方式: 第二个窗口再敲命令
+-- 时旧面板 buffer 还显示在别的窗口 (bufhidden=wipe 不生效), nvim_buf_set_name 撞名
+-- 报错; 就算侥幸打开, 内容也按回退链重渲染成别的树的状态。匿名 buffer + 按源窗口
+-- 记账让"各窗口各看各的"成立; 同一窗口再敲同一命令换新快照。两张表分开: 两种面板
+-- 要能在同一窗口**并存** (见 plugin/aosp-nav.lua 里 :AospDebug 的并存理由)。
+local _panel_floats = {}
+local _debug_floats = {}
+
+--- 收掉 srcwin 在 reg 名下的浮窗 (幂等: win/buf 已无效时静默跳过)
+local function close_float(reg, srcwin)
+  local f = reg[srcwin]
+  if not f then
+    return
+  end
+  reg[srcwin] = nil
+  if vim.api.nvim_win_is_valid(f.win) then
+    pcall(vim.api.nvim_win_close, f.win, true)
+  end
+  if vim.api.nvim_buf_is_valid(f.buf) then
+    pcall(vim.api.nvim_buf_delete, f.buf, { force = true })
+  end
+end
+
+--- 浮窗打开的公共体: 居中、贴内容尺寸 (上限 90% 屏)、rounded 边框 + 标题;
+--- q / <Esc> 关闭, 浮窗或源窗口被关 (WinClosed, once) 时清账。
+--- @param reg table 登记表 (按源窗口 winid 键控)
+--- @param srcwin integer 调用方窗口
+--- @param out string[] 内容行
+--- @param opts { title = string, filetype = string }
+--- @return integer 浮窗 winid
+local function open_float(reg, srcwin, out, opts)
+  -- 从浮窗里再敲同一命令: 当前"源窗口"是旧浮窗自己, 先收掉它, 避免浮窗叠浮窗
+  for k, f in pairs(reg) do
+    if f.win == srcwin then
+      close_float(reg, k)
+      break
+    end
+  end
+  close_float(reg, srcwin)
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, out)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].filetype = opts.filetype
+
+  local width, height = 0, #out
+  for _, l in ipairs(out) do
+    width = math.max(width, vim.fn.strdisplaywidth(l))
+  end
+  width = math.min(width + 4, math.floor(vim.o.columns * 0.9))
+  height = math.min(height, math.floor(vim.o.lines * 0.9))
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    row = math.floor((vim.o.lines - height) / 2),
+    col = math.floor((vim.o.columns - width) / 2),
+    width = width,
+    height = height,
+    border = "rounded",
+    style = "minimal",
+    title = opts.title,
+    title_pos = "center",
+  })
+
+  local function closer()
+    close_float(reg, srcwin)
+  end
+  vim.keymap.set("n", "q", closer, { buffer = buf, nowait = true, silent = true })
+  vim.keymap.set("n", "<Esc>", closer, { buffer = buf, nowait = true, silent = true })
+  -- 浮窗被关 (q 已在 closer 里走过一遍, 这里是外部 :close 等路径) 或源窗口被关
+  -- 时清账; once 避免常驻 autocmd 越攒越多。
+  vim.api.nvim_create_autocmd("WinClosed", {
+    pattern = tostring(win),
+    once = true,
+    callback = closer,
+  })
+  if srcwin ~= win then
+    vim.api.nvim_create_autocmd("WinClosed", {
+      pattern = tostring(srcwin),
+      once = true,
+      callback = closer,
+    })
+  end
+  reg[srcwin] = { buf = buf, win = win }
+  return win
+end
 
 --- :AospDebug 的目标 client: 优先当前 buffer 挂着的 (与 java/source_apply 同口径),
 --- 否则退回第一个 —— 面板上会写明报的是哪棵树。
@@ -656,11 +741,10 @@ end
 --- @param bang boolean|nil
 function M.debug_panel(bang)
   local jl = require("aosp-nav.util.jvm_live")
-  local out = {
-    "aosp-nav debug",
-    "generated: " .. os.date("%Y-%m-%d %H:%M:%S"),
-    "",
-  }
+  -- [v18.25] 先抓调用方窗口 (浮窗 buffer 建好之后它就不是"当前窗口"了)。
+  local srcwin = vim.api.nvim_get_current_win()
+  -- [v18.25] 头部 "aosp-nav debug" 一行删掉: 浮窗标题已经顶着它。
+  local out = { "generated: " .. os.date("%Y-%m-%d %H:%M:%S"), "" }
 
   local client = debug_client()
   if not client then
@@ -718,14 +802,13 @@ function M.debug_panel(bang)
     end
   end
 
-  vim.cmd("botright new")
-  local buf = vim.api.nvim_get_current_buf()
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, safe)
-  vim.bo[buf].buftype = "nofile"
-  vim.bo[buf].bufhidden = "wipe"
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].filetype = "aosp-nav-debug"
-  vim.api.nvim_buf_set_name(buf, "aosp-nav://debug")
+  -- [v18.25] 浮窗化 (与 :Aosp 同一体, 各自记账): 每个源窗口一个实例, q/<Esc> 关闭。
+  open_float(
+    _debug_floats,
+    srcwin,
+    safe,
+    { title = " aosp-nav debug ", filetype = "aosp-nav-debug" }
+  )
 end
 
 --- :AospRescan — 清 jar 缓存并重扫, 同时刷新 import.exclusions 缓存
@@ -1026,22 +1109,29 @@ local function source_roots_section(fname)
 end
 
 --- :Aosp — 打开**一个**信息面板 (旧 status + diagnostics + source-roots 三合一)
+--- [v18.25] 浮窗形态: 居中、贴内容尺寸、rounded 边框; 每个源窗口一个实例,
+--- q / <Esc> 关闭, 源窗口关闭时浮窗跟着收掉。
 function M.panel()
-  -- [v18.5] 先抓调用方文件名: 面板缓冲建好之后 nvim_buf_get_name(0) 就是
-  -- aosp-nav://panel, diagnose 里的"当前文件"判定会全部失灵 (v18.2 的坑在这复活)。
+  -- [v18.5] 先抓调用方文件名/窗口: 浮窗 buffer 建好之后 nvim_buf_get_name(0)
+  -- 就是 "" (匿名), diagnose 的"当前文件"判定会全部失灵 (v18.2 的坑在这复活)。
   local src_file = vim.api.nvim_buf_get_name(0)
-  local out = {
-    "aosp-nav",
-    "generated: " .. os.date("%Y-%m-%d %H:%M:%S"),
-  }
+  local srcwin = vim.api.nvim_get_current_win()
+  -- [v18.25] 基准按**调用方文件**算好并显式传下去 (见 M.diagnose 的注释):
+  -- 旧实现在 diagnose 里从"当前 buffer"再推导, 面板 buffer 取不到树, 多窗口下
+  -- 全部串成回退链选中的同一棵树。
+  local basis = basis_mod.panel_basis(src_file)
+
+  -- [v18.25] 头部 "aosp-nav" 一行删掉: 浮窗标题已经顶着它; "generated:" 留着,
+  -- 它标的是这份快照的时间 (同窗口重开换新快照时看得出刷新过)。
+  local out = { "generated: " .. os.date("%Y-%m-%d %H:%M:%S") }
 
   -- 不单列 status 块: 它的每个字段 (phase/root/jars/mode/clients) 在
   -- diagnostics 里都有, 单列只会让面板变长一倍。M.status() 仍是给 statusline 的公开 API。
   out[#out + 1] = ""
-  vim.list_extend(out, diagnostics_body(M.diagnose(nil, src_file)))
+  vim.list_extend(out, diagnostics_body(M.diagnose(basis, src_file)))
 
   out[#out + 1] = ""
-  vim.list_extend(out, source_roots_section(nil))
+  vim.list_extend(out, source_roots_section(src_file))
 
   out[#out + 1] = ""
   -- :Aosp! 是"强制注入全部已累积源码根" —— 只有会累积的 aosp 模式才有东西可强推。
@@ -1054,14 +1144,7 @@ function M.panel()
   out[#out + 1] = "-- :AospRescan   refresh jars + import.exclusions caches"
   out[#out + 1] = "-- :AospCleanWorkspace  rebuild the jdtls workspace (destructive)"
 
-  vim.cmd("botright new")
-  local buf = vim.api.nvim_get_current_buf()
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, out)
-  vim.bo[buf].buftype = "nofile"
-  vim.bo[buf].bufhidden = "wipe"
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].filetype = "aosp-nav-panel"
-  vim.api.nvim_buf_set_name(buf, "aosp-nav://panel")
+  open_float(_panel_floats, srcwin, out, { title = " aosp-nav ", filetype = "aosp-nav-panel" })
 end
 
 --- :AospCleanWorkspace — 删除 jdtls workspace 目录 (等价 VSCode 的
