@@ -303,19 +303,14 @@ end
 --- 靠**下次启动**生效, 所以 inject_sync 必须知道上个会话攒了哪些项目。
 --- **按树分文件**: 一个共享文件意味着每棵树启动时都会把对方的项目读进来 (相对
 --- 本树算不出来 -> 空壳), 而且启动时的 persist 会把对方那一行**覆盖掉**。
---- 键规则沿用 jars/source_roots 的缓存命名约定。
+--- 键规则沿用 jars/source_roots 的缓存命名约定; v18.24 起每树一个子目录。
 --- @param aosp_root string
 --- @return string|nil
 local function projects_file(aosp_root)
   local cfg = get_cfg()
-  if not cfg.cache_dir or not aosp_root or aosp_root == "" then
-    return nil
-  end
+  local dir = require("aosp-nav.util.path").cache_tree_dir(cfg.cache_dir, aosp_root)
   -- 键规则与 jars/source_roots 一致 ([#8] 单射, 两棵不同的树不再同键)
-  return cfg.cache_dir
-    .. "/source_inject-projects-"
-    .. require("aosp-nav.util.path").cache_key(aosp_root)
-    .. ".txt"
+  return dir and (dir .. "/source_inject-projects.txt") or nil
 end
 
 --- 写某棵树的累积项目顺序 (一行一个绝对路径, 老的在前)
@@ -325,7 +320,7 @@ function M.persist(aosp_root)
   if not f then
     return
   end
-  vim.fn.mkdir(get_cfg().cache_dir, "p")
+  vim.fn.mkdir(vim.fn.fnamemodify(f, ":h"), "p")
   local fh = io.open(f, "w")
   if not fh then
     return

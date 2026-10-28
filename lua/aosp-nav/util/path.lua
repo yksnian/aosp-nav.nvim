@@ -48,4 +48,22 @@ function M.cache_key(root)
   return (root:gsub("%-", "--"):gsub("/", "-"):gsub("^-", ""))
 end
 
+--- 树级缓存目录: <cache_dir>/<cache_key(root)>/ —— 每棵树一个子目录 (v18.24,
+--- jdt.ls 的 -data 目录风格)。树级缓存用短后缀命名 (jars.txt / module-deps.tsv /
+--- import_exclusions.txt / …); 项目级缓存 (闭包 jar / 项目源码根) 收进**所属树**
+--- 的目录, 文件名用**相对键**: <cache_key(rel)>.closure-jars.txt —— 旧扁平命名下
+--- <tree>.<project>.closure-jars.txt 这类 110 字符文件名由此消失, 且绝对键中
+--- 重复的树前缀不再出现。目录名沿用 cache_key ([#8] 单射不变, 两棵不同的树
+--- 仍然是不同目录; cache_key 对相对路径同样单射)。
+--- cache_dir/root 为空返回 nil, 调用方沿用各自已有的守卫。
+--- @param cache_dir string|nil
+--- @param root string|nil
+--- @return string|nil
+function M.cache_tree_dir(cache_dir, root)
+  if not cache_dir or cache_dir == "" or not root or root == "" then
+    return nil
+  end
+  return cache_dir .. "/" .. M.cache_key(root)
+end
+
 return M

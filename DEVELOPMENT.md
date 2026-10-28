@@ -1928,6 +1928,73 @@ aosp-nav 仍接管了 project 模式的源码根注入链:
 **测试**: t_source_roots 锁告警去重 (首次恰一条 / 重扫不重复 / reset 后重新出声);
 19 套件全过; stylua v0.20.0 `--check` 过。
 
+### 2.23 缓存布局扁平 → 一树一目录 (2026-10-28, v18.24)
+
+**动机 (用户看 ~/.cache/nvim/aosp_nav 后提出)**: 扁平文件名把树键和后缀全塞进一个
+文件名, 真实形态 `home-…-aosp.home-…-packages-modules-Connectivity.closure-jars.txt`
+(~110 字符), 目录一眼看不出归属; jdt.ls 自己的 -data 侧 (`~/.cache/nvim/jdtls/`)
+是 `<树名>_<sha1前8>` 一个目录一个工程。
+
+**终态布局 (用户定稿)**: 每棵树一个子目录, **全部**缓存文件都收进树目录内; 树级
+缓存用短后缀命名, 项目级缓存的文件名改用**相对键** (相对树根的路径过 `cache_key`,
+对相对路径同样单射)。中间形态曾是"每个缓存键一个子目录" (项目缓存各自 `<cache_key(项目)>/`
+成目录), 用户看了实机布局后定稿为树域化 —— "一个工程一个目录"的语义这才真正成立,
+项目文件不再散落顶层:
+
+| 缓存 | 旧扁平名 | 终态路径 |
+| --- | --- | --- |
+| jar 全树集 | `<tree>.txt` | `<tree>/jars.txt` |
+| module-deps 摘要 | `<tree>.module-deps.tsv` | `<tree>/module-deps.tsv` |
+| intermediates 清单 | `<tree>.intermediates-jars.tsv` | `<tree>/intermediates-jars.tsv` |
+| 项目闭包 jar 集 | `<tree>.<project>.closure-jars.txt` | `<tree>/<rel>.closure-jars.txt` |
+| 源码根扫描 (树基准) | `<tree>.source-roots.txt` | `<tree>/source-roots.txt` |
+| 源码根扫描 (项目基准) | `<project>.source-roots.txt` | `<tree>/<rel>.source-roots.txt` |
+| source_inject 累积账本 | `source_inject-projects-<tree>.txt` | `<tree>/source_inject-projects.txt` |
+| import.exclusions | `import_exclusions-<root>.txt` | `<tree>/import_exclusions.txt` |
+
+(`<tree>` = `<cache_dir>/<cache_key(树根)>`, 目录名沿用 [#8] 单射的 `cache_key`,
+两棵不同的树仍然不同目录; `<rel>` = 项目相对树根的路径。)
+
+**实现要点**:
+* `util/path.lua` 新增集中入口 `M.cache_tree_dir(cache_dir, root)`, 五个模块九处
+  拼接点全部改走它。
+* **源码根缓存的树归属在 `source_roots.cache_file` 内部反查**: 签名保持单参数
+  `cache_file(root)`, 内部经 `java/root.aosp_root(root)` (sibling=false; 返回值恒为
+  root 自身或其祖先, 故 tree ~= root 蕴含 root 在树内) 找到树根 —— 调用方
+  (source_inject / ui / scan_cached / reset) 全部零改动, 也无模块环 (root.lua 不依赖
+  source_roots)。树内项目 → `<tree>/<rel>.source-roots.txt`; root 即树根 →
+  `<tree>/source-roots.txt`; 反查不到 (非 AOSP root: `find_for_project` 的测试契约 /
+  防御) → 回退自键自目录, 行为与中间形态一致。
+* **闭包文件的 rel 前移**: `project_closure_jars` 里 `rel` 的计算 (含
+  project-is-root 守卫) 从 seeds 之前上移到 pc 构造之前 —— pc 文件名改用
+  `cache_key(rel)`, 守卫同时提前, aosp 根本身不再白跑一次 index 加载 (返回值不变)。
+
+**三个容易踩的坑 (实测)**:
+* 原来四处 TSV/闭包落盘是 `pcall(writefile)` **且不 mkdir** —— 扁平时代 cache_dir
+  由 setup 的 `mkdir -p` 兜底所以侥幸能用; 进子目录后父目录不再天然存在,
+  writefile 会静默失败 (pcall 吞掉), 缓存**永远写不出去**。四处写点全部补
+  `mkdir(fnamemodify(f, ":h"), "p")` (与 jars.write_cache 原有的同款)。
+* `project_closure_jars` 的 `pc` 原条件里藏着 `not opts.no_cache` (决定闭包文件的
+  读与写是否生效), 机械替换时容易丢 —— 丢失后 no_cache 调用会错误命中旧闭包文件。
+* 拼接点改成可能返回 nil (`cache_tree_dir` 对空 cache_dir/root 返 nil) 后,
+  import_exclusions 的三个调用点 (cached/is_stale/save) 原样解引用会把"concat 时崩"
+  换成"fnamemodify(nil) 时崩" —— 全部补 nil 守卫 (cached→nil / is_stale→true /
+  save→return), 与 jars/source_roots 原有的 `if not f then return end` 同款。
+
+不在范围内的: `ui.lua` 的 thread dump (时间戳一次性文件, 保留扁平)、kotlin/classpath
+(独立缓存根, 非 aosp_nav)。
+
+**迁移**: 不做代码级迁移 (缓存全带版本头/TTL, 直接放弃 = 每树首次重扫; module-deps
+11MB TSV 的 awk 是后台链, 无感), 旧扁平文件成为孤儿由用户清空 `~/.cache/nvim/aosp_nav`
+收尾。
+
+**测试**: t_module_deps (intermediates TSV 预写路径改树目录, 且预写前需 mkdir ——
+setup 只建 cache_dir 本身; project-is-root 用例顺带钉住守卫前移后的返回不变)、
+t_multi_tree (累积文件断言改用 `cache_key`, 旧的裸 `gsub("/", "-")` 不单射不可再用;
+其 sr.save 走树内项目路径, 钉住 cache_file 的反查归属)、t_exclusions (伪造旧版本
+缓存路径改树目录; 非 AOSP root 顺带钉住 cache_file 的自键回退分支)。
+19 套件全过; stylua v0.20.0 `--check` 过。
+
 ## 3. 导航模式
 
 **对用户只宣传两种体验** (v11 降级后), 由单个键 `java.mode` 表达:
@@ -2179,7 +2246,12 @@ jre_dropped, shadow_dropped, exclude_dropped, dup_fqn, shadow_ratio}`, 用于
 
 ## 6. 缓存格式
 
-路径: `<cache_dir>/<flattened root>.source-roots.txt` (`/` → `-`, 去前导 `-`)。
+路径 (v18.24 起一树一目录, §2.23): `<cache_dir>/<cache_key(树根)>/source-roots.txt`
+(树基准); 项目基准的缓存收进所属树的目录, 文件名用相对键
+`<cache_dir>/<cache_key(树根)>/<cache_key(rel)>.source-roots.txt` —— 树归属由
+`cache_file(root)` 内部经 `aosp_root` 反查, 非 AOSP root 回退
+`<cache_dir>/<cache_key(root)>/` (`cache_key`: 先 `-`→`--` 转义再 `/`→`-`,
+见 `util/path.lua`)。
 
 ```
 # aosp-nav.nvim source-roots v6
@@ -2215,11 +2287,11 @@ frameworks/base/services/core/java
   没有 `out/` (构建产物统一在 AOSP 根下)。源码根本来就不随编译变化, 只有 `repo sync`
   换分支才会变, 那种情况走 `:AospRescan`。
 
-### 6.1 jar 缓存 (`<cache_dir>/<flattened android_root>.txt`)
+### 6.1 jar 缓存 (`<cache_dir>/<cache_key(android_root)>/jars.txt`)
 
-§6 正文讲的是**源码根**缓存 (`<flattened root>.source-roots.txt`)。jar 列表另有一份
-缓存, 键规则相同 (`/` → `-`, 去前导 `-`, 见 `java/jars.lua` 的 `cache_file_for`),
-无后缀 `.txt`:
+§6 正文讲的是**源码根**缓存 (树目录内的 `source-roots.txt` / `<rel>.source-roots.txt`)。
+jar 列表另有一份缓存, 键规则相同 (同一 `cache_key` / 树目录, 见 `java/jars.lua` 的
+`cache_file_for`):
 
 ```
 # version=6

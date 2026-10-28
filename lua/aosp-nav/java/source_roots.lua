@@ -464,19 +464,33 @@ function M.scan_async(root, cb)
 end
 
 --- 缓存文件路径。**必须**与 jars 的缓存不同名: jars.lua 用的是
---- <cache_dir>/<key>.source-roots.txt; 键规则与 jars/import_exclusions 一致
---- ([#8] 单射: 旧 gsub("/", "-") 下两个不同项目可同键互相覆盖)
+--- <tree_dir>/jars.txt, 这里是 source-roots.txt; 相对键经 cache_key 仍单射
+--- ([#8]: 旧 gsub("/", "-") 下两个不同项目可同键互相覆盖)。
+--- [v18.24b] 树域化布局: 所有缓存文件收进**树目录** (cache_key(树根) 一层),
+--- 项目基准的缓存用**相对键**命名 —— root 在树内时文件为
+--- <cache_dir>/<cache_key(tree)>/<cache_key(rel)>.source-roots.txt, root 即树根
+--- 时为 <cache_dir>/<cache_key(root)>/source-roots.txt。非 AOSP root
+--- (find_for_project 的测试契约 / 防御) 反查不到树根 -> 回退自键自目录,
+--- 行为与 v18.24 一致。无模块环: java/root 不依赖本模块。
 --- @param root string
 --- @return string|nil
 function M.cache_file(root)
-  local cfg = get_cfg()
-  if not cfg.cache_dir or not root or root == "" then
+  local pmod = require("aosp-nav.util.path")
+  -- aosp_root 返回值恒为 root 自身或其祖先 (上溯构造), tree ~= root 蕴含
+  -- root 在树内, rel 必然非空 (除非 root 带尾斜杠, 由 rel == "" 守卫兜住)。
+  local tree = require("aosp-nav.java.root").aosp_root(root) or root
+  local dir = pmod.cache_tree_dir(get_cfg().cache_dir, tree)
+  if not dir then
     return nil
   end
-  return cfg.cache_dir
-    .. "/"
-    .. require("aosp-nav.util.path").cache_key(root)
-    .. ".source-roots.txt"
+  if tree == root then
+    return dir .. "/source-roots.txt"
+  end
+  local rel = root:gsub("/+$", ""):sub(#tree + 2)
+  if rel == "" then
+    return dir .. "/source-roots.txt"
+  end
+  return dir .. "/" .. pmod.cache_key(rel) .. ".source-roots.txt"
 end
 
 --- 排除配置指纹 (写进缓存第 2 行): 与 jar 侧的 # filters= 同一个算法,

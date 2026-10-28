@@ -134,8 +134,12 @@ H.check(
 )
 
 -- ---------- 会合点 3: 磁盘上的累积文件按树分开 ----------
-local fA = CACHE .. "/source_inject-projects-" .. A_ROOT:gsub("/", "-"):gsub("^-", "") .. ".txt"
-local fB = CACHE .. "/source_inject-projects-" .. B_ROOT:gsub("/", "-"):gsub("^-", "") .. ".txt"
+-- [v18.24] 每棵树一个子目录 (<cache_dir>/<cache_key(root)>/), 累积文件
+-- 在树目录内且文件名不再携带树键。此处须用 cache_key (带 "-" 转义), 不能
+-- 再用裸 gsub("/", "-") —— 不单射的旧键规则 [#8] 已废弃。
+local pmod = require("aosp-nav.util.path")
+local fA = CACHE .. "/" .. pmod.cache_key(A_ROOT) .. "/source_inject-projects.txt"
+local fB = CACHE .. "/" .. pmod.cache_key(B_ROOT) .. "/source_inject-projects.txt"
 H.check(
   vim.fn.filereadable(fA) == 1 and vim.fn.filereadable(fB) == 1,
   "两棵树各有一份累积文件"

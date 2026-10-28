@@ -199,9 +199,15 @@ vim.fn.writefile({
 -- intermediates 清单 TSV (mtime 基准 = JSON 产物): [v18.17b] manifest 后台化后,
 -- 预写 TSV 让端到端走"完整闭包"路径 (无 TSV 时 manifest 返回 nil → 降级集)
 local json_mtime = vim.uv.fs_stat(AOSP .. "/out/soong/module_bp_java_deps.json").mtime.sec
+-- [v18.24] 树子目录尚不存在 (setup 只建 cache_dir 本身), 预写前先建
+vim.fn.mkdir(TMP .. "/cache/" .. require("aosp-nav.util.path").cache_key(AOSP), "p")
 vim.fn.writefile(
   { "# imj mtime=" .. json_mtime, IA, IS },
-  TMP .. "/cache/" .. require("aosp-nav.util.path").cache_key(AOSP) .. ".intermediates-jars.tsv"
+  -- [v18.24] 每个缓存键一个子目录, TSV 在树目录内
+  TMP
+    .. "/cache/"
+    .. require("aosp-nav.util.path").cache_key(AOSP)
+    .. "/intermediates-jars.tsv"
 )
 
 -- 种子发现: 类型白名单 + path 前缀 (T 是 android_test 不做种子)

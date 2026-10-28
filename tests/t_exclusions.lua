@@ -14,7 +14,7 @@
 -- [v18.30] **cache_dir 必须在 setup 时就指向临时目录。** 本套件的 `effective()` /
 -- `ensure_cached()` 会把扫描结果**落盘**到 `cache_dir`, 而 `TMP` 每次都是新的
 -- `vim.fn.tempname()` —— 用真 cache_dir 跑的话每次测试都在用户的
--- `~/.cache/nvim/aosp_nav/` 里留一个 `import_exclusions-tmp-nvim.<pid>-<rand>-0.txt`,
+-- `~/.cache/nvim/aosp_nav/` 里留一个树目录 (`<cache_key(TMP)>/import_exclusions.txt`),
 -- 且**永不清理** (实测攒了 22 个)。这里一开始就重定向, 结束时删掉。
 local here = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h")
 local PLUGIN = vim.fn.fnamemodify(here .. "/..", ":p"):gsub("/$", "")
@@ -141,7 +141,11 @@ local back = IE.cached(TMP)
 H.check(back ~= nil and #back == 2, "cache: save/cached 回读一致")
 
 -- 伪造一个旧版本缓存 -> cached() 必须视为无效 (这是 CACHE_VERSION 的作用)
-local cpath = CACHE .. "/" .. require("aosp-nav.util.path").cache_key(TMP) .. ".exclusions.txt"
+-- [v18.24] 缓存在 <cache_dir>/<cache_key(root)>/ 子目录里
+local cpath = CACHE
+  .. "/"
+  .. require("aosp-nav.util.path").cache_key(TMP)
+  .. "/import_exclusions.txt"
 local fh = io.open(cpath, "w")
 fh:write("# version=1\n# root=" .. TMP .. "\n# count=1\n/old/stale\n")
 fh:close()

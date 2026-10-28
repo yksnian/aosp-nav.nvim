@@ -80,17 +80,16 @@ function M.escape_glob(s)
   return (s:gsub("[%*%?%[%]{}%\\]", "\\%0"))
 end
 
---- 缓存文件路径: <cache_dir>/import_exclusions-<root 扁平化>.txt
+--- 缓存文件路径: <cache_dir>/<root 扁平化>/import_exclusions.txt
 --- 键规则与 jars/source_roots 一致 ([#8] 单射: 旧 gsub("/", "-") 下 /work/a/b 与
---- /work/a-b 同键, 两棵树的缓存互相覆盖)
+--- /work/a-b 同键, 两棵树的缓存互相覆盖); v18.24 起每个缓存键一个子目录,
+--- 目录名由 util.path.cache_tree_dir 给出。
 --- @param root string
---- @return string
+--- @return string|nil
 local function cache_path(root)
   local cfg = get_cfg()
-  return cfg.cache_dir
-    .. "/import_exclusions-"
-    .. require("aosp-nav.util.path").cache_key(root)
-    .. ".txt"
+  local dir = require("aosp-nav.util.path").cache_tree_dir(cfg.cache_dir, root)
+  return dir and (dir .. "/import_exclusions.txt") or nil
 end
 
 --- 扫描结果有效时长 (秒); <= 0 表示永不过期 (仅 :AospImportExclusions 强制重扫)
@@ -110,7 +109,7 @@ function M.cached(root)
     return nil
   end
   local p = cache_path(root)
-  if vim.fn.filereadable(p) ~= 1 then
+  if not p or vim.fn.filereadable(p) ~= 1 then
     return nil
   end
 
@@ -138,7 +137,7 @@ function M.is_stale(root)
     return true
   end
   local p = cache_path(root)
-  if vim.fn.filereadable(p) ~= 1 then
+  if not p or vim.fn.filereadable(p) ~= 1 then
     return true
   end
   local ttl = ttl_seconds()
@@ -157,18 +156,21 @@ function M.save(root, patterns)
   if not root or root == "" then
     return
   end
-  local cfg = get_cfg()
-  vim.fn.mkdir(cfg.cache_dir, "p")
+  local p = cache_path(root)
+  if not p then
+    return
+  end
+  vim.fn.mkdir(vim.fn.fnamemodify(p, ":h"), "p")
   local lines = {
     cache_header.line("version", CACHE_VERSION),
     cache_header.line("root", root),
     cache_header.line("generated", os.date("%Y-%m-%d %H:%M")),
     cache_header.line("count", #patterns),
   }
-  for _, p in ipairs(patterns) do
-    lines[#lines + 1] = p
+  for _, pat in ipairs(patterns) do
+    lines[#lines + 1] = pat
   end
-  vim.fn.writefile(lines, cache_path(root))
+  vim.fn.writefile(lines, p)
 end
 
 --- 删除 root 的扫描缓存 (内存侧无状态, 下次 configure 会重新扫描)

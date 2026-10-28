@@ -26,15 +26,14 @@ local function get_cfg()
   return require("aosp-nav").config
 end
 
---- jar 文件缓存路径 (键规则与 import_exclusions / source_roots 一致, [#8] 单射)
+--- jar 文件缓存路径 (键规则与 import_exclusions / source_roots 一致, [#8] 单射;
+--- v18.24 起每棵树一个子目录, 文件名只剩短后缀)
 --- @param root string android_root
 --- @return string|nil
 local function cache_file_for(root)
   local cfg = get_cfg()
-  if not cfg.cache_dir or not root or root == "" then
-    return nil
-  end
-  return cfg.cache_dir .. "/" .. require("aosp-nav.util.path").cache_key(root) .. ".txt"
+  local dir = require("aosp-nav.util.path").cache_tree_dir(cfg.cache_dir, root)
+  return dir and (dir .. "/jars.txt") or nil
 end
 
 --- 写 jar 缓存文件 (同步扫描与后台刷新共用的唯一写路径)。
@@ -797,13 +796,8 @@ end
 
 local function module_deps_tsv_for(aosp_root)
   local cfg = get_cfg()
-  if not cfg.cache_dir or not aosp_root or aosp_root == "" then
-    return nil
-  end
-  return cfg.cache_dir
-    .. "/"
-    .. require("aosp-nav.util.path").cache_key(aosp_root)
-    .. ".module-deps.tsv"
+  local dir = require("aosp-nav.util.path").cache_tree_dir(cfg.cache_dir, aosp_root)
+  return dir and (dir .. "/module-deps.tsv") or nil
 end
 
 --- 读取 soong 模块依赖图摘要 (awk 单遍提取, TSV 缓存按产物 mtime 判新鲜)。
@@ -863,6 +857,7 @@ function M.module_deps_index(aosp_root, opts)
     return nil, nil
   end
   if tsv then
+    vim.fn.mkdir(vim.fn.fnamemodify(tsv, ":h"), "p")
     local dump = { "# module-deps v1 mtime=" .. artifact.mtime }
     for name, m in pairs(index) do
       dump[#dump + 1] = table.concat({
@@ -1152,9 +1147,8 @@ local function intermediates_manifest(aosp_root, artifact_mtime)
     return _intermediates_manifest[aosp_root]
   end
   local cfg = get_cfg()
-  local tsv = cfg.cache_dir
-      and (cfg.cache_dir .. "/" .. require("aosp-nav.util.path").cache_key(aosp_root) .. ".intermediates-jars.tsv")
-    or nil
+  local dir = require("aosp-nav.util.path").cache_tree_dir(cfg.cache_dir, aosp_root)
+  local tsv = dir and (dir .. "/intermediates-jars.tsv") or nil
   local paths = nil
   if tsv and vim.fn.filereadable(tsv) == 1 then
     local lines = vim.fn.readfile(tsv)
@@ -1188,6 +1182,7 @@ local function intermediates_manifest(aosp_root, artifact_mtime)
               end
             end
             if tsv then
+              vim.fn.mkdir(vim.fn.fnamemodify(tsv, ":h"), "p")
               local dump = { "# imj mtime=" .. tostring(artifact_mtime) }
               for p in pairs(collected) do
                 dump[#dump + 1] = p
@@ -1248,11 +1243,9 @@ local function warmup_module_deps_async(aosp_root)
       if not next(index) then
         return
       end
-      local cfg = get_cfg()
-      local tsv = cfg.cache_dir
-          and (cfg.cache_dir .. "/" .. require("aosp-nav.util.path").cache_key(aosp_root) .. ".module-deps.tsv")
-        or nil
+      local tsv = module_deps_tsv_for(aosp_root)
       if tsv then
+        vim.fn.mkdir(vim.fn.fnamemodify(tsv, ":h"), "p")
         local dump = { "# module-deps v1 mtime=" .. tostring(artifact.mtime) }
         for name, m in pairs(index) do
           dump[#dump + 1] = table.concat({
@@ -1294,10 +1287,18 @@ function M.project_closure_jars(aosp_root, project_dir, opts)
   local cfg0 = get_cfg()
   local artifact0 = M.module_deps_artifact(aosp_root)
   local mt0 = artifact0 and artifact0.mtime or "none"
-  local pc = (cfg0.cache_dir and not opts.no_cache)
-      and (cfg0.cache_dir .. "/" .. require("aosp-nav.util.path").cache_key(aosp_root) .. "." .. require(
-        "aosp-nav.util.path"
-      ).cache_key(project_dir) .. ".closure-jars.txt")
+  local rel = project_dir:gsub("/+$", ""):sub(#aosp_root + 2)
+  if rel == "" then
+    return nil, { reason = "project-is-root" } -- aosp 根本身: 闭包不适用 (全树场景)
+  end
+  -- no_cache 同样跳过闭包文件的读与写 (与 jar/TSV 缓存一个口径)
+  local dir = (cfg0.cache_dir and not opts.no_cache)
+      and require("aosp-nav.util.path").cache_tree_dir(cfg0.cache_dir, aosp_root)
+    or nil
+  -- [v18.24b] 相对键: 闭包文件与其它缓存一样收进树目录, 文件名不再携带树键
+  -- 前缀 —— cache_key 对相对路径仍单射 ([#8])。rel 已守卫非空 (见上)。
+  local pc = dir
+      and (dir .. "/" .. require("aosp-nav.util.path").cache_key(rel) .. ".closure-jars.txt")
     or nil
   if pc and vim.fn.filereadable(pc) == 1 then
     local lines = vim.fn.readfile(pc)
@@ -1330,10 +1331,6 @@ function M.project_closure_jars(aosp_root, project_dir, opts)
     end
   end
 
-  local rel = project_dir:gsub("/+$", ""):sub(#aosp_root + 2)
-  if rel == "" then
-    return nil, { reason = "project-is-root" } -- aosp 根本身: 闭包不适用 (全树场景)
-  end
   local seeds = project_seed_modules(index, rel)
   if #seeds == 0 then
     return nil, { reason = "no-seed-modules" }
@@ -1383,6 +1380,7 @@ function M.project_closure_jars(aosp_root, project_dir, opts)
   -- 降级集 (后台采集中) 不持久、不 memo —— 完整清单就绪后下次 configure 重算
   if manifest ~= nil then
     if pc then
+      vim.fn.mkdir(vim.fn.fnamemodify(pc, ":h"), "p")
       local dump = { "# closure v1 mtime=" .. tostring(mt0) }
       for _, j in ipairs(jars) do
         dump[#dump + 1] = j
@@ -1418,9 +1416,8 @@ function M.manifest_ready(aosp_root)
     return false
   end
   local cfg = get_cfg()
-  local tsv = cfg.cache_dir
-      and (cfg.cache_dir .. "/" .. require("aosp-nav.util.path").cache_key(aosp_root) .. ".intermediates-jars.tsv")
-    or nil
+  local dir = require("aosp-nav.util.path").cache_tree_dir(cfg.cache_dir, aosp_root)
+  local tsv = dir and (dir .. "/intermediates-jars.tsv") or nil
   if tsv and vim.fn.filereadable(tsv) == 1 then
     local head = (vim.fn.readfile(tsv, "", 1)[1] or "")
     return head == "# imj mtime=" .. tostring(artifact.mtime)
