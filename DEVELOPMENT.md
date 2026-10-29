@@ -2084,6 +2084,29 @@ aosp 不读闭包/rel 含 '-' 转义/全空 stderr 提示 五条路径。模板�
 -6 重叠), dup=0, framework-minus-apex/combined 恰 1 条, stderr 干净。
 21 套件全过; stylua v0.20.0 `--check` 过。
 
+### 2.23.3 :Aosp 面板对非 AOSP 工程的三处残留噪声 (2026-10-29, v18.34)
+
+用户拿一个**普通 gradle app 工程**实测面板, 暴露 v18.23 的 in_aosp 闸没收干净的三处:
+
+1. **"this project's source roots (injected)" 列出 9 个 sourceSets 目录**
+   (app/src/main/java + build/generated/source/buildConfig/...): 纯误导 —— 非 AOSP
+   工程插件**什么都不注入** (is_android 闸, java/init.lua 交还 jdt.ls 原生处理), 这
+   9 个根是 jdt.ls 自己 gradle 导入的 (AGP sourceSets); 面板列的是 find_for_project
+   对 gradle 布局**扫描**的结果, 与 "injected" 是两码事 (目录重合只是因为两者读的
+   都是同一份磁盘布局)。修复: proj 在 AOSP 树外 (aosp_root(proj)==nil) 时整段不出,
+   `== source roots ==` 段的 "n/a (not an AOSP tree...)" 已交代处境; proj=nil 不闸,
+   AOSP 下保留 "(no running jdtls...)" 提示。
+2. **`! session phase=idle jars=0 origin=nil`**: session state 按树键控且 [#5] 非
+   AOSP 文件不写状态, basis=nil 时 st 是全默认空表 —— 恒 idle 配 "!", 纯噪声。
+   修复: basis 为 nil 不显示该行。
+3. **`! workspace root <none> (mode=project)`**: wr = project_r ∨ workspace_root ∨
+   aosp_r, 三者全 nil 只发生在非 AOSP 工程 (AOSP 各模式下恒非 nil: project 模式
+   project_dir 命中项目目录, aosp/infer 模式兜底 aosp_r)。修复: wr 为 nil 不显示。
+
+三处统一沿用 [v18.23] 的闸法: 非 AOSP 不显示 AOSP 专属行, 由 `aosp root
+<not an AOSP file>` 一行交代处境。AOSP 会话行为零变化。21 套件全过;
+stylua v0.20.0 `--check` 过。
+
 ### 2.24 面板浮窗化: 每个源窗口一个实例 (2026-10-28, v18.25)
 
 **动机 (用户多窗口实测)**: 旧实现 `botright new` + 固定名 `aosp-nav://panel`, 多窗口

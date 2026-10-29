@@ -354,8 +354,12 @@ function M.diagnose(basis, src_file)
     aosp_r ~= nil,
     action_if(aosp_r ~= nil, "aosp-nav only manages roots inside an AOSP tree")
   )
-  lines[#lines + 1] =
-    line("workspace root", ("%s (mode=%s)"):format(wr or "<none>", mode), wr ~= nil)
+  -- [v18.34] wr 为 nil 只发生在非 AOSP 工程 (aosp_r/workspace_root/project_dir 全 nil):
+  -- 这行是 AOSP 词汇, 此时 "!" 是无谓告警, 上一行 "<not an AOSP file>" 已交代处境,
+  -- 按 [v18.23] 同一闸法直接不显示 (AOSP 各模式下 wr 恒非 nil, 行为不变)。
+  if wr then
+    lines[#lines + 1] = line("workspace root", ("%s (mode=%s)"):format(wr, mode), true)
+  end
   -- project 模式下工作区根跟着 buffer 走, 所以"**运行中那台**现在指着谁"是一等信息
   -- (它决定这次跨模块跳转会落到源码还是 jar)。路径本身已经在上面一行了, 这里只说
   -- 状态与差异; 别的模式下工作区根恒为 AOSP 根, 没有信息量, 不显示。
@@ -428,11 +432,17 @@ function M.diagnose(basis, src_file)
       phase_text = "ready* (importing...)"
     end
   end
-  lines[#lines + 1] = line(
-    "session",
-    ("phase=%s jars=%d origin=%s"):format(phase_text, st.jars, tostring(st.cache_origin)),
-    session_ok
-  )
+  -- [v18.34] session state 按树 (aosp root) 键控, 且 [#5] 非 AOSP 文件不写状态:
+  -- basis=nil (非 AOSP 工程) 时 st 是全默认空表, "phase=idle jars=0 origin=nil" 配
+  -- "!" 在普通 gradle/maven 工程是纯噪声 (v18.23 闸掉的 referencedLibraries/
+  -- sourcePaths 属同类) —— 不显示。
+  if basis then
+    lines[#lines + 1] = line(
+      "session",
+      ("phase=%s jars=%d origin=%s"):format(phase_text, st.jars, tostring(st.cache_origin)),
+      session_ok
+    )
+  end
 
   -- [v12] 会话隔离 (java/session_conflict.lua): 另一个 nvim 已占着本棵树本该用的
   -- `-data`, 本会话自动换了独立索引, 于是 sourcePaths/jars 都没注入 —— 这是**预期**,
@@ -951,6 +961,15 @@ local function source_root_lists(aosp_root, st)
     out[#out + 1] = "this project's source roots (injected):"
     local live = require("aosp-nav.java.workspace_follow").client()
     local proj = live and (live.root_dir or (live.config and live.config.root_dir)) or nil
+    -- [v18.34] 非 AOSP 工程 (proj 在 AOSP 树外) 插件**什么都不注入** (is_android 闸,
+    -- java/init.lua: 一律交还 jdt.ls 原生处理), 这里却会把 find_for_project 对 gradle
+    -- 项目扫出的 sourceSets 目录 (app/src/main/java + build/generated/...) 冠以
+    -- "(injected)" 抬上面板 —— 与 jdt.ls 自己 gradle 导入的根是两码事, 纯误导。
+    -- 不出这段 (== source roots == 段的 "n/a (not an AOSP tree...)" 已说明处境);
+    -- proj=nil 时不闸 (AOSP 下保留 "no running jdtls" 提示)。
+    if proj and require("aosp-nav.java.root").aosp_root(proj) == nil then
+      return {}
+    end
     if not proj then
       out[#out + 1] = "  (no running jdtls — the roots are resolved from the workspace root)"
     else
