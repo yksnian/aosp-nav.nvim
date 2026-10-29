@@ -211,7 +211,9 @@ local function config_hash(cfg, branches)
     -- 参与 hash 的配置项。
     exclude_jars = cfg.java.exclude_jars,
     exclude_paths = cfg.java.exclude_paths,
-    jar_mode = cfg.kotlin.jar_mode,
+    -- [v18.33] 原 kotlin.jar_mode 换成 java.mode: jar 来源跟随主模式,
+    -- java.mode 变化必须触发脚本重生成
+    java_mode = cfg.java.mode,
     curated_modules = cfg.kotlin.curated_modules,
     soong_tag_priority = cfg.kotlin.soong_tag_priority,
     make_jar_priority = cfg.kotlin.make_jar_priority,
@@ -279,7 +281,7 @@ function M.render(branches)
 
   local lines = {
     "#!/usr/bin/env bash",
-    "# aosp-nav.nvim classpath v2 hash=" .. config_hash(cfg, branches),
+    "# aosp-nav.nvim classpath v5 hash=" .. config_hash(cfg, branches),
     "# Family: nvim (aosp-nav.nvim). Backs up / falls through to the aosp-nav-vscode",
     "# script at classpath.vscode.bak, so both plugins can share this file.",
     "# Managed by aosp-nav.nvim, manual edits will be overwritten.",
@@ -291,7 +293,7 @@ function M.render(branches)
     "CACHE_DIR=" .. shq(cfg.cache_dir),
     "FALLBACK_DIR=" .. shq(j.jar_fallback_dir),
     "VSC_BACKUP=" .. vsc,
-    "MODE=" .. shq(k.jar_mode),
+    "JAVA_MODE=" .. shq(j.mode),
     "EXCLUDE_JAR_RE=" .. exclude_re,
     "",
     "CURATED=(",
@@ -432,6 +434,31 @@ fi
 
 jars=()
 declare -A seen_mod
+declare -A seen_j
+
+# 跨来源 jar 去重 (curated 基线 / 模块闭包 / 全量缓存可能交叉): 按完整路径只收一次
+add_jar() {
+  [ -f "$1" ] || return 0
+  [ -n "${seen_j[$1]:-}" ] && return 0
+  seen_j[$1]=1
+  jars+=("$1")
+}
+
+# 读插件维护的 jar 清单 (jars.txt / <rel>.closure-jars.txt): 跳空行与 # 头
+read_jar_list() {
+  [ -f "$1" ] || return 0
+  local jf
+  while IFS= read -r jf; do
+    case "$jf" in ''|'#'*) continue ;; esac
+    add_jar "$jf"
+  done < "$1"
+}
+
+# [v18.32] 树缓存键: 转义序与 util/path.cache_key 完全一致 ——
+# 先 "-"→"--" 再 "/"→"-", 最后去首 "-" (顺序反了两种分隔会碰撞)
+key=${root//-/--}
+key=${key//\//-}
+key=${key#-}
 
 ok() {
   local n=${1##*/}
@@ -446,8 +473,13 @@ ok() {
   return 0
 }
 
-# ---- 3a. curated: glob module dirs per pattern ----
-if [ "$MODE" = curated ]; then
+# ---- 3. jar 来源 (跟随 java.mode, [v18.33] 起 kotlin.jar_mode 删除):
+#   project    = curated 框架基线 ∪ 模块闭包 (<rel>.closure-jars.txt, 与 jdt.ls
+#                project 模式的 referencedLibraries 同源, 跳转目标两侧一致);
+#                闭包文件缺失 (module-deps 清单未就绪 / 项目=树根) 时回退全量缓存
+#   aosp/infer = 全量缓存 (原 all 行为)
+# ---- 3a. curated: glob module dirs per pattern (project 的框架基线) ----
+if [ "$JAVA_MODE" = project ]; then
   for base in "${soong_bases[@]}"; do
     for pat in "${CURATED[@]}"; do
       for vdir in "$base/$pat"/*/; do
@@ -462,7 +494,7 @@ if [ "$MODE" = curated ]; then
             if ok "$jf"; then found=$jf; break; fi
           done
           if [ -n "$found" ]; then
-            jars+=("$found"); seen_mod[$mod]=1; break
+            add_jar "$found"; seen_mod[$mod]=1; break
           fi
         done
       done
@@ -480,24 +512,41 @@ if [ "$MODE" = curated ]; then
           d=$(dirname "$jf")
           [ -n "${seen_mod[$d]:-}" ] && continue
           ok "$jf" || continue
-          jars+=("$jf"); seen_mod[$d]=1; break
+          add_jar "$jf"; seen_mod[$d]=1; break
         done
       done
     done
   done
-# ---- 3b. all: read plugin-maintained cache (java jars.lua) ----
+# ---- 3b. project: 模块闭包 ∪ 闭包缺失时的全量缓存兜底 ----
+# 闭包文件由 java/jars.lua project_closure_jars 写好 (已应用 §2.19.6/2.19.7 名册闸:
+# 排除桩模块/空实现依赖), 脚本原样读。rel = KLS 工作区根相对 AOSP 根的路径,
+# 文件名 = cache_key(rel) (相对键同样单射, [#8])。空 rel (项目=树根) 拼出的
+# ".closure-jars.txt" 不存在 → 自然落入全量缓存兜底, 与 lua 侧 project-is-root
+# 守卫口径一致。本段位于外层 `if JAVA_MODE = project` 分支内, 直线执行。
+rel=${PWD#"$root"}
+rel=${rel#/}
+  ckey=${rel//-/--}
+  ckey=${ckey//\//-}
+  ckey=${ckey#-}
+  cf=$CACHE_DIR/$key/$ckey.closure-jars.txt
+  read_jar_list "$cf"
+  if [ ! -f "$cf" ]; then
+    read_jar_list "$CACHE_DIR/$key/jars.txt"
+  fi
 else
-  key=${root//\//-}
-  key=${key#-}
-  f=$CACHE_DIR/$key.txt
+  # ---- 3c. aosp/infer: 全量缓存 (原 all 模式; [v18.24] 起一树一目录) ----
+  f=$CACHE_DIR/$key/jars.txt
   if [ -f "$f" ]; then
-    while IFS= read -r jf; do
-      case "$jf" in ''|'#'*) continue ;; esac
-      [ -f "$jf" ] && jars+=("$jf")
-    done < "$f"
+    read_jar_list "$f"
   else
     echo "aosp-nav: jar cache missing: $f (open a .java file once, or :AospCollectJars)" >&2
   fi
+fi
+
+# root 已解析但一个 jar 都没拿到的统一提示 (project: 闭包+基线全空;
+# aosp/infer: 全量缓存缺失)
+if [ ${#jars[@]} -eq 0 ]; then
+  echo "aosp-nav: no jars resolved for $root (java.mode=$JAVA_MODE) - open a .java file once, or :AospRescan" >&2
 fi
 
 # ---- 4. prepend mason KLS kotlin-stdlib (best-effort) ----

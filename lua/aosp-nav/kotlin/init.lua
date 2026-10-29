@@ -96,14 +96,16 @@ function M.configure(opts)
     log.error("kls-classpath generate failed: " .. (err or "unknown"))
   end
 
-  -- 5. all 模式: 预热 java 模块的 jar 缓存 (脚本 all 模式的数据源)
+  -- 5. 预热 java 模块的 jar 缓存 (脚本两类来源的数据闸, [v18.33] 起无条件跑):
+  --    aosp/infer 模式全量缓存就是数据源; project 模式是闭包未就绪时的兜底来源,
+  --    且 find_android_jars 顺带驱动 module-deps 清单采集 (闭包缓存的前置)。
   --    尽力而为: 无 buffer 上下文时 jars.lua 内部用 getcwd() 兜底
-  if k.jar_mode == "all" then
+  do
     local ok2, _ = pcall(function()
       require("aosp-nav.java.jars").find_android_jars()
     end)
     if not ok2 then
-      log.debug("jar cache warm-up failed, kls-classpath(all) may miss cache")
+      log.debug("jar cache warm-up failed, kls-classpath may miss cache")
     end
   end
 

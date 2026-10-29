@@ -564,7 +564,7 @@ function M.diagnose(basis, src_file)
   local k = cfg.kotlin
   lines[#lines + 1] = line(
     "kotlin",
-    "enabled=" .. tostring(k.enabled) .. " jar_mode=" .. tostring(k.jar_mode),
+    "enabled=" .. tostring(k.enabled) .. " jars=" .. tostring(cfg.java.mode),
     k.enabled
   )
   if k.enabled then

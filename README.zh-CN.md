@@ -280,8 +280,7 @@ jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客�
 | java.kill_orphan_jdtls            | true                                                         | 全部 | 启动时 SIGTERM 掉"孤儿"jdtls —— 上一个 nvim 已经退出、却还占着同一份 `-data` 的那台 (之后每个会话都要跟它抢索引)。只杀"确实是孤儿"**且** `-data` 在本插件缓存根之下的; 设 `false` 只报告不杀 |
 | java.inlay_hints_mode             | auto                                                         | 全部 | auto=有jar强制off/无jar all, 或 off/all                      |
 | kotlin.enabled                    | true                                                         | 全部 | 启用 kotlin 子模块 (KLS)                                     |
-| kotlin.jar_mode                   | curated                                                      | 全部 | curated=精选核心模块, all=全量 (实验性)                      |
-| kotlin.curated_modules            | {framework, core-all, SystemUI, dagger...}                   | 全部 | curated 模式加载的 soong 模块列表                            |
+| kotlin.curated_modules            | {framework, core-all, SystemUI, dagger...}                   | java.mode=project | KLS 的框架基线; jar 来源跟随 java.mode: project=模块闭包 ∪ 本清单基线 (闭包未就绪回退全量缓存), aosp/infer=全量缓存 |
 | kotlin.soong_tag_priority         | {combined, javac, turbine-combined}                          | soong 闭包 + 全树扫描 | KLS 专用 tag 优先级; combined 优先使跳转可见方法体 (fernflower 反编译), 补全优先/内存敏感可改回 turbine 优先 |
 | kotlin.make_jar_priority          | {classes-header.jar, classes.jar, javalib.jar}               | make 扫描 | Kotlin 的 Make 构建系统 jar 优先级                           |
 | kotlin.disable_document_highlight | true                                                         | 全部 | 禁用 documentHighlight (避 KLS -32603)                       |

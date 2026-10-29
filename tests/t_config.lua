@@ -71,23 +71,45 @@ H.eq(user_opts.java.workspace_mode, "project", "merge 不改写调用方传入�
 -- 修法: merge(user_opts, base) 支持 base = 已生效配置, setup 重复调用时传它;
 -- 原先只保住 java 排除名单的 merge_lists 补丁随之删除。
 -- ---------------------------------------------------------------------------
+-- 车辆键: kotlin.jar_mode 已随 [v18.33] 删除 (行为并入 java.mode), 改用同为
+-- 标量的 disable_document_highlight 复刻同一条 "setup(opts) -> 空参 setup() ->
+-- 带参 setup() -> 空表 setup({}) 全程不丢用户值" 的路径。
 local nav = require("aosp-nav")
-nav.setup({ kotlin = { jar_mode = "all" }, log_level = "debug" })
-H.eq(nav.config.kotlin.jar_mode, "all", "setup(opts) 后 kotlin.jar_mode 生效")
-H.eq(D.kotlin.jar_mode, "curated", "前置条件: 代码默认值仍是 curated")
+nav.setup({ kotlin = { disable_document_highlight = false }, log_level = "debug" })
+H.eq(
+  nav.config.kotlin.disable_document_highlight,
+  false,
+  "setup(opts) 后 kotlin.disable_document_highlight 生效"
+)
+H.check(
+  D.kotlin.disable_document_highlight == true,
+  "前置条件: 代码默认值 disable_document_highlight = true"
+)
 
 local prev = nav.config
 nav.setup() -- 命令回调里的空参调用
-H.eq(nav.config.kotlin.jar_mode, "all", "空参 setup() 之后 jar_mode 仍是用户值")
+H.eq(
+  nav.config.kotlin.disable_document_highlight,
+  false,
+  "空参 setup() 之后 disable_document_highlight 仍是用户值"
+)
 H.eq(nav.config.log_level, "debug", "空参 setup() 之后 log_level 仍是用户值")
 H.check(nav.config ~= prev, "setup 仍产出新表 (不就地改旧表)")
-H.eq(prev.kotlin.jar_mode, "all", "旧 config 表未被就地改写 (这次改的是它的值)")
+H.eq(
+  prev.kotlin.disable_document_highlight,
+  false,
+  "旧 config 表未被就地改写 (这次改的是它的值)"
+)
 H.eq(prev.log_level, "debug", "旧 config 表未被就地改写 (log_level)")
 
 -- 第二次带参 setup: 新键生效, 上一次的键不丢
 nav.setup({ java = { mode = "infer" } })
 H.eq(nav.config.java.mode, "infer", "第二次 setup 的新值生效")
-H.eq(nav.config.kotlin.jar_mode, "all", "第二次 setup 不丢上一次的 kotlin.jar_mode")
+H.eq(
+  nav.config.kotlin.disable_document_highlight,
+  false,
+  "第二次 setup 不丢上一次的 kotlin.disable_document_highlight"
+)
 H.eq(nav.config.log_level, "debug", "第二次 setup 不丢上一次的 log_level")
 
 -- 排除名单的 append 语义照旧 (base 换了也不许回归)
@@ -98,7 +120,11 @@ H.check(
   "默认排除项与用户项并存 (append 语义未回归)"
 )
 nav.setup({}) -- 空表与 nil 同样不能清空用户配置
-H.eq(nav.config.kotlin.jar_mode, "all", "空表 setup({}) 之后 jar_mode 仍是用户值")
+H.eq(
+  nav.config.kotlin.disable_document_highlight,
+  false,
+  "空表 setup({}) 之后 disable_document_highlight 仍是用户值"
+)
 
 -- ---------------------------------------------------------------------------
 -- [v11] merge 的输入必须被完全保护: tbl_deep_extend 会把**没被 opts 覆盖的子表
@@ -111,8 +137,11 @@ H.check(not rawequal(scratch.kotlin, D.kotlin), "merge 结果不与 defaults 共
 local first_jar = D.java.exclude_jars[1]
 scratch.java.exclude_jars[1] = "MUTATED"
 H.check(D.java.exclude_jars[1] == first_jar, "就地改合并结果不污染 defaults 的列表")
-scratch.kotlin.jar_mode = "MUTATED"
-H.check(D.kotlin.jar_mode == "curated", "就地改合并结果不污染 defaults 的标量")
+scratch.kotlin.disable_document_highlight = "MUTATED"
+H.check(
+  D.kotlin.disable_document_highlight == true,
+  "就地改合并结果不污染 defaults 的标量"
+)
 
 -- 两次 setup 之间同样不许共享子表 (旧表被就地改写会让"上一次配置"变成幽灵)
 local a = nav.config

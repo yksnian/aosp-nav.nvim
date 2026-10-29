@@ -1982,7 +1982,9 @@ aosp-nav 仍接管了 project 模式的源码根注入链:
   save→return), 与 jars/source_roots 原有的 `if not f then return end` 同款。
 
 不在范围内的: `ui.lua` 的 thread dump (时间戳一次性文件, 保留扁平)、kotlin/classpath
-(独立缓存根, 非 aosp_nav)。
+(独立缓存根, 非 aosp_nav) —— 后者是**漏判**: 脚本文件本身在
+`~/.config/kotlin-language-server/` 不假, 但它的 all 分支读的是 `cfg.cache_dir` 下的
+java jar 缓存, 见 §2.23.1。
 
 **迁移**: 不做代码级迁移 (缓存全带版本头/TTL, 直接放弃 = 每树首次重扫; module-deps
 11MB TSV 的 awk 是后台链, 无感), 旧扁平文件成为孤儿由用户清空 `~/.cache/nvim/aosp_nav`
@@ -1994,6 +1996,93 @@ t_multi_tree (累积文件断言改用 `cache_key`, 旧的裸 `gsub("/", "-")` �
 其 sr.save 走树内项目路径, 钉住 cache_file 的反查归属)、t_exclusions (伪造旧版本
 缓存路径改树目录; 非 AOSP root 顺带钉住 cache_file 的自键回退分支)。
 19 套件全过; stylua v0.20.0 `--check` 过。
+
+### 2.23.1 classpath 脚本 all 分支漏改: KLS 拿 0 个 AOSP jar, Kotlin 跳转全空 (2026-10-28, v18.32)
+
+**症状 (用户实测)**: 打开 packages/modules/Connectivity 的 `ApfTestBase.kt`,
+`android.os.Handler` 跳不动了 (以前可以)。jdt.ls 侧一切正常 —— 文件是 **.kt**,
+走的是 KLS 链路, 与 #3/#6/#8 无关, 嫌疑直指 #9。
+
+**根因**: §2.23 的 out-of-scope 清单把 `kotlin/classpath` 当成"独立缓存根"排除,
+实际只对了一半: 脚本**文件**在 `~/.config/kotlin-language-server/classpath` (确实独立),
+但脚本体的 **all 分支** (`MODE=all` 时) 读的是 `cfg.cache_dir` (= `~/.cache/nvim/aosp_nav`)
+下的 java jar 缓存, 且用的是 v18.24 之前的**旧扁平命名 + 朴素 slug**:
+
+```bash
+key=${root//\//-}          # 旧: 既非单射, 也非 cache_key 转义序
+f=$CACHE_DIR/$key.txt      # 旧: 扁平文件, v18.24 起已不存在
+```
+
+v18.24 把缓存挪进 `<cache_dir>/<cache_key(root)>/jars.txt` 后, 这个嵌入点没跟着改 ——
+模板字符串不参与任何模块编译期检查, 漏改就是静默的。
+
+**实测证据** (真机, 修复前): 在 Connectivity 目录下直接执行盘上的 classpath 脚本,
+
+```
+aosp-nav: jar cache missing: ~/.cache/nvim/aosp_nav/home-u-project-aosp.txt
+stdout jar count: 3        <- 只剩 mason 前置的 kotlin-stdlib 家族
+```
+
+而同一时刻 `<cache_dir>/home-u-project-aosp/jars.txt` 好好躺着 (1126 个 jar,
+当天 13:57 由预热写入)。巧的是该树根不含 "-", 朴素 slug 与 cache_key 结果相同
+(`home-u-project-aosp`), 所以**唯一**的断点就是目录层级 —— 但含 "-" 的树根
+(如 `/work/a-b/tree`) 还会叠加 slug 不单射问题, 修复必须两处一起对齐。
+
+**修法**: 脚本 all 分支改读 `$CACHE_DIR/$key/jars.txt`, 且 key 转义三步与
+`util/path.cache_key` 逐一对应 (`"-"→"--"` 先于 `"/"→"-"`, 去首 `"-"`; 顺序反了
+`/work/a-b` 与 `/work/a/-b` 会撞 key)。marker `classpath v2 hash=` → **v3**:
+`ensure_script` 靠 `classpath v<N> hash=<hash>` 整串比对决定重写, 本修复不触碰
+config_hash 的任何输入 (配置没变), 不 bump 版本盘上旧脚本永远不重生成。
+
+**测试**: 新增 `t_kls_classpath.lua` (纯渲染零写盘, 补回 §10.2 丢失 scratch 套件里
+的 kls 覆盖): all 分支路径形态 / 旧扁平路径消失 / 转义三行与 cache_key 对齐 /
+含 "-" 根的 key 值 / marker v3。
+**真机端到端**: 修复前 Connectivity 目录执行盘上脚本 = 3 jar + stderr "jar cache
+missing"; 修复后同目录 = **1129** jar、stderr 干净、
+`framework-minus-apex/android_common/combined/framework.jar` (android.os.Handler 真身)
+在列。21 套件全过; stylua v0.20.0 `--check` 过。
+
+### 2.23.2 kotlin.jar_mode 删除: jar 来源跟随 java.mode (2026-10-28, v18.33)
+
+**决策** (用户拍板, 收拢旋钮): 删除 `kotlin.jar_mode` ("curated"/"all"), KLS 的 jar
+来源直接跟随 `java.mode` ——
+- **project** = 模块闭包 (`<rel>.closure-jars.txt`, 与 jdt.ls project 模式注入
+  referencedLibraries 同源, **跳转目标两侧一致**) ∪ curated 框架基线; 闭包文件缺失
+  (module-deps 清单未就绪 / 项目=树根) 时回退全量缓存
+- **aosp/infer** = 全量缓存 (原 all 行为)
+
+为什么带 curated 基线而不是纯闭包: §2.23.1 实测 Connectivity 闭包含
+framework-minus-apex/combined, 但 §2.19.7 实测 Wifi 闭包 **无** framework —— 闭包对
+framework 的覆盖因模块而异, 基线 (~20 jar) 兜住这批模块, 成本可忽略。
+
+**实现要点** ([kotlin/classpath.lua](../lua/aosp-nav/kotlin/classpath.lua)):
+- 脚本头注入 `JAVA_MODE=` (shq 后), body 第 3 段按它分档; `MODE` 变量删除
+- `config_hash` 的 `jar_mode` 输入换成 `java.mode` —— java.mode 切换必须触发重生成
+- 跨来源去重: 新增 `add_jar`/`read_jar_list` (seen_j 按完整路径); **curated 的两个
+  入库点也必须走 add_jar** —— 首轮真机复验输出 600 jar/6 个重复 (framework-minus-apex
+  combined 等同时被基线与闭包命中), 修正后 594/dup=0
+- marker **v3→v5**: 两次模板改动各 bump 一次。教训: 第二次改动 (curated 去重) 当场
+  忘了 bump, ensure_script 判定"无需重写", 真机复测 dup 依旧 6 才暴露 —— **模板改动
+  与 bump 必须同步**, 否则盘上脚本永远停留在旧模板
+- 闭包读取不做二次过滤, 原样读 (lua 侧写盘时已应用 §2.19.6/2.19.7 名册闸; 脚本侧
+  再过滤会与 :Aosp 面板的 refLibs 计数不一致)
+- rel = `${PWD#$root}` (KLS 工作区根 = 树内 .git 项目目录, 与闭包的 project_dir
+  同口径); 文件名 `cache_key(rel)` 的 bash 转义序与 util/path.cache_key 一致,
+  由执行级测试钉死 (rel 含 '-' 的 fixture, 转义序错 → 闭包 miss → 断言失败)
+- 老配置 `kotlin.jar_mode = ...` 静默丢弃 (drop_legacy_keys); 校验只挡
+  curated_modules 非表垃圾 (允许置空 = project 模式走纯闭包)
+- 预热 (kotlin/init.lua 第 5 步) 改为**无条件**: aosp/infer 下全量缓存是数据源;
+  project 下是兜底来源, 且顺带驱动 module-deps 清单采集 (闭包的前置)
+- :Aosp 面板 kotlin 行 `jar_mode=` 改为 `jars=<java.mode>`
+
+**测试**: `t_kls_classpath.lua` 重写为渲染层 + **真实 bash 执行**双轨 (23 断言):
+渲染层钉 JAVA_MODE 注入/闭包路径形态/旧扁平路径不回归/marker v5/树键转义序;
+执行层用 fixture 假树走 dispatch→分支→读取→输出全链, 覆盖 闭包命中/闭包缺失回退/
+aosp 不读闭包/rel 含 '-' 转义/全空 stderr 提示 五条路径。模板是 `[[ ]]` 长字符串,
+不受任何编译期检查保护, 执行层是这类"静默漏改"的唯一解码器。
+**真机端到端** (Connectivity, java.mode=project): 594 jar (587 闭包 ∪ ~20 基线,
+-6 重叠), dup=0, framework-minus-apex/combined 恰 1 条, stderr 干净。
+21 套件全过; stylua v0.20.0 `--check` 过。
 
 ### 2.24 面板浮窗化: 每个源窗口一个实例 (2026-10-28, v18.25)
 
@@ -3144,9 +3233,10 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | ---- | ---- | ---- |
 | `t_commands.lua` | 17 | 命令面冻结契约: 恰好 5 个 `:Aosp*` 命令 (含 `:AospDebug`), 且删掉的那 7 个一个都不在; `:Aosp`/`:AospDebug` 都是 bang 命令 |
 | `t_conflict.lua` | 41 | 会话隔离 (§2.16.1): `session_conflict.check` 四种情形 (有**主的**别的 jdtls 占同一 `-data` → 冲突 / 无 → 不冲突 / 只剩孤儿 → 不冲突 / `-data` 在别处 → 不冲突; 全部注入假依赖, 不碰真 `/proc`) 且同一 `ws_dir` 只扫一次 (结果按会话缓存, configure 与 project_name 包装器共用同一判定) / 算不出 `-data` 时不扫 foreign 且不冲突 / `isolation_name` = `base.."-nvim"..pid`, 同 base 换 pid 换名字 (隔离成立的前提)、同会话稳定、空/nil base → nil / `cleanup` 的归属闸 (`isolation_dir_owned`): 缓存根之下 + **本进程** `-nvim<pid>` 后缀才认, 隔离根与其 `workspace/` 子目录两形态都认; 共用 `qssi/workspace`、别人的后缀、别处 `-data`、`/`、nil、空串、`<cache_root>-evil` 兄弟目录一律判否 / `isolation_root` 归约 (workspace 子路径 → 根) / **端到端**: 只剩 `config/` 的泄漏目录被 `cleanup(不存在的 workspace)` 整个删掉 (回归 2026-10-13 泄漏), 共用的 `qssi/workspace` 不动 / **`configure` 集成回归闸**: 无冲突时 `opts.project_name` **逐引用相同**、照旧返回 basename —— "不影响单 nvim 正常路径"的证据 / **收尾回归闸**: 全程把 `SC.set_cache_root` 指向临时目录, 断言真缓存根里没被写进任何 `-nvim<pid>` 目录 (回归 2026-10-13 "测试在真缓存里留下 `qssi-nvim<pid>`"; 真树那块需 `AOSPNAV_LIVE_TEST=1`) / **真树块**: 冲突时 `project_name` 变隔离名 + `state.get(<AOSP 根>).limited == true` **且** `state.get().limited == false` (钉住 §2.15 `#3` 的"状态按树分区"契约; 2026-10-15 修) |
-| `t_config.lua` | 37 | 本轮重构引入/删除的键: 死键静默丢弃 (不映射、不告警) / `merge` 不改调用方的表 / `source_apply_max_roots` 不再是配置键 / **重复 setup 不得打回默认值** (见 §2.14): 空参 `setup()` 后 `kotlin.jar_mode`·`log_level` 仍是用户值 / 第二次带参 setup 不丢上一次的键 / 新表产出且旧表不被就地改写 / 排除名单 append 语义未回归 / **合并结果不与 `M.defaults` 共享子表**, 就地改它不污染默认值 (标量+列表) |
+| `t_config.lua` | 37 | 本轮重构引入/删除的键: 死键静默丢弃 (不映射、不告警; `kotlin.jar_mode` 已随 v18.33 删除并入 `java.mode`, 老配置配置了也不报错) / `merge` 不改调用方的表 / `source_apply_max_roots` 不再是配置键 / **重复 setup 不得打回默认值** (见 §2.14): 空参 `setup()` 后 `kotlin.disable_document_highlight`·`log_level` 仍是用户值 (车辆键: jar_mode 已删, v18.33 起用同为标量的 disable_document_highlight 复刻同一路径) / 第二次带参 setup 不丢上一次的键 / 新表产出且旧表不被就地改写 / 排除名单 append 语义未回归 / **合并结果不与 `M.defaults` 共享子表**, 就地改它不污染默认值 (标量+列表) |
 | `t_exclusions.lua` | 26 | `java/import_exclusions.lua` (§2.19): `escape_glob` 转义 `[ ] * { }` / 扫描判据 = **只认 `.project`** (jdt.ls 的 EclipseProjectImporter 就凭它导入; 多要一个 `.classpath` 会让"有 .project 无 .classpath"的 Gradle 工程漏网, 而一个漏网的可见工程足以废掉整棵树的不可见工程) / 只有 `.classpath` 的目录不排除 / 深层 (dir-depth 5, jdt.ls 的边界) 够得着 / 产出全是**目录**不含文件名 / `effective` 合成规则 (6 条默认 + 扫描 + 用户追加, 去重) / **`exclude_merge` 不管 `import_exclusions`** (回归: replace 曾把它清成 0) / 缓存版本不匹配视为无缓存 |
 | `t_jvm.lua` | 127 | `util/jvm.assess` (此前**完全没有**测试): `-Xmx6G` 判否 / `--jvm-arg=` 前缀剥离 / 重复 `-Xmx` 后者胜 / `UseParallelGC` 识别 / 无值·无键·nil cmd 不崩 / **`xmx_over_host`** (§8.1.2): `-Xmx16G` 在 512G 宿主静默·在 15G 宿主报警且建议**调小** (不得误报 `xmx_small`) / 80% 边界恰好不报·超过才报 / `MemTotal` 读不到时跳过该检查 / `host_mem_total()` 真读 `/proc/meminfo` (正数或 nil, 不崩)。`util/jvm_live` (**活进程遥测**, §8.1.1): PerfCounter 解析 (去引号、值含 `=`、缺键) / uptime 与 `/proc/<pid>/status` (读不到是 nil 而非 0) / heap_info 三种形态 / young·major 按**名字**分类 (G1 的第三个 collector **不得**算 major) / 间隔按 `uptime/invocations` **自算**(不信 `avg*IntervalTime`) / 五条 fixture 的判定 (实测形态 → 三条 info 且零 warn; 6G 死亡螺旋 → 三条 warn; 健康 G1 → 零 finding; **G1 但新生代 <5% → 仍零 finding**, `young_gen_tiny` 只对 ParallelGC 报; 空快照不崩) / `find_jcmd` 三条回退路径 (注入式, 不碰 `/proc`) / jcmd 对死 pid 的失败路径 (退出码不可靠, 空 stdout 必须自己判失败) / `render` 的每一项都不得含换行 (`nvim_buf_set_lines` 会直接抛) |
+| `t_kls_classpath.lua` | 23 | `kotlin/classpath` 渲染 + **真实 bash 执行**双轨 (§2.23.2, 零 LSP/fixture 假树): JAVA_MODE 注入 / 闭包路径形态 `<tree>/<cache_key(rel)>.closure-jars.txt` / 旧扁平 `<key>.txt` 不回归 / marker v5 / 树键转义序与 `util/path.cache_key` 对齐 (含 "-" 根) / 执行层五条路径: 闭包命中、闭包缺失回退全量、aosp 不读闭包、rel 含 "-" 转义、全空 stderr 提示 —— 模板是长字符串无编译期保护, 执行层是静默漏改的唯一解码器 |
 | `t_log.lua` | 54 | `util/log.lua`: 四档阈值比较 / `log.user` 绕过阈值 / 会话内 `once` 去重 / `once` 被阈值挡下时**不消费**登记 / 消息前缀 |
 | `t_module_deps.lua` | 28 | `java/jars` 的 **soong 依赖闭包** (§2.19): `module_bp_java_deps.json` 解析 (依赖图去重 / 传递闭包 / 缺文件退化) / manifest TSV 读回与 mtime 失效 / 闭包缓存按 (树, 项目) 键控且随产物 mtime 失效 / 降级集 ⊆ 完整集 (热补只增不减) / **闭包路径仍应用 `exclude_jars`** (§2.19.6): 闭包内但名字命中排除模式的 jar 必须被排掉 (回归 v18.24 的 no_exclude 矫枉过正) |
 | `t_multi_tree.lua` | 29 | **两棵树共用一个 nvim 会话** (§2.15): 假树造 A/B 两棵树, 零 LSP。两棵树各自推断出正确的根与项目 / 会话切到 B 后**不继承** A 的项目 (旧实现会) / 同一会话里 A·B 同时活动时 `union` 互不污染 / `state(A)` ≠ `state(B)` / 两棵树各有自己的顺序文件且内容不交叉 / `reset(A)` 不动 B / `client(fname)` 按 buffer 的 client 选 (旧实现取 `get_clients()[1]`) / `_is_applied` 按树分开 |
@@ -3161,9 +3251,9 @@ AOSPNAV_LIVE_TEST=1 bash tests/run.sh               # 连真树检查一起跑
 | `t_root_fallback.lua` | 30 | 取不到根的缓冲不得引出第二台 jdtls (§2.13): 两条**实测**触发路径 (jdt:// 反编译视图 / kls 的 `/tmp/kotlinlangserver…/…java`, 后者是**真路径 + `buftype=""`**) 都复用现有 client 的 `root_dir` 原样 / 没有 jdtls 在跑时一律不接管 / 树外**有** `.git` 的工程听用户的 (不劫持) / 树外无工程标记的真实文件复用 (它本就没有可用的根) / 用户 `root_dir` 有结果或抛错时的行为 / 多台 client 时"上一个 buffer 挂着的"优先 / 无 `root_dir` 的 client 跳过 (`config.root_dir` 里的认) / `mode="project"` 同样受益 / **内存闸 (§2.13.1)**: 可用内存 < 4 GB 时退回已有台, 且发出的**必须是 warn** (默认档可见; 降回 info 则测试变红)、同项目 `once` 去重、内存恢复后照旧起新台 (闸不粘) |
 | `t_workspace.lua` | 42 | 工作区污染的处置 (§2.12): 排除名单 (假工程与复算出的 invisible project 都不算) / 空壳判定的正反例 (JDT 目录空 + 树里无整行; **名字只作为树里路径片段出现仍算空壳** = `grep -x` 整行语义) / `project_location` 解析二进制 `.location` / `remove_project_metadata` 的越界防护 (`../sentinel` 被拒且哨兵文件仍在) / 删一个后 blockers 减一 / `gradle_download_evidence` 三种日志变体 / `jdtls_holders`·`foreign_jdtls` 对 nil·空串·临时目录 / **`clean_workspace` 删完自动重启** (§2.18): 缓存根之外的 dir 被拒 / 非 java 缓冲只删不重启 / java 缓冲删完重放一次 `FileType` (自动重启) / **命令后窗口切走: 目录仍被删且当前缓冲跑完被还原** (`start_or_attach` 读的是 `nvim_get_current_buf()`, 不摆好窗口就重放不出来 = "清完没重启") / `buftype~=''` 的 java 缓冲不重启 (挡 §2.13 的第二台 jdtls) —— 注入 `dir`/`cache_root`/`defer=false`, 临时目录, 零 LSP | 
 
-合计 **639** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
-`t_jvm` 127 / `t_root_from_cwd` 21 / `t_source_apply` 25 / `t_conflict` 37, 共 **615**)。
-2026-10-27 本机实测默认 **615** / live **639**, 18 个套件 (差值是各套真机块按"真树齐备
+合计 **662** 条断言 (上表各文件是"真树齐备 + 真 jdtls 在跑"时的行数; 默认跑法则
+`t_jvm` 127 / `t_root_from_cwd` 21 / `t_source_apply` 25 / `t_conflict` 37, 共 **638**)。
+2026-10-28 本机实测默认 **638** / live **662**, 21 个套件 (差值是各套真机块按"真树齐备
 + 真 jdtls 在跑"的有无整段 SKIP, 非不变量)。
 
 > **[2026-10-15] 真树块两条夹具缺陷已修** (两条都是**夹具**问题, 产品代码无缺陷):

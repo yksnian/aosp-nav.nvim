@@ -215,11 +215,11 @@ M.defaults = {
   },
   kotlin = {
     enabled = true,
-    -- jar 选择模式: "curated"=精选核心模块(脚本直接 glob, 实时反映编译产物),
-    --   "all"=全量 jar(读 java 模块维护的缓存文件, 实验性: KLS 会为每个 jar
-    --   建符号索引, 首次索引慢/内存高, 且需先打开过 java 文件预热缓存)
-    jar_mode = "curated",
+    -- [v18.33] 原 jar_mode ("curated"/"all") 已删: jar 来源跟随 java.mode ——
+    --   project = 模块闭包 ∪ 本清单 (框架基线); aosp/infer = 全量 jar 缓存。
+    --   见 kotlin/classpath.lua 的 ---- 3 ---- 段。
     -- 精选模块 (glob, 匹配 soong intermediates 的模块路径; ** 跨目录层级)
+    --   仅在 java.mode="project" 下生效 (project 的框架基线兜底)
     -- 语义: 模式下一层作为 vdir, 再拼 tag 找 jar。因此
     --   "frameworks/base/services/core/*" 能命中 services.core / services.core.unboosted
     --   等直接子模块 (vdir 落在 <mod>/android_common), 但命中不了更深嵌套的
@@ -286,6 +286,10 @@ local function drop_legacy_keys(user_opts)
   end
   if user_opts.clang ~= nil then
     user_opts.clang = nil
+  end
+  local k = user_opts.kotlin
+  if type(k) == "table" then
+    k.jar_mode = nil -- [v18.33] 键已删, 行为并入 java.mode (老配置静默丢弃)
   end
 end
 
@@ -394,14 +398,10 @@ function M.validate(cfg)
 
   -- kotlin 段校验 (kotlin 启用时)
   if cfg.kotlin and cfg.kotlin.enabled then
-    if cfg.kotlin.jar_mode ~= "curated" and cfg.kotlin.jar_mode ~= "all" then
-      return false, "kotlin.jar_mode must be 'curated' or 'all'"
-    end
-    if
-      cfg.kotlin.jar_mode == "curated"
-      and (not cfg.kotlin.curated_modules or #cfg.kotlin.curated_modules == 0)
-    then
-      return false, "kotlin.curated_modules must not be empty in curated mode"
+    -- [v18.33] jar_mode 校验已随键删除; curated_modules 允许置空 (project 模式
+    -- 走纯闭包), 只挡非表垃圾
+    if type(cfg.kotlin.curated_modules) ~= "table" then
+      return false, "kotlin.curated_modules must be a list"
     end
     if not cfg.kotlin.soong_tag_priority or #cfg.kotlin.soong_tag_priority == 0 then
       return false, "kotlin.soong_tag_priority must not be empty"
