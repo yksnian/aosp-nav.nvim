@@ -484,14 +484,25 @@ function M.diagnose(basis, src_file)
       n_b > 0 and mode ~= "project" and ":AospCleanWorkspace clears them in one pass" or nil
     )
     -- jdtls workspace 目录
-    local wd = workspace.workspace_dir()
-    local wd_ok = wd ~= nil and vim.fn.isdirectory(wd) == 1
-    lines[#lines + 1] = line(
-      "jdtls workspace",
-      tostring(wd),
-      wd_ok,
-      action_if(wd_ok, "will be created on next start")
-    )
+    -- [真树实测反馈] 无 jdtls client 且当前文件非 .java 时, workspace_dir() 的
+    -- "预测路径"有误导性 (用户实测: 只开 netd 的 cpp 文件, 面板显示要为 netd 预建
+    -- workspace —— 实际 jdtls 只挂 ft=java, netd 无 .java, 该目录永远不会被创建)
+    -- —— 收成一句非问题提示, 不再展示预测路径。
+    local has_jdtls = #vim.lsp.get_clients({ name = "jdtls" }) > 0
+    local cur_src = (src_file and src_file ~= "") and src_file or vim.api.nvim_buf_get_name(0)
+    local wd
+    if not has_jdtls and vim.fn.fnamemodify(cur_src, ":e") ~= "java" then
+      lines[#lines + 1] = line("jdtls workspace", "not started (no java file opened)", true, nil)
+    else
+      wd = workspace.workspace_dir()
+      local wd_ok = wd ~= nil and vim.fn.isdirectory(wd) == 1
+      lines[#lines + 1] = line(
+        "jdtls workspace",
+        tostring(wd),
+        wd_ok,
+        action_if(wd_ok, "will be created on next start")
+      )
+    end
     -- 工作区里的外部可见工程: invisible project 的闸门 (见 M.workspace_blockers)。
     -- 有它们时跳转全落进 jdt.ls-java-project 假工程, 而症状只是"索引很快就结束"。
     -- 判据是"工作区根是不是 AOSP 根" <=> mode ~= "project" (aosp 与 infer 都要判;
@@ -589,6 +600,13 @@ function M.diagnose(basis, src_file)
     lines[#lines + 1] = line("kls classpath", owner .. " (" .. tostring(kpath) .. ")", ok, hint)
     local n_kls = #vim.lsp.get_clients({ name = "kotlin_language_server" })
     lines[#lines + 1] = line("kls client", n_kls .. " attached", true)
+  end
+
+  -- cpp (clangd): 旗标采集链 origin (compdb → cc_deps → bp), 对位 jars= origin 行。
+  -- 与 java 的 [v18.23] 同闸: 非 AOSP 基准不显示 (basis 非空即在某棵树内)。
+  if cfg.cpp and cfg.cpp.enabled and basis then
+    local cs = require("aosp-nav.cpp").status(basis)
+    lines[#lines + 1] = line("cpp cdb", cs.text, cs.ok, cs.action)
   end
 
   return lines
@@ -916,6 +934,9 @@ function M.rescan(import_root)
   -- 只清内存; 文件缓存留着: 重扫失败时下次启动仍有旧列表可用
   local jm = require("aosp-nav.java.jars")
   jm.reset_cache(root)
+  -- [v18.35] cpp 缓存 (自管 CDB / bp 索引 / BFS 账本) 同步失效 —— 树重编后
+  -- cc_deps/compdb 内容变了, 旧条目的旗标会误导 clangd
+  local cpp_dropped = require("aosp-nav.cpp").invalidate(root)
   -- no_cache: 否则文件缓存还在, find_android_jars 会直接命中它, 等于没重扫
   local jars = jm.find_android_jars({ no_cache = true })
   if #jars == 0 then
@@ -942,6 +963,9 @@ function M.rescan(import_root)
   if exc_n then
     msg = msg
       .. ("; import.exclusions: %d stale dir(s), %d pattern(s) effective"):format(exc_n, exc_total)
+  end
+  if cpp_dropped then
+    msg = msg .. "; cpp cdb dropped"
   end
   log.info(msg, { timeout = 10000 })
 end

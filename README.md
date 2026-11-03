@@ -400,69 +400,35 @@ Check in order:
 
 After switching jar mode (curated/all) or changing the tag priority, clear the KLS cache: `rm -rf ~/.cache/kotlin-language-server`
 
-### Extending: browsing Android native code (navigation and completion in c/cpp)
+### c/cpp (clangd) wiring
 
-Install and configure an LSP/clangd plugin. With LazyVim, just enable the `lang.clangd` extra.
+Enable a clangd plugin as usual (LazyVim: the `lang.clangd` extra), then inject the AOSP options:
 
-Then generate `compile_commands.json` in your Android source environment. (clangd searches for `compile_commands.json` upward from the opened file's directory, so the simplest approach is a symlink in the AOSP root pointing at the real file.)
-
-Steps:
-
-1. Enter the source root and set up the build environment (same as before a normal `make`)
-
-```
-cd /path/to/android/  # replace with your AOSP root
-source build/envsetup.sh
-lunch <your_target>       # e.g. lunch aosp_arm64-eng
-```
-
-1. Important — set SOONG_GEN_COMPDB=1
-
-```
-export SOONG_GEN_COMPDB=1
-# Optional: generate a pretty-printed (human-readable) JSON file
-export SOONG_GEN_COMPDB_DEBUG=1
-# Optional: specify the output directory; $(pwd) means the current directory
-export SOONG_LINK_COMPDB_TO=$(pwd)
-```
-
-1. Build, e.g. a single module
-
-```
-mm
-# Or build the whole project
-# make -j8
-```
-
-The file is usually generated at `out/soong/development/ide/compdb/compile_commands.json`.Create a symlink in the source root:
-
-```
-cd /path/to/android/ # replace with your AOSP root
-ln -sf out/soong/development/ide/compdb/compile_commands.json .
-```
-
-Then open any cpp file in nvim.
-
-**Tip**
-
-You can wrap`SOONG_GEN_COMPDB=1` and `ln -sf out/soong/development/ide/compdb/compile_commands.json .`into an extended `make` function in your `~/.bashrc`:
-
-```
-function make_ex() {
-    SOONG_GEN_COMPDB=1 SOONG_GEN_COMPDB_DEBUG=1 make "$@"
-    if [ -f "out/soong/development/ide/compdb/compile_commands.json" ]; then
-        ln -sf out/soong/development/ide/compdb/compile_commands.json .
-        echo "🔗 compile_commands.json is created"
-    fi
+```lua
+-- lua/plugins/lsp.lua
+return {
+  {
+    "neovim/nvim-lspconfig",
+    opts = function(_, opts)
+      opts.servers = opts.servers or {}
+      opts.servers.clangd =
+        require("aosp-nav").cpp.configure(opts.servers.clangd or {})
+    end,
+  },
 }
 ```
 
-Use `make_ex` instead of `make` when you want compile_commands.json generated (`lunch` stays the same).
+No manual `compile_commands.json` needed. On every clangd attach the plugin resolves compile flags for the file via a three-tier chain (the `:Aosp` panel shows the active one as `cpp cdb: origin=...`):
 
-```
-source ~/.bashrc
-make_ex -j8               # instead of make
-```
+| origin | When | How it works |
+| ------ | ---- | ------------ |
+| `compdb` | `out/soong/development/ide/compdb/compile_commands.json` exists | clangd is pointed straight at that directory (native consumption, zero extra work) |
+| `cc_deps` | `out/soong/module_bp_cc_deps.json` exists | produced by **every ordinary build** (soong's `ccdeps_generator`, no `SOONG_GEN_COMPDB` needed); the plugin extracts the owning module's flags and writes entries into its own `compile_commands.json` under the plugin cache |
+| `bp` | neither exists | heuristic fallback: nearest `Android.bp` (include dirs / cflags) + bounded BFS over `header_libs` exports + a curated framework-header baseline |
+
+The self-managed CDB lives under `~/.cache/nvim/aosp_nav/` and grows one entry per file you actually open — clangd is wired with `--compile-commands-dir`, so no symlinks in the tree root. Your own `--compile-commands-dir` always wins. `:AospRescan` invalidates the cpp cache along with the jar cache.
+
+For the compdb tier (optional, most precise per-file flags) the old manual recipe still works: `SOONG_GEN_COMPDB=1` before the build puts the file at `out/soong/development/ide/compdb/compile_commands.json` — no symlink required anymore.
 
 ## License
 

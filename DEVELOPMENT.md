@@ -34,6 +34,10 @@ setup(opts)
        │    ├─ java/session_conflict   双 nvim 抢同一份 -data 时的会话隔离
        │    └─ java/contract.lua       jdt.ls 内部实现的运行期契约自检
        ├─ kotlin/init.lua              KLS 接线 (classpath 脚本 + 分发表)
+       ├─ cpp/init.lua                 clangd 接线 (--compile-commands-dir + 按需 CDB, 见 §2.23.4)
+       │    ├─ cpp/cdb.lua             自管 compile_commands.json (增量 upsert + meta 旁车)
+       │    ├─ cpp/ccdeps.lua          module_bp_cc_deps.json 模块段流式提取 → 旗标组装
+       │    └─ cpp/bp.lua              nearest Android.bp + header_libs BFS + curated 基线
        ├─ basis.lua                    "哪棵树"基准解析 (tree_key / panel_basis / jar_root)
        └─ ui.lua                       :Aosp / :AospDebug / 状态栏 (纯展示层)
 ```
@@ -2107,6 +2111,122 @@ aosp 不读闭包/rel 含 '-' 转义/全空 stderr 提示 五条路径。模板�
 <not an AOSP file>` 一行交代处境。AOSP 会话行为零变化。21 套件全过;
 stylua v0.20.0 `--check` 过。
 
+### 2.23.4 cpp (clangd) 模块: compdb → cc_deps → bp 三级旗标采集链 (2026-11-03, v18.35)
+
+cpp 跳转/补全此前完全依赖用户手工准备 `compile_commands.json`
+(SOONG_GEN_COMPDB + 树根软链接, 老 README 教程)。本轮把这条链接管进插件,
+结构与 jars 链 (soong→make→fallback) 同构:
+
+```
+cpp/init.lua  configure(opts)          clangd 注入 --compile-commands-dir + LspAttach 按需组装
+  ├─ cpp/cdb.lua     自管 CDB            <cache>/<树键>/cpp/compile_commands.json + meta.txt 旁车
+  ├─ cpp/ccdeps.lua  origin=cc_deps     module_bp_cc_deps.json 按模块段流式提取
+  └─ cpp/bp.lua      origin=bp          nearest Android.bp + header_libs BFS + curated 基线
+```
+
+**soong 事实 (cc/ccdeps.go, lineage-24.0 tarball, 全部反编译/源码级证据)**:
+
+1. `module_bp_cc_deps.json` 由 parallel singleton `ccdeps_generator` 在
+   `GenerateBuildActions` 写出, 注释 "(b/204397180) Generate
+   module_bp_cc_deps.json by default" —— **普通构建/分析即产生, 与
+   SOONG_GEN_COMPDB 无关**。这是 cc_deps 档作为默认档成立的根据。
+2. `json.MarshalIndent(moduleDeps, "", "\t")` —— **tab 缩进**, Go 的 MarshalIndent
+   会转义字符串内的换行, 因此字符串值不含裸换行 → 模块段可以**行级流式提取**
+   (`ccdeps.segment`: needle 匹配 `\t\t<name>": {`, 同缩进 `}` 行闭合), 不必把
+   几十上百 MB 的 json 整读进内存 (`vim.json.decode` 整读在 100MB 级文件上是
+   秒级+GB 级内存, 不可接受)。行级假设被未来 soong 改紧凑格式打破时 segment
+   返回 nil, 自然落到 bp 档, 不硬撑。
+3. ccParameters 实际键名 (容易记错的点): `header_search_path` /
+   **`system_search_path`** (isystem, 不是 system_header_search_path) / `flag` /
+   `system_root` / `relative_file_path` (-fX=Y 形态, v18.35 不消费)。
+   `header_search_path`/`system_search_path` 存的是 **bare 路径** (soong 侧已剥
+   `-I`/`-isystem` 前缀, parseCompilerCCParameters 的 TrimPrefix), 组装时由插件加回。
+4. best-variant: 每模块只留一份, 设备 arch 命中的变体胜出, 否则先到先得
+   ("heuristically, ones that appear first are likely to be more relevant") ——
+   所以按 bp 文件声明序逐个试模块名是正确顺序。
+
+**关键设计**:
+
+* **origin=compdb 零介入**: compdb 在场时 clangd 直接指向
+  `out/soong/development/ide/compdb/`, 插件不写任何条目 (ensure_entry 短路)。
+  这也是为什么 origin 判定 (detect_origin) 必须在 configure 时做而不是写死。
+  cpp.configure 的起点文件走 cpp 版 probe (§2.8 同一精神: 当前 buffer 优先,
+  否则高 bufnr 已加载 cpp buffer), 不假设 opts 求值时停在 cpp buffer 上。
+* **CDB 用 `arguments` 列表形态** (非 `command` 字符串), 旗标无需 shell 转义;
+  arguments[1] 必须是编译器, bp 档不产编译器 → cdb.upsert 统一兜底 clang++。
+  clangd 的 `--compile-commands-dir` 会让它**放弃**向上搜索 compile_commands.json,
+  所以该旗标只在 compdb/cc_deps/bp 三档之一成立时注入; 用户自己设的
+  --compile-commands-dir (两种形态) 永远优先。
+* **meta 旁车**: CDB 本体必须始终是合法 JSON (clangd 不吃注释), 版本/origin/count
+  记在 `meta.txt` (`# key=value`, 与 jars.txt 同款); 树键串台双保险 (aosp 路径
+  写进头部) 同款沿用。meta version bump 语义: 字段集/语义变更时 bump,
+  旧 meta 自动作废。
+* **cc_deps 查询是懒的**: nearest Android.bp → 候选模块名 (声明序, 去重) →
+  segment 提取 → srcs 命中判定 (根相对精确 > 基名 > 模块目录拼接)。没有打开
+  过的文件永远不产生段提取; 文件不属于任何模块 srcs 时落 bp 档。
+* **bp 档的路径解析顺序**: 绝对 → 根相对 (isdirectory 试探) → 模块目录相对 →
+  兜底根相对。cc_deps 同款 (`resolve_path` 两处各一份, 语义一致, 不共享以保持
+  两采集器独立可测)。
+* **header_libs BFS**: 按名反查需要全树 Android.bp 索引 (`fd` 优先, `find` 兜底,
+  排除 .repo/out/prebuilts), 按树落盘 `cpp/bp_index.txt` (7 天过期,
+  :AospRescan 强制失效); 反查用 `grep -F -H -e` 批量分片 (500 文件/片)。
+  **只追 header_libs 一条边** (static/shared 的传递 export 不展开, 树太深),
+  深度默认 3 (`cpp.header_lib_depth`)。grep 输出解析带横幅防御 (只认
+  `<绝对路径>:%s*name: "..."` 形态) —— 且注意 `--` 之后不能再放 `-e`
+  (选项解析终止, -e 会被当文件名), 本轮实测踩过。
+* **curated 基线** (`cpp.curated_includes`, 语义=整表替换, 对位
+  kotlin.curated_modules): 存在性过滤后才加, 覆盖 bp 档解析不到的常用框架头
+  (libcutils/libbase/liblog/...)。bp 档三处皆空时返回 nil → 不注入, clangd
+  保持用户原生配置。
+* **:AospRescan 挂点**: cpp 缓存 (自管 CDB/bp 索引/BFS 内存账本) 与 jar 缓存
+  同步失效, 面板消息附 `cpp cdb dropped`。
+
+**测试** (t_cpp_cdb, 82 断言): segment 行级提取 (含字符串带大括号的防御);
+ccdeps 旗标组装 (-I/-isystem/-D/--sysroot/编译器, 三种路径相对形态);
+bp.parse (注释/嵌套 map/列表跨行); bp.lookup BFS + curated 存在性过滤;
+cdb upsert 幂等/追加/替换 + meta 记账; detect_origin 四档; configure 注入三态
+(cmd nil/列表/用户已设); 执行级 —— 写出的 CDB 必须 `vim.json.decode` 还原且
+每个 -I/-isystem 指向真实存在的目录。22 套件全过; stylua v0.20.0 `--check` 过。
+
+**本地实测边界 (如实记录)**: 本仓库本地开发树是裁剪 checkout
+(bionic/external/frameworks/packages/system/vendor + build/make, 无 build/soong,
+out/soong 只有 module_bp_java_deps.json), 因此 compdb/cc_deps 两档的证据链 =
+soong 源码 (上列 4 条) + fixture 复刻 (tab 缩进 MarshalIndent 同款); bp 档在本地裁剪树可真跑。
+~~上真树后第一件事: 挑一个 cc 模块 (如 system/core/libcutils) 对拍 cc_deps 组装条目与
+soong 实际编译命令的差异 (预期差异: soong 隐式旗标不含于 cc_deps、relative_file_path 未消费)。~~
+**[2026-11-03 真树实测补录]** 已在真树 (用户裁剪 AOSP checkout, 162MB
+module_bp_cc_deps.json, 无 prebuilts/clang) 用 system/netd libnetd_client /
+NetdClient.cpp 完成端到端验证 (0.8s 命中, clangd `--check` 建 AST 成功),
+过程中发现并修正四件事, 全部有磁盘实测证据:
+
+1. **cc_deps srcs 是根相对且 defaults 已展开**: NetdClient.cpp 直接出现在
+   `libnetd_client.srcs` (根相对形态), 不是 bp 里 defaults 前的模块相对形态 ——
+   srcs 命中判定要同时支持根相对/基名/模块相对三种 (§fixture 已复刻)。
+2. **编译器路径带 `${ANDROID_ROOT}` 占位符**, 需展开成 AOSP 根再判 executable,
+   失败回退裸 clang++/clang (clangd 自带前端, 不依赖 soong 的 clang 二进制)。
+3. **cc_deps 不携带 arch** → 不加 `--target` 时 clangd 落 host 三元组,
+   `-march=armv8-a` 直接报错。从 best-variant 的 `system_search_path` 里
+   `uapi/asm-<arch>` 推导 (`asm-arm64 → aarch64-linux-android` 等 8 项)。
+4. **cc_deps 旗标不含 `-nostdlibinc`** (实测 99 旗标里不存在, 别按它判定)。
+   裁剪树真正的坑是: libc++ 头指向 prebuilts/clang (缺失) + `--target=` 非宿主
+   三元组阻断 clang 驱动的宿主 libstdc++ 探测 → C++ 标准库头一个都进不来,
+   `<atomic>` 起步连环错到 `fatal: too many errors emitted` (clangd `--check`
+   实测 26 错, 与用户报的 "Too many errors emitted, stopping now" 同源)。
+   兜底: C++ 文件且旗标里无任何**存在**的 `/c++/` 头目录时, 用宿主编译器
+   `clang++ -E -Wp,-v -xc++ <空文件>` 探测它自带的 C++ 标准库头路径
+   (解析 stderr 的 `#include <...> search starts here:` 段, 只留含 `/c++/`
+   的目录, 按编译器缓存), 显式追加 `-isystem`。C 文件不追加 (bionic 头够用)。
+   探测注意: `vim.fn.tempname()` 只给路径不落盘, clang `-E` 会报
+   "no such file or directory", 必须先 `writefile({}, ...)` 写空文件。
+   树里存在可用 c++/v1 目录 (全量 checkout) 时不追加, 旗标原样透传。
+
+对拍结论 (NetdClient.cpp): cc_deps 组装条目与 clangd 消费间的剩余差异只有
+版本耦合旗标 (`-gz=zstd`、`-ftrivial-auto-var-init=zero`) —— clangd 自带的
+新前端照常吞掉, 不影响解析; 系统 clang 14 的 `-fsyntax-only` 会在驱动层拒绝
+它们, 那是调试脚本的问题不是 clangd 的。裁剪树里 `system/libbase/include` 等
+头目录本身缺检出导致的 `android::base` 符号缺失属树不完整, 非插件可修;
+全量 checkout (有 prebuilts/clang) 走原始旗标零介入。
+
 ### 2.24 面板浮窗化: 每个源窗口一个实例 (2026-10-28, v18.25)
 
 **动机 (用户多窗口实测)**: 旧实现 `botright new` + 固定名 `aosp-nav://panel`, 多窗口
@@ -3417,6 +3537,10 @@ KLS 进程的孤儿/残留清理现在是**自动的** (旧的 `:AospKillOrphanK
   后者是 §8.1.2 的宿主内存上限 (80%), 依赖跑测试的机器, 所以 `jvm.assess()` 的测试
   **必须显式传 `mem_total`**, 否则同一份断言在 15G 笔记本与 512G 工作站上结论相反。
 - **碰 BufEnter 路径** → 必须保持毫秒级; 任何扫描都异步 (`scan_async`), 结果进缓存。
+- **动 cpp 缓存布局** (`cpp/cdb.lua` / `bp_index`) → bump 对应版本 (cdb 的
+  `META_VERSION` / bp 的 `INDEX_VERSION`), 否则旧缓存带着旧语义继续用;
+  ccdeps 的行级提取依赖 MarshalIndent tab 缩进这一 soong 事实 (§2.23.4), soong
+  换紧凑格式时 segment 返回 nil 落 bp 档 —— 若要支持新格式, 别在旧解析上打补丁。
 - **碰 `inject_sync`** → 它只能**同步读缓存**, 一旦引入扫描, sourcePaths 就赶不上
   `initialize` 请求了 (而 §2.5 禁止事后补救)。
 - **在 `configure` 里用 buf 0** → 一律走 `probe_file` (§2.8)。新加的任何"从当前

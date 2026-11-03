@@ -44,7 +44,7 @@ end
 -- 为了 lualine 之类的调用点写起来短; 之前缺失导致文档里的用法拿到 nil)
 setmetatable(M, {
   __index = function(t, key)
-    if key == "java" or key == "kotlin" then
+    if key == "java" or key == "kotlin" or key == "cpp" then
       -- 未 setup 时用默认配置自动初始化
       if not M._state.setup_done then
         M.setup()

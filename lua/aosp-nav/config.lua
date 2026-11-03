@@ -256,6 +256,29 @@ M.defaults = {
     storage_path = vim.fn.expand("~/.cache/kotlin-language-server"),
     -- jar 名/路径排除复用 java.exclude_jars / java.exclude_paths (单一来源)
   },
+  -- [v18.35] cpp (clangd) 模块: 跳转/补全的编译旗标采集链
+  -- compdb → module_bp_cc_deps.json → Android.bp 启发式兜底, 见 cpp/init.lua
+  cpp = {
+    enabled = true,
+    -- header_libs BFS 最大深度 (bp 兜底档; 0 = 只解析顶层模块自身)
+    header_lib_depth = 3,
+    -- curated 全局基线 (相对 AOSP 根, 磁盘上不存在时自动跳过): 覆盖 bp 兜底档
+    -- 解析不到的常用框架头。语义 = 整表替换 (同 kotlin.curated_modules)。
+    curated_includes = {
+      "bionic/libc/include",
+      "bionic/libm/include",
+      "system/core/include",
+      "system/libbase/include",
+      "system/logging/liblog/include",
+      "system/unwinding/libunwindstack/include",
+      "frameworks/native/include",
+      "frameworks/av/include",
+      "frameworks/base/include",
+      "system/media/audio/include",
+      "hardware/libhardware/include",
+      "external/libcxx/include",
+    },
+  },
 }
 
 -- [v10] java.mode 合法值 (取代旧的 workspace_mode + source_paths_mode):
@@ -408,6 +431,23 @@ function M.validate(cfg)
     end
     if not cfg.kotlin.storage_path or cfg.kotlin.storage_path == "" then
       return false, "kotlin.storage_path must not be empty"
+    end
+  end
+
+  -- cpp 段校验
+  if cfg.cpp then
+    local hd = cfg.cpp.header_lib_depth
+    if hd ~= nil and (type(hd) ~= "number" or hd < 0) then
+      log.warn(
+        ("cpp.header_lib_depth = %s is not a non-negative number, falling back to 3"):format(
+          tostring(hd)
+        ),
+        { once = true, id = "cpp_header_lib_depth:" .. tostring(hd) }
+      )
+      cfg.cpp.header_lib_depth = 3
+    end
+    if cfg.cpp.curated_includes ~= nil and type(cfg.cpp.curated_includes) ~= "table" then
+      return false, "cpp.curated_includes must be a list"
     end
   end
 
