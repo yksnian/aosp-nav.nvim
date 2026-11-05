@@ -218,6 +218,36 @@ local function host_cxx_includes(compiler)
   return out
 end
 
+--- 部分检出剪枝: 剔除指向不存在目录的 -I / -isystem(+值) / --sysroot=。
+--- clang 本来就静默跳过不存在的搜索目录, 剔除不改变解析结果 —— 收益是 CDB
+--- 干净可读, 且面板/执行层校验不被死路径迷惑。它**解决不了**头文件本身缺
+--- 检出的报错 (#include 在盘上无命中), 那类只能补检出/跑构建产物。
+local function prune_missing_dirs(args)
+  local out = {}
+  local i = 1
+  while i <= #args do
+    local a = args[i]
+    local drop = false
+    if a:sub(1, 2) == "-I" and #a > 2 then
+      drop = vim.fn.isdirectory(a:sub(3)) ~= 1
+    elseif a == "-isystem" then
+      if args[i + 1] then
+        drop = vim.fn.isdirectory(args[i + 1]) ~= 1
+        if drop then
+          i = i + 1 -- 值随键一起跳过
+        end
+      end
+    elseif a:sub(1, 10) == "--sysroot=" then
+      drop = vim.fn.isdirectory(a:sub(11)) ~= 1
+    end
+    if not drop then
+      out[#out + 1] = a
+    end
+    i = i + 1
+  end
+  return out
+end
+
 --- cc_deps 查询: nearest Android.bp 给出候选模块名 → 逐个提取段 → srcs 命中
 --- 判定 → 组装 module_info。
 --- @param aosp string AOSP 根
@@ -288,6 +318,7 @@ function M.lookup(aosp, fname)
                 )
               )
             end
+            args = prune_missing_dirs(args)
             -- --target 放最前 (clangd 读 arguments[1] 后的目标三元组); soong
             -- 旗标里没有 target (arch 属 variant 配置, cc_deps 不携带), 缺了
             -- clangd 会按 host 三元组解析, -march=armv8-a 直接报错

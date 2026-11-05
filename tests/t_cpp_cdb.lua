@@ -261,6 +261,30 @@ do
     "ccdeps.lookup: usable c++/v1 dir suppresses host fallback"
   )
   wf(CCDEPS, CCDEPS_LINES) -- 还原夹具 (后续 exec 段要用)
+
+  -- 部分检出剪枝: 指向不存在目录的 -I/-isystem 从条目剔除 (clang 本来就静默
+  -- 跳过不存在的搜索目录, 剪掉只是 CDB 干净; 头文件缺检出的报错要靠补检出)
+  local patched2 = vim.deepcopy(CCDEPS_LINES)
+  for i, l in ipairs(patched2) do
+    patched2[i] = l:gsub(
+      '"header_search_path": %["system/core/include"%]',
+      '"header_search_path": ["system/core/include", "ghost_dir"]'
+    )
+    patched2[i] = patched2[i]:gsub(
+      '"system_search_path": %["bionic/libc/kernel/uapi/asm%-arm64", "external/llvm/sysroot/usr/include"%]',
+      '"system_search_path": ["bionic/libc/kernel/uapi/asm-arm64", "external/llvm/sysroot/usr/include", "ghost_isystem"]'
+    )
+  end
+  wf(CCDEPS, patched2)
+  ccdeps._cxx_probe_cache[stub_cxx] = {} -- 别让宿主兜底掺和本断言
+  local info7 = ccdeps.lookup(TREE, FOO)
+  local a7 = info7 and table.concat(info7.args, "\n") or ""
+  H.check(
+    a7:find("ghost_dir", 1, true) == nil and a7:find("ghost_isystem", 1, true) == nil,
+    "ccdeps.lookup: missing dirs pruned from args"
+  )
+  H.check(a7:find("/system/core/include", 1, true) ~= nil, "ccdeps.lookup: existing dirs kept")
+  wf(CCDEPS, CCDEPS_LINES)
 end
 
 -- ---------------------------------------------------------------- bp ----
@@ -369,7 +393,7 @@ do
   vim.fn.delete(CCDEPS)
   local origin, dir = cpp.detect_origin(TREE, FOO)
   H.eq(origin, "bp", "detect_origin: bp tier")
-  H.eq(dir, cdb.cdb_path(TREE), "detect_origin: cdb dir for bp tier")
+  H.eq(dir, cdb.cache_dir(TREE), "detect_origin: cdb dir for bp tier")
 
   -- cc_deps 档 (恢复夹具)
   wf(CCDEPS, { --[[ 内容无所谓, 只判存在性 ]]
@@ -377,7 +401,9 @@ do
   })
   origin, dir = cpp.detect_origin(TREE, FOO)
   H.eq(origin, "cc_deps", "detect_origin: cc_deps tier")
-  H.eq(dir, cdb.cdb_path(TREE), "detect_origin: cdb dir for cc_deps tier")
+  H.eq(dir, cdb.cache_dir(TREE), "detect_origin: cdb dir for cc_deps tier")
+  -- 必须是目录而不是 compile_commands.json 文件路径 (clangd 只认目录)
+  H.check(dir ~= cdb.cdb_path(TREE), "detect_origin: returns directory, not cdb file")
 
   -- compdb 档: 优先级最高
   wf(TREE .. "/out/soong/development/ide/compdb/compile_commands.json", { "[]" })
@@ -418,10 +444,22 @@ do
   local opts = cpp.configure({ cmd = { "clangd" } })
   local joined = table.concat(opts.cmd, " ")
   H.check(
-    joined:find("%-%-compile%-commands%-dir=" .. vim.pesc(cdb.cdb_path(TREE))) ~= nil,
+    joined:find("%-%-compile%-commands%-dir=" .. vim.pesc(cdb.cache_dir(TREE))) ~= nil,
     "configure: flag appended to list cmd"
   )
+  H.check(
+    joined:find(vim.pesc(cdb.cdb_path(TREE)), 1, false) == nil,
+    "configure: directory passed, not compile_commands.json path"
+  )
   H.eq(cdb.meta(TREE).origin, "cc_deps", "configure: origin recorded")
+  -- 冷启动修复: clangd 启动前 CDB 条目必须已落盘 (启动后写入不会被重载)
+  H.check(vim.fn.isdirectory(cdb.cache_dir(TREE)) == 1, "configure: cdb dir created")
+  local pre = vim.fn.filereadable(cdb.cdb_path(TREE))
+  H.check(pre == 1, "configure: cdb prefilled before clangd start")
+  if pre == 1 then
+    local pre_entries = vim.json.decode(table.concat(vim.fn.readfile(cdb.cdb_path(TREE)), "\n"))
+    H.eq(pre_entries[1] and pre_entries[1].file, FOO, "configure: prefill entry is probe file")
+  end
 
   -- 用户已设 --compile-commands-dir → 尊重用户
   local mine = "--compile-commands-dir=/my/own"

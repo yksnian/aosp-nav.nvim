@@ -124,6 +124,36 @@ return {
 
 `configure` 会注入 `init_options.storagePath`、禁用 `documentHighlight` handler、补全 `root_markers` (追加 `.git`), 并生成 `~/.config/kotlin-language-server/classpath` 脚本。
 
+### c/cpp（clangd）接线
+
+照常启用 clangd 插件（LazyVim 勾选 `lang.clangd` extra 即可），然后注入 AOSP 特化配置：
+
+```lua
+-- lua/plugins/lsp.lua
+return {
+  {
+    "neovim/nvim-lspconfig",
+    opts = function(_, opts)
+      opts.servers = opts.servers or {}
+      opts.servers.clangd =
+        require("aosp-nav").cpp.configure(opts.servers.clangd or {})
+    end,
+  },
+}
+```
+
+无需手工准备 `compile_commands.json`。clangd 附着每个文件时，插件按三级链解析该文件的编译旗标（`:Aosp` 面板以 `cpp cdb: origin=...` 显示当前生效档）：
+
+| origin | 生效条件 | 工作方式 |
+| ------ | -------- | -------- |
+| `compdb` | `out/soong/development/ide/compdb/compile_commands.json` 存在 | clangd 直接指向该目录（原生消费，插件零介入） |
+| `cc_deps` | `out/soong/module_bp_cc_deps.json` 存在 | 该文件**普通编译即产生**（soong 的 `ccdeps_generator`，无需 `SOONG_GEN_COMPDB`）；插件按模块段提取旗标，写入插件缓存下自管的 `compile_commands.json` |
+| `bp` | 两者皆无 | 启发式兜底：nearest `Android.bp`（include 目录 / cflags）+ `header_libs` 限深 BFS + curated 框架头基线 |
+
+自管 CDB 位于 `~/.cache/nvim/aosp_nav/`，按实际打开的文件逐条增长——clangd 通过 `--compile-commands-dir` 接线，**树根不再需要软链接**。用户自己设的 `--compile-commands-dir` 永远优先。`:AospRescan` 会连带清掉 cpp 缓存。
+
+compdb 档（可选，逐文件旗标最精确）依旧可用老配方：编译前 `SOONG_GEN_COMPDB=1`，产物在 `out/soong/development/ide/compdb/compile_commands.json`——现在不再需要软链接。完整步骤见 [拓展：如何查看 Android Native 代码](#拓展如何查看-android-native-代码在-ccpp-中跳转和自动补全)。
+
 ## 导航模式
 
 单个键 `java.mode` 同时决定 jdtls 的工程根 (Eclipse workspace 的 `root_dir`) 在哪, 以及是否注入 Java 源码根。
@@ -396,35 +426,67 @@ AOSP 重新编译后:
 
 切换 jar 模式 (curated/all) 或修改 tag 优先级后, 建议清理 KLS 缓存: `rm -rf ~/.cache/kotlin-language-server`
 
-### c/cpp（clangd）接线
+### 拓展：如何查看 Android Native 代码（在 c/cpp 中跳转和自动补全）
 
-照常启用 clangd 插件（LazyVim 勾选 `lang.clangd` extra 即可），然后注入 AOSP 特化配置：
+插件会自动接线 clangd（见 [c/cpp（clangd）接线](#ccpp-clangd-接线)），并按 `compdb` → `cc_deps` → `bp` 三级链解析编译旗标。生成 compile_commands.json 是**可选**的：它能提供最精确的逐文件旗标；但只要树里有 `out/soong/module_bp_cc_deps.json`（普通编译即会产生），或文件旁边至少有 `Android.bp`，c/cpp 跳转和补全就已经可用。
 
-```lua
--- lua/plugins/lsp.lua
-return {
-  {
-    "neovim/nvim-lspconfig",
-    opts = function(_, opts)
-      opts.servers = opts.servers or {}
-      opts.servers.clangd =
-        require("aosp-nav").cpp.configure(opts.servers.clangd or {})
-    end,
-  },
+如需自行生成 `compdb` 档：
+
+1. 进入源码根目录，配置编译参数（和平时 make 前操作一样）
+
+```
+cd /path/to/android/  # 替换为你的 AOSP 根目录
+source build/envsetup.sh
+lunch <your_target>       # 例如: lunch aosp_arm64-eng
+```
+
+2. 重要，设置 SOONG_GEN_COMPDB=1
+
+```
+export SOONG_GEN_COMPDB=1
+# 可选：生成格式化（便于阅读）的 JSON 文件
+export SOONG_GEN_COMPDB_DEBUG=1
+# 可选：指定输出目录，$(pwd) 表示当前目录
+export SOONG_LINK_COMPDB_TO=$(pwd)
+```
+
+3. 执行编译，例如某个模块
+
+```
+mm
+# 或者编译整个 Android 项目
+# make -j8
+```
+
+文件通常生成在 `out/soong/development/ide/compdb/compile_commands.json`。插件会自动把 clangd 指向该目录，因此不再需要软链接。若还希望 clangd 自身的向上查找（或其它工具）能找到它，可在源码根目录下创建软链接：
+
+```
+cd /path/to/android/ # 替换为你的 AOSP 根目录
+ln -sf out/soong/development/ide/compdb/compile_commands.json .
+```
+
+然后用 nvim 打开你需要查看的 cpp 文件即可。
+
+**备注**
+
+可以将 `SOONG_GEN_COMPDB=1` 和可选的软链接封装为 make 的拓展函数放到 `~/.bashrc` 文件中：
+
+```
+function make_ex() {
+    SOONG_GEN_COMPDB=1 SOONG_GEN_COMPDB_DEBUG=1 make "$@"
+    if [ -f "out/soong/development/ide/compdb/compile_commands.json" ]; then
+        ln -sf out/soong/development/ide/compdb/compile_commands.json .
+        echo "compile_commands.json is created"
+    fi
 }
 ```
 
-无需手工准备 `compile_commands.json`。clangd 附着每个文件时，插件按三级链解析该文件的编译旗标（`:Aosp` 面板以 `cpp cdb: origin=...` 显示当前生效档）：
+想生成 compile_commands.json 时用 `make_ex` 替代 `make` 编译项目（lunch 照常使用）。
 
-| origin | 生效条件 | 工作方式 |
-| ------ | -------- | -------- |
-| `compdb` | `out/soong/development/ide/compdb/compile_commands.json` 存在 | clangd 直接指向该目录（原生消费，插件零介入） |
-| `cc_deps` | `out/soong/module_bp_cc_deps.json` 存在 | 该文件**普通编译即产生**（soong 的 `ccdeps_generator`，无需 `SOONG_GEN_COMPDB`）；插件按模块段提取旗标，写入插件缓存下自管的 `compile_commands.json` |
-| `bp` | 两者皆无 | 启发式兜底：nearest `Android.bp`（include 目录 / cflags）+ `header_libs` 限深 BFS + curated 框架头基线 |
-
-自管 CDB 位于 `~/.cache/nvim/aosp_nav/`，按实际打开的文件逐条增长——clangd 通过 `--compile-commands-dir` 接线，**树根不再需要软链接**。用户自己设的 `--compile-commands-dir` 永远优先。`:AospRescan` 会连带清掉 cpp 缓存。
-
-compdb 档（可选，逐文件旗标最精确）依旧可用老配方：编译前 `SOONG_GEN_COMPDB=1`，产物在 `out/soong/development/ide/compdb/compile_commands.json`——现在不再需要软链接。
+```
+source ~/.bashrc
+make_ex -j8               # 代替 make
+```
 
 ## License
 

@@ -63,7 +63,9 @@ end
 --- @param aosp string
 --- @param fname string|nil 触发文件 (bp 档的 nearest 检测需要; nil = 跳过该档)
 --- @return string origin "compdb"|"cc_deps"|"bp"|"none"
---- @return string|nil cdb_dir 传给 clangd 的目录 (origin=none 时 nil)
+--- @return string|nil cdb_dir 传给 clangd 的**目录** (origin=none 时 nil)
+--- 注意必须传目录: clangd 的 --compile-commands-dir 只接受目录 (传文件路径即使
+--- 存在也会被当死路径)。自管 CDB 的目录 = <cache>/<树键>/cpp。
 function M.detect_origin(aosp, fname)
   local compdb = aosp .. "/out/soong/development/ide/compdb/compile_commands.json"
   if vim.fn.filereadable(compdb) == 1 then
@@ -71,10 +73,10 @@ function M.detect_origin(aosp, fname)
   end
   local cdb = require("aosp-nav.cpp.cdb")
   if vim.fn.filereadable(aosp .. "/out/soong/module_bp_cc_deps.json") == 1 then
-    return "cc_deps", cdb.cdb_path(aosp)
+    return "cc_deps", cdb.cache_dir(aosp)
   end
   if fname and fname ~= "" and require("aosp-nav.cpp.bp").nearest_bp(fname, aosp) then
-    return "bp", cdb.cdb_path(aosp)
+    return "bp", cdb.cache_dir(aosp)
   end
   return "none", nil
 end
@@ -147,6 +149,20 @@ function M.configure(opts)
 
   -- cmd 注入: 用户已设 --compile-commands-dir 时尊重用户 (compdb/自管 CDB 都让位)
   if not has_cc_dir(opts.cmd) then
+    -- 自管 CDB (cc_deps/bp) 必须在 clangd 启动**之前**就位:
+    --   * clangd 启动时目录不存在 → --compile-commands-dir 被整体忽略, 回落到
+    --     内置 fallback (无任何 -I, StringPrintf 之类全部未解析);
+    --   * 启动后才写出的 compile_commands.json 不会被会话内重载 (实测 20s 内
+    --     仍走 fallback), 所以 LspAttach 里的异步 upsert 救不了第一个文件。
+    -- 这里同步组装当前触发文件的条目; 正常树一次 lookup ~0.2s (cc_deps 段行级
+    -- 流式扫描), bp 档首次可能触发全树 index 但有磁盘缓存。
+    if origin ~= "compdb" and cdb_dir then
+      vim.fn.mkdir(cdb_dir, "p")
+      local ok, err = pcall(M.ensure_entry, aosp, fname)
+      if not ok then
+        log.debug("cpp cdb prefill failed for " .. fname .. ": " .. tostring(err))
+      end
+    end
     local flag = "--compile-commands-dir=" .. cdb_dir
     if opts.cmd == nil then
       opts.cmd = { "clangd", flag }
@@ -215,7 +231,7 @@ function M.status(aosp)
     return {
       text = ("origin=%s, entries=%s"):format(origin, n or "?"),
       ok = true,
-      action = n == 0 and "open a .cpp/.h file to generate entries" or nil,
+      action = (n or 0) == 0 and "open a .cpp/.h file to generate entries" or nil,
     }
   end
   return {

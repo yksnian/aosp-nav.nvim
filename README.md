@@ -124,6 +124,36 @@ return {
 
 `configure` injects `init_options.storagePath`, disables the `documentHighlight` handler, extends `root_markers` (appending `.git`), and generates the `~/.config/kotlin-language-server/classpath` script.
 
+### c/cpp (clangd) wiring
+
+Enable a clangd plugin as usual (LazyVim: the `lang.clangd` extra), then inject the AOSP options:
+
+```lua
+-- lua/plugins/lsp.lua
+return {
+  {
+    "neovim/nvim-lspconfig",
+    opts = function(_, opts)
+      opts.servers = opts.servers or {}
+      opts.servers.clangd =
+        require("aosp-nav").cpp.configure(opts.servers.clangd or {})
+    end,
+  },
+}
+```
+
+No manual `compile_commands.json` needed. On every clangd attach the plugin resolves compile flags for the file via a three-tier chain (the `:Aosp` panel shows the active one as `cpp cdb: origin=...`):
+
+| origin | When | How it works |
+| ------ | ---- | ------------ |
+| `compdb` | `out/soong/development/ide/compdb/compile_commands.json` exists | clangd is pointed straight at that directory (native consumption, zero extra work) |
+| `cc_deps` | `out/soong/module_bp_cc_deps.json` exists | produced by **every ordinary build** (soong's `ccdeps_generator`, no `SOONG_GEN_COMPDB` needed); the plugin extracts the owning module's flags and writes entries into its own `compile_commands.json` under the plugin cache |
+| `bp` | neither exists | heuristic fallback: nearest `Android.bp` (include dirs / cflags) + bounded BFS over `header_libs` exports + a curated framework-header baseline |
+
+The self-managed CDB lives under `~/.cache/nvim/aosp_nav/` and grows one entry per file you actually open — clangd is wired with `--compile-commands-dir`, so no symlinks in the tree root. Your own `--compile-commands-dir` always wins. `:AospRescan` invalidates the cpp cache along with the jar cache.
+
+For the compdb tier (optional, most precise per-file flags) the old manual recipe still works: `SOONG_GEN_COMPDB=1` before the build puts the file at `out/soong/development/ide/compdb/compile_commands.json` — no symlink required anymore. See [Extending: browsing Android native code](#extending-browsing-android-native-code-navigation-and-completion-in-ccpp) for the full recipe.
+
 ## Navigation modes
 
 A single key, `java.mode`, decides where jdtls's project root is and whether the plugin injects Java source roots.
@@ -400,35 +430,67 @@ Check in order:
 
 After switching jar mode (curated/all) or changing the tag priority, clear the KLS cache: `rm -rf ~/.cache/kotlin-language-server`
 
-### c/cpp (clangd) wiring
+### Extending: browsing Android native code (navigation and completion in c/cpp)
 
-Enable a clangd plugin as usual (LazyVim: the `lang.clangd` extra), then inject the AOSP options:
+The plugin wires clangd automatically (see [c/cpp (clangd) wiring](#ccpp-clangd-wiring)) and resolves compile flags through the three-tier chain: `compdb` first, then `cc_deps`, then the `bp` heuristic fallback. Generating a compilation database is **optional** — it gives you the most precise per-file flags, but c/cpp navigation already works without it as long as the tree has `out/soong/module_bp_cc_deps.json` (produced by any ordinary build) or at least an `Android.bp` next to the file.
 
-```lua
--- lua/plugins/lsp.lua
-return {
-  {
-    "neovim/nvim-lspconfig",
-    opts = function(_, opts)
-      opts.servers = opts.servers or {}
-      opts.servers.clangd =
-        require("aosp-nav").cpp.configure(opts.servers.clangd or {})
-    end,
-  },
+To produce the `compdb` tier yourself:
+
+1. Enter the source root and set up the build environment (same as before a normal `make`)
+
+```
+cd /path/to/android/  # replace with your AOSP root
+source build/envsetup.sh
+lunch <your_target>       # e.g. lunch aosp_arm64-eng
+```
+
+2. Important — set SOONG_GEN_COMPDB=1
+
+```
+export SOONG_GEN_COMPDB=1
+# Optional: generate a pretty-printed (human-readable) JSON file
+export SOONG_GEN_COMPDB_DEBUG=1
+# Optional: specify the output directory; $(pwd) means the current directory
+export SOONG_LINK_COMPDB_TO=$(pwd)
+```
+
+3. Build, e.g. a single module
+
+```
+mm
+# Or build the whole project
+# make -j8
+```
+
+The file is usually generated at `out/soong/development/ide/compdb/compile_commands.json`. The plugin points clangd at that directory on its own, so no symlink is required. If you also want clangd's own upward search (or other tools) to find it, link it into the tree root:
+
+```
+cd /path/to/android/ # replace with your AOSP root
+ln -sf out/soong/development/ide/compdb/compile_commands.json .
+```
+
+Then open any cpp file in nvim.
+
+**Tip**
+
+You can wrap `SOONG_GEN_COMPDB=1` and the optional symlink into an extended `make` function in your `~/.bashrc`:
+
+```
+function make_ex() {
+    SOONG_GEN_COMPDB=1 SOONG_GEN_COMPDB_DEBUG=1 make "$@"
+    if [ -f "out/soong/development/ide/compdb/compile_commands.json" ]; then
+        ln -sf out/soong/development/ide/compdb/compile_commands.json .
+        echo "compile_commands.json is created"
+    fi
 }
 ```
 
-No manual `compile_commands.json` needed. On every clangd attach the plugin resolves compile flags for the file via a three-tier chain (the `:Aosp` panel shows the active one as `cpp cdb: origin=...`):
+Use `make_ex` instead of `make` when you want compile_commands.json generated (`lunch` stays the same).
 
-| origin | When | How it works |
-| ------ | ---- | ------------ |
-| `compdb` | `out/soong/development/ide/compdb/compile_commands.json` exists | clangd is pointed straight at that directory (native consumption, zero extra work) |
-| `cc_deps` | `out/soong/module_bp_cc_deps.json` exists | produced by **every ordinary build** (soong's `ccdeps_generator`, no `SOONG_GEN_COMPDB` needed); the plugin extracts the owning module's flags and writes entries into its own `compile_commands.json` under the plugin cache |
-| `bp` | neither exists | heuristic fallback: nearest `Android.bp` (include dirs / cflags) + bounded BFS over `header_libs` exports + a curated framework-header baseline |
-
-The self-managed CDB lives under `~/.cache/nvim/aosp_nav/` and grows one entry per file you actually open — clangd is wired with `--compile-commands-dir`, so no symlinks in the tree root. Your own `--compile-commands-dir` always wins. `:AospRescan` invalidates the cpp cache along with the jar cache.
-
-For the compdb tier (optional, most precise per-file flags) the old manual recipe still works: `SOONG_GEN_COMPDB=1` before the build puts the file at `out/soong/development/ide/compdb/compile_commands.json` — no symlink required anymore.
+```
+source ~/.bashrc
+make_ex -j8               # instead of make
+```
 
 ## License
 
