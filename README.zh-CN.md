@@ -45,7 +45,6 @@ Android cpp代码演示。![cpp_demo](https://github.com/user-attachments/assets
 ```lua
 {
   "yksnian/aosp-nav.nvim",
-  version = "*",  -- 跟踪最新稳定 tag (v1.1.0 起); 省略则跟踪 main 分支
   dependencies = "mfussenegger/nvim-jdtls",
   ft = "java",
 }

@@ -45,7 +45,6 @@ Android cpp demo:![cpp_demo](https://github.com/user-attachments/assets/8847ce0d
 ```lua
 {
   "yksnian/aosp-nav.nvim",
-  version = "*",  -- track the latest stable tag (since v1.1.0); omit to follow the main branch
   dependencies = "mfussenegger/nvim-jdtls",
   ft = "java",
 }
