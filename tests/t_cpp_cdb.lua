@@ -6,6 +6,8 @@
 --   * bp.parse / bp.lookup (Tier A): nearest bp + header_libs BFS + curated 基线
 --   * cdb: 增量 upsert (追加/替换/幂等) + meta origin 记账 + invalidate
 --   * configure: --compile-commands-dir 注入 (cmd nil/列表/用户已设 三态)
+--   * configure: root_dir 固定到 AOSP 根 (用户显式设置时不覆盖)
+--   * ensure_entry: 头文件短路 (不写 CDB 条目; 源文件采集链不受影响)
 --   * detect_origin / status: 四档 origin 判定与面板文案
 -- 执行级验证: 写出的 CDB 必须能被 vim.json.decode 还原, 且 -I 指向真实存在的目录。
 
@@ -461,6 +463,27 @@ do
     H.eq(pre_entries[1] and pre_entries[1].file, FOO, "configure: prefill entry is probe file")
   end
 
+  -- root_dir 策略内建于插件: AOSP 树内固定到树根, 用户显式设置时不覆盖
+  H.eq(type(opts.root_dir), "function", "configure: root_dir policy installed")
+  local pinned
+  opts.root_dir(0, function(d)
+    pinned = d
+  end)
+  H.eq(pinned, (TREE:gsub("/+$", "")), "configure: root_dir pinned to tree root")
+  local user_root = function() end
+  H.eq(
+    cpp.configure({ cmd = { "clangd" }, root_dir = user_root }).root_dir,
+    user_root,
+    "configure: user root_dir respected"
+  )
+
+  -- 头文件作为触发文件时, configure 的同步预填充同样不写条目
+  vim.fn.delete(cdb.cache_dir(TREE), "rf")
+  vim.api.nvim_buf_set_name(0, TREE .. "/system/core/include/cutils/log.h")
+  cpp.configure({ cmd = { "clangd" } })
+  H.check(vim.fn.filereadable(cdb.cdb_path(TREE)) == 0, "configure: header not prefilled")
+  vim.api.nvim_buf_set_name(0, FOO)
+
   -- 用户已设 --compile-commands-dir → 尊重用户
   local mine = "--compile-commands-dir=/my/own"
   local opts2 = cpp.configure({ cmd = { "clangd", mine } })
@@ -515,15 +538,34 @@ do
     end
   end
 
-  -- bp 兜底档 (cc_deps 撤掉后落到 bp; log.h 不在任何 srcs 里, 走纯 curated 基线)
+  -- bp 兜底档 (cc_deps 撤掉后落到 bp; 该文件不在任何 srcs 里, 走纯 curated 基线)
   vim.fn.delete(CCDEPS)
-  H.eq(
-    cpp.ensure_entry(TREE, TREE .. "/system/core/include/cutils/log.h"),
-    "bp",
-    "exec: bp fallback"
-  )
+  local FALLBACK_SRC = HELLO .. "/fallback_only.cpp"
+  wf(FALLBACK_SRC, { "// not listed in any Android.bp srcs" })
+  H.eq(cpp.ensure_entry(TREE, FALLBACK_SRC), "bp", "exec: bp fallback")
   local entries2 = vim.json.decode(table.concat(vim.fn.readfile(cdb.cdb_path(TREE)), "\n"))
   H.check(#entries2 == 2, "exec: cdb has both files after fallback")
+
+  -- 头文件短路: 不写 CDB 条目, 直接返回 nil。
+  -- 依据 = 头文件永远不在 srcs 里, cc_deps 全 miss 后 bp 会拿错模块的旗标
+  -- (真树实测 sys/stat.h 落到 libc_jemalloc_wrapper), 且这条 miss 链路对
+  -- 162MB module_bp_cc_deps.json 做 N 次全量扫描 (实测 50s+, 卡死主线程)。
+  -- clangd 对无条目的头文件会从包含它的 TU 推断旗标, 是正确用法。
+  local n_before = #entries2
+  for _, h in ipairs({
+    TREE .. "/system/core/include/cutils/log.h",
+    HEADERS .. "/include/foo.h",
+    HELLO .. "/src.hpp",
+    HELLO .. "/src.hh",
+    HELLO .. "/src.hxx",
+  }) do
+    H.eq(cpp.ensure_entry(TREE, h), nil, "exec: header skipped (" .. h:gsub(".*/", "") .. ")")
+  end
+  local entries_header = vim.json.decode(table.concat(vim.fn.readfile(cdb.cdb_path(TREE)), "\n"))
+  H.eq(#entries_header, n_before, "exec: header adds no cdb entry")
+
+  -- 非 C 族文件本来就不接管 (回归保护)
+  H.eq(cpp.ensure_entry(TREE, HELLO .. "/README.md"), nil, "exec: non-cpp untouched")
 
   -- compdb 档: ensure_entry 是 no-op (clangd 原生消费, 不写条目)。
   -- 前置 = configure 已记账 origin=compdb (真实流程里 configure 在场时就会记)。

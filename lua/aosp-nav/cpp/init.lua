@@ -27,6 +27,26 @@ local CPP_EXT = {
   hxx = true,
 }
 
+-- 翻译单元后缀 (CPP_EXT 去掉头文件): 只有源文件才进 CDB
+local SRC_EXT = {
+  c = true,
+  cc = true,
+  cpp = true,
+  cxx = true,
+  ["c++"] = true,
+}
+
+-- clangd 的默认 root 标记 (lspconfig clangd 同款); 仅在 AOSP 树外回落使用
+local ROOT_MARKERS = {
+  ".clangd",
+  ".clang-tidy",
+  ".clang-format",
+  "compile_commands.json",
+  "compile_flags.txt",
+  "configure.ac",
+  ".git",
+}
+
 local function get_cfg()
   return require("aosp-nav").config
 end
@@ -35,6 +55,13 @@ end
 --- @return boolean
 local function is_cpp_file(fname)
   return CPP_EXT[fname:match("%.([%w+]+)$") or ""] == true
+end
+
+--- 是否翻译单元源文件 (头文件不算)
+--- @param fname string
+--- @return boolean
+local function is_cpp_source(fname)
+  return SRC_EXT[fname:match("%.([%w+]+)$") or ""] == true
 end
 
 --- cpp 版 probe_file (§2.8 同一精神: 起点文件与其它模块同源):
@@ -95,13 +122,25 @@ local function has_cc_dir(cmd)
   return false
 end
 
---- 给一个 C 族源文件组装/更新 CDB 条目 (LspAttach 与测试共用入口)。
+--- 给一个 C 族**源文件**组装/更新 CDB 条目 (LspAttach 与测试共用入口)。
 --- compdb 树是 clangd 原生消费, 本函数直接返回; cc_deps 树 miss 时落到 bp。
+---
+--- 头文件不写条目 (直接返回 nil):
+---   * 正确性: 头文件不会出现在任何模块的 srcs 里, cc_deps 档必然全 miss 落到 bp,
+---     而 bp 档给的是"最近 Android.bp 里第一个模块"的旗标 —— 实测
+---     bionic/libc/include/sys/stat.h 被写成 libc_jemalloc_wrapper 的旗标
+---     (裸 clang++、无 --target、无 -nostdlibinc), 解析目标/系统头全是错的;
+---   * 性能: 这条 miss 链路要对 nearest Android.bp 的每个候选模块做一次
+---     module_bp_cc_deps.json (真树 162MB) 全量行扫描, 实测 sys/stat.h
+---     ccdeps.lookup 50.7s / ensure_entry 59.3s, 而它跑在 LspAttach 的
+---     vim.schedule 回调里 = 主线程, 跳转头文件后整个 UI 冻住约 41s。
+---   clangd 对没有 CDB 条目的头文件本来就会从索引里"包含它的 TU"推断旗标,
+---   这才是 clangd 推荐用法, 也天然拿到正确的 --target/系统头。
 --- @param aosp string
 --- @param fname string 源文件绝对路径
 --- @return string|nil origin 实际采用的来源 (nil = 没有可用信息)
 function M.ensure_entry(aosp, fname)
-  if not is_cpp_file(fname) then
+  if not is_cpp_file(fname) or not is_cpp_source(fname) then
     return nil
   end
   local cdb = require("aosp-nav.cpp.cdb")
@@ -173,6 +212,23 @@ function M.configure(opts)
     end
   end
 
+  -- 工作区根固定到 AOSP 根 (用户显式设了 root_dir 就不碰):
+  --   默认按就近的 .git/compile_commands.json 取根, 于是从 system/netd 跳到
+  --   bionic/libc/include/sys/stat.h 会**另起一台 clangd** —— 真树实测同一次
+  --   会话 1→2 台, 历史日志 32 次启动、c++23 标准库被重复索引 5 次, 每台
+  --   各自建 preamble/索引。整棵树共用一台: 一份索引、一次标准库索引,
+  --   跨仓库跳转不再拉起新进程。树外文件仍走 lspconfig clangd 的默认语义。
+  if opts.root_dir == nil then
+    opts.root_dir = function(bufnr, on_dir)
+      local f = vim.api.nvim_buf_get_name(bufnr or 0)
+      local root = require("aosp-nav.java.root").aosp_root(f)
+      if root then
+        return on_dir(root)
+      end
+      on_dir(vim.fs.root(f, ROOT_MARKERS) or vim.fs.dirname(f))
+    end
+  end
+
   -- LspAttach: clangd 附着后按需组装该文件的 CDB 条目 (cc_deps/bp 两档;
   -- schedule 异步执行, 批量 grep 不卡附着; per-file 去重防重复扫描)
   do
@@ -186,7 +242,8 @@ function M.configure(opts)
           return
         end
         local f = vim.api.nvim_buf_get_name(args.buf)
-        if not is_cpp_file(f) or inflight[f] then
+        -- 头文件不采集 (见 ensure_entry 注释): 连 schedule 都不进
+        if not is_cpp_source(f) or inflight[f] then
           return
         end
         local r = require("aosp-nav.java.root").aosp_root(f)
