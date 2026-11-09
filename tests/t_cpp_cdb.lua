@@ -494,6 +494,44 @@ do
   local opts3 = cpp.configure(nil)
   H.eq(opts3.cmd[1], "clangd", "configure: nil cmd gets clangd")
 
+  -- 树内 clangd 查找 (PATH 没有时的兜底): 多版本命中取 clang-r 最大者
+  local CLANG_R1 = TREE .. "/prebuilts/clang/host/linux-x86/clang-r487739/bin"
+  local CLANG_R2 = TREE .. "/prebuilts/clang/host/linux-x86/clang-r522817/bin"
+  mkdir(CLANG_R1)
+  mkdir(CLANG_R2)
+  wf(CLANG_R1 .. "/clangd", { "#!/bin/sh" })
+  wf(CLANG_R2 .. "/clangd", { "#!/bin/sh" })
+  H.eq(cpp.find_tree_clangd(TREE), CLANG_R2 .. "/clangd", "find_tree_clangd: picks highest clang-r")
+  vim.fn.delete(TREE .. "/prebuilts/clang/host/linux-x86", "rf")
+  H.eq(cpp.find_tree_clangd(TREE), nil, "find_tree_clangd: none in tree")
+
+  -- configure 二进制解析: PATH 无 clangd 时回落树内 prebuilts; 树内也无则告警
+  if vim.fn.executable("clangd") == 0 then
+    mkdir(CLANG_R2)
+    wf(CLANG_R2 .. "/clangd", { "#!/bin/sh" })
+    local opts5 = cpp.configure(nil)
+    H.check(opts5.cmd[1] == CLANG_R2 .. "/clangd", "configure: tree clangd used when PATH has none")
+    -- 用户自带 --compile-commands-dir 时裸名同样要换 (替换与注入相互独立)
+    local opts6 = cpp.configure({ cmd = { "clangd", mine } })
+    H.check(opts6.cmd[1] == CLANG_R2 .. "/clangd", "configure: tree clangd replaces bare name")
+    H.eq(opts6.cmd[2], mine, "configure: user cc_dir untouched by binary swap")
+    vim.fn.delete(TREE .. "/prebuilts/clang/host/linux-x86", "rf")
+    require("aosp-nav.util.log").reset()
+    local notes = H.capture_notify(function()
+      cpp.configure(nil)
+    end)
+    local hit = false
+    for _, n in ipairs(notes) do
+      if tostring(n.msg):find("clangd not on PATH", 1, true) ~= nil then
+        hit = true
+      end
+    end
+    H.check(hit, "configure: warns when clangd is nowhere")
+  else
+    local opts5 = cpp.configure(nil)
+    H.eq(opts5.cmd[1], "clangd", "configure: PATH clangd kept as-is")
+  end
+
   -- 非 cpp buffer → 原样返回
   vim.api.nvim_buf_set_name(0, "/somewhere/README.md")
   local opts4 = cpp.configure({ cmd = { "clangd" } })

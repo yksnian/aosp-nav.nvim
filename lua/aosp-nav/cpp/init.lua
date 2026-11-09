@@ -122,6 +122,27 @@ local function has_cc_dir(cmd)
   return false
 end
 
+--- 在 AOSP 树内查找 clangd (PATH 上没有时的兜底; AOSP 工具链自带 clangd)。
+--- 范围 = <aosp>/prebuilts/clang/host/linux-x86/clang-*/bin/clangd;
+--- 多版本命中取 clang-r<版本号> 最大者 (数字比较, 无版本号的目录按字典序)。
+--- @param aosp string AOSP 根
+--- @return string|nil clangd 绝对路径; 没有则 nil
+function M.find_tree_clangd(aosp)
+  local hits = vim.fn.glob(aosp .. "/prebuilts/clang/host/linux-x86/*/bin/clangd", false, true)
+  if #hits == 0 then
+    return nil
+  end
+  table.sort(hits, function(x, y)
+    local vx = x:match("clang%-r?(%d+)/")
+    local vy = y:match("clang%-r?(%d+)/")
+    if vx and vy then
+      return tonumber(vx) < tonumber(vy)
+    end
+    return x < y
+  end)
+  return hits[#hits]
+end
+
 --- 给一个 C 族**源文件**组装/更新 CDB 条目 (LspAttach 与测试共用入口)。
 --- compdb 树是 clangd 原生消费, 本函数直接返回; cc_deps 树 miss 时落到 bp。
 ---
@@ -186,6 +207,34 @@ function M.configure(opts)
   end
   require("aosp-nav.cpp.cdb").set_origin(aosp, origin)
 
+  -- 二进制解析: 插件即将以裸名 "clangd" 启动而 PATH 上没有时, 先找树内
+  -- prebuilts 自带的 clangd; 都没有则告警提示配置。用户自定义二进制不碰
+  -- (opts.cmd 是字符串或 cmd[1] 非裸名一律视为已配置)。
+  local clangd_bin = "clangd"
+  local bare = opts.cmd == nil or (type(opts.cmd) == "table" and opts.cmd[1] == "clangd")
+  if bare and vim.fn.executable("clangd") ~= 1 then
+    local found = M.find_tree_clangd(aosp)
+    if found then
+      clangd_bin = found
+      log.info(
+        "using clangd from AOSP tree: " .. found,
+        { once = true, id = "cpp_clangd_tree:" .. aosp }
+      )
+    else
+      log.warn(
+        ("clangd not on PATH and none under %s/prebuilts/clang/host/linux-x86/; set lspconfig opts.servers.clangd.cmd to the clangd binary"):format(
+          aosp
+        ),
+        { once = true, id = "cpp_clangd_missing:" .. aosp }
+      )
+    end
+  end
+  -- 裸名替换与 --compile-commands-dir 注入相互独立: 用户自带 cc_dir 时
+  -- (has_cc_dir=true, 下方注入整段跳过) 二进制照样要换成树内路径。
+  if clangd_bin ~= "clangd" and type(opts.cmd) == "table" and opts.cmd[1] == "clangd" then
+    opts.cmd[1] = clangd_bin
+  end
+
   -- cmd 注入: 用户已设 --compile-commands-dir 时尊重用户 (compdb/自管 CDB 都让位)
   if not has_cc_dir(opts.cmd) then
     -- 自管 CDB (cc_deps/bp) 必须在 clangd 启动**之前**就位:
@@ -204,7 +253,7 @@ function M.configure(opts)
     end
     local flag = "--compile-commands-dir=" .. cdb_dir
     if opts.cmd == nil then
-      opts.cmd = { "clangd", flag }
+      opts.cmd = { clangd_bin, flag }
     elseif type(opts.cmd) == "table" then
       opts.cmd[#opts.cmd + 1] = flag
     else
