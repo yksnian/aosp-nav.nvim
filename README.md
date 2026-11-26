@@ -1,495 +1,217 @@
 # aosp-nav.nvim
 
-English | [简体中文](README.zh-CN.md)
+[![CI](https://img.shields.io/badge/CI-lua_tests-blue.svg)](.github/workflows/ci.yml)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-Neovim plugin for reading and editing Android (AOSP) source code.
-Just need a full compiled Android source tree(out/soong/.intermediates present).
+Source navigation for Android (AOSP) in **Neovim / LazyVim**: go-to-definition, completion and references across all Java and Kotlin modules (`frameworks/base`, `packages/modules/*`, system_server services), plus C/C++ via clangd. You supply config values; the plugin wires up jdt.ls, clangd and the Kotlin language server for your tree.
 
-Normally, with jdtls / kotlin-language-server set up in Neovim, opening an Android project only lets you jump to and complete symbols within the project's own Java/Kotlin files and the JDK. As soon as an Android framework class is involved, you get "no definition".
+The Neovim counterpart of [aosp-nav-vscode](https://github.com/yksnian/aosp-nav-vscode): same jar-selection rules, interoperable Kotlin classpath channel.
 
-This plugin leverages jdtls, kotlin-language-server and clangd to support go-to-definition and completion for Android framework/native code (Java/Kotlin/cpp):
+## How it works
 
-- **Java**: Android-specific jdtls configuration — completion and navigation across all Java modules
-- **Kotlin**: AOSP classpath configuration for kotlin-language-server (KLS) — Kotlin code can jump to framework Java sources
-- **c/cpp**: navigation and completion rely on clangd plus the Android build environment configuration
+AOSP is not a Gradle/Maven project: a bare jdt.ls sees only the file you opened, while build output holds 10,000+ jars containing every symbol. Feeding all of them in breaks navigation (duplicate classes, stub jars hijacking symbols, an index that never finishes). aosp-nav:
 
-## Demo
+1. **Detect** — opening a `.java`/`.kt` file in an AOSP checkout finds the tree root (`build/envsetup.sh` + `build/soong`, or `.repo`). Silent until then.
+2. **Select** — compute the selected modules' dependency closure from `out/soong/module_bp_java_deps.json`: hundreds of jars, not the whole build tree.
+3. **Inject** — jdt.ls receives `referencedLibraries`, import switches and `sourcePaths` at start and live afterwards (no restart in the normal path). Source roots make `gd` land in real `.java` files instead of decompiled jars. On Java buffers the plugin also removes jdt.ls's broken `foldingRange` capability to stop cosmetic `-32603` folding/highlight errors (other clients and filetypes keep folding).
+4. **Cache** — persist the jar list and invalidate it on rebuilds/config changes; later opens are fast.
 
-Android Java go-to-definition:![2026-09-01-10-04-53](https://github.com/user-attachments/assets/3a9ed67a-55fc-41e3-aca6-41554897a619)
+## Requirements
 
-Android Java completion:![2026-09-01-10-05-58](https://github.com/user-attachments/assets/d64d173f-4483-44dd-bd6c-3fbda535d5e6)
+- Neovim ≥ 0.9; ≥ 0.11 enables clangd's native `cmd` hook (older versions use `on_new_config`)
+- A jdt.ls client: [nvim-jdtls](https://github.com/mfussenegger/nvim-jdtls) (LazyVim's java extra) or any setup starting jdt.ls with `name = "jdtls"`
+- Optional C/C++: clangd via [nvim-lspconfig](https://github.com/neovim/nvim-lspconfig) — the checkout's prebuilt clangd wins, one on `PATH` is fallback
+- Optional Kotlin: on by default — see [Kotlin support](#kotlin-support)
+- A **compiled** AOSP tree (`out/soong/.intermediates` present)
 
-Android cpp demo:![cpp_demo](https://github.com/user-attachments/assets/8847ce0d-df1c-43b6-af34-2efd76b1e659)
+The plugin never sets JVM heap or vmargs. For a large tree, add `-Xmx8g` in your own jdtls config.
 
-## Features
+## Install & wiring (LazyVim)
 
-- **Automatic android_root detection** for multi-checkout workspace layouts
-- **Workspace root = AOSP root**: the whole tree shares a single jdtls index, so cross-module navigation needs no manual markers — see [Navigation modes](#navigation-modes)
-- **Soong intermediates jar loading**: dependency jars are discovered under `out/soong/.intermediates/` automatically
-- **File-based caching** under `~/.cache/nvim/aosp_nav/`; refresh everything with `:AospRescan`
-- **Cross-module go-to-definition lands in real `.java` sources**: a preset core set of source roots is injected from the very first import, so jumps to framework classes open editable sources instead of a read-only decompiled view
-- **AOSP compatibility fixes** applied automatically (foldingRange, Gradle/Maven import, inlay hints)
-- **Kotlin (kotlin-language-server) support**: jump from Kotlin to framework Java sources
-
-## Installation
-
-### Requirements
-
-- Neovim >= 0.10
-- [mfussenegger/nvim-jdtls](https://github.com/mfussenegger/nvim-jdtls)
-- [fwcd/kotlin-language-server](https://github.com/fwcd/kotlin-language-server) >= 1.3.13 (for Kotlin support; installable via mason)
-- `fd` (recommended, 3-10x faster scans) or `find` (fallback)
-
-### lazy.nvim
+**Add** `lua/plugins/aosp-nav.lua`:
 
 ```lua
-{
-  "yksnian/aosp-nav.nvim",
-  dependencies = "mfussenegger/nvim-jdtls",
-  ft = "java",
+-- lua/plugins/aosp-nav.lua
+return {
+  {
+    "yksnian/aosp-nav.nvim",
+    opts = {},                     -- configuration only; defaults live in the plugin
+    -- Thin wiring: all hooks and workarounds are implemented in the plugin.
+    -- `require` stays inside each callback because lazy.nvim parses spec
+    -- files before the plugin directory enters the runtime path.
+    specs = {
+      { "mfussenegger/nvim-jdtls", optional = true,
+        opts = function(_, opts) require("aosp-nav").jdtls_opts(opts) end },
+      { "neovim/nvim-lspconfig", optional = true,
+        opts = function(_, opts) require("aosp-nav").lspconfig_opts(opts) end },
+      { "nvimtools/none-ls.nvim", optional = true,
+        opts = function(_, opts) require("aosp-nav").none_ls_opts(opts) end },
+      { "nvim-lualine/lualine.nvim", optional = true,
+        opts = function() require("aosp-nav.status").setup_lualine() end },
+    },
+  },
 }
 ```
+
+`opts` holds values only; the plugin owns every hook and workaround (clangd native/legacy hooks, KLS init options, ktlint timeout, Eclipse guard, inlay-hint crash). Helpers patch only servers/sources you already configured: they never enable or Mason-install anything, respect `false` / `enabled = false`, and wrap a user clangd `cmd` function instead of discarding it. `require("aosp-nav").specs()` returns these same wrappers, but only call it where the module is already loadable — never at the top of a spec file.
+
+If you previously installed from a local `dir` path, remove that entry and run `:Lazy clean` once after switching to the repository form.
+
+Open a `.java` file in the tree: the statusline shows `AOSP:<n>` once the classpath is in (`<n>` is the jar count, e.g. `AOSP:774`). The first scan takes seconds; the first jdt.ls index of a large tree takes a while, once, with high CPU.
+
+### Wiring in a non-lazy setup
+
+`opts = {}` above is what makes lazy.nvim call `setup()` and apply the four helper wrappers. Without lazy.nvim, call `setup()` yourself and use the same helpers on the config tables you already pass to each server:
+
+```lua
+local aosp_nav = require("aosp-nav")
+aosp_nav.setup({})                                    -- once, before any LSP starts
+
+-- jdt.ls: merge the AOSP fragment into the config you hand to start_or_attach.
+-- Use jdtls_opts (not just jdtls_settings): it also pins root_dir to the
+-- window scope and injects start-only import exclusions before initialize.
+local config = ...                                    -- your jdtls config
+aosp_nav.jdtls_opts(config)
+require("jdtls").start_or_attach(config)
+
+-- lspconfig-style setups: mutate the opts table in place. This wires both
+-- clangd paths (native `cmd` on nvim >= 0.11 and legacy on_new_config) plus
+-- the KLS storagePath fix; it only touches servers you already configured.
+aosp_nav.lspconfig_opts(lspconfig_opts)               -- your lspconfig opts table
+aosp_nav.none_ls_opts(none_ls_opts)                   -- your none-ls opts table
+```
+
+`require("aosp-nav").specs()` returns the same four wrappers if you need them programmatically; do not call it at the top of a lazy spec file (the module is not on `package.path` yet). Skipping all wiring still works: the plugin pushes settings to a *running* jdt.ls and rewrites the clangd CDB — you only lose first-start convenience.
 
 ## Configuration
 
-Call `setup()` before your jdtls configuration, then inject the AOSP-specific options with `configure`:
-
-```lua
--- lua/plugins/jdtls.lua
-require("aosp-nav").setup()
-
-return {
-  {
-    "mfussenegger/nvim-jdtls",
-    dependencies = "yksnian/aosp-nav.nvim",
-    ft = "java",
-    opts = function(_, opts)
-      -- Your jdtls config (cmd, root_dir, on_attach, ...)
-      -- JVM args MUST use the --jvm-arg= prefix; a bare -Xmx8G is silently ignored.
-      opts.cmd = {
-        "jdtls",
-        "--jvm-arg=-Xmx8G",
-        "--jvm-arg=-Xms2G",
-      }
-      -- No root_dir of your own: configure() takes over (AOSP tree -> AOSP root,
-      -- outside it your own root_dir / root_markers semantics are preserved)
-
-      -- Inject AOSP-specific config (jars, foldingRange, gradle, import.exclusions, ...)
-      return require("aosp-nav").java.configure(opts)
-    end,
-  },
-}
-```
-
-### Custom options
+Seven keys; everything derivable from the tree is derived (AOSP root, window scope, module selection, Java autobuild, prebuilt clangd, ktlsp bootstrap, process cleanup, clangd restart debounce).
 
 ```lua
 require("aosp-nav").setup({
-  cache_dir = "~/.cache/nvim/aosp_nav",
-  log_level = "warn",  -- "debug" | "info" | "warn" | "error" | "off"
-  java = {
-    jar_fallback_dir = "~/.usr/android_jars",
-    mode = "project",  -- "project" (default) | "aosp" | "infer" (not recommended); see "Navigation modes"
-    core_source_roots = {
-      "frameworks/base/core/java",
-      "frameworks/base/services/core/java",
-    },
-    source_paths_max_projects = 8,  -- LRU bound on accumulated projects (0 = unlimited)
-    source_root_exclude = { "^external/cronet/" },
-    exclude_paths = { "linux_glibc_common" },  -- do NOT add "android_common_apex"; see the Options table
-    disable_folding_range = true,
-    inlay_hints_mode = "auto",  -- "auto" | "off" | "all"
+  enabled = true,
+  android_root = nil,           -- explicit root; auto-detected per file when nil
+  exclude = {
+    jars = {},                  -- regex on jar file name AND module name
+    paths = {},                 -- substring on the path relative to .intermediates/
+    globs = {},                 -- regex on the same relative path
   },
+  source_roots = {},            -- hand-written source-root additions (root-relative or absolute)
+  kotlin = { enabled = true },  -- on by default; set false to disable
+  cpp = { enabled = true },     -- clangd / CDB integration
+  log_level = "info",
 })
 ```
 
-### Kotlin (kotlin-language-server) wiring
+Your exclusions are **added to** the built-in rules (all known stub families) — there is no replace mode; dropping the defaults silently breaks navigation.
 
-Inject the KLS options in your lspconfig opts (LazyVim example):
+Module selection is per-checkout state written by `:AospModules` (`state.json` in `stdpath("cache")/aosp-nav/aosp-<djb2(root)>/`), not configuration.
 
-```lua
--- lua/plugins/lsp.lua
-return {
-  {
-    "neovim/nvim-lspconfig",
-    opts = function(_, opts)
-      opts.servers = opts.servers or {}
-      opts.servers.kotlin_language_server =
-        require("aosp-nav").kotlin.configure(opts.servers.kotlin_language_server or {})
-    end,
-  },
-}
-```
+**Java autobuild** is derived, not configurable: off for the root window or when more than 100 sourcePaths are injected; on elsewhere. The decision is sent only when jdt.ls starts; live sourcePath pushes never toggle it. `:Aosp` shows the reason.
 
-`configure` injects `init_options.storagePath`, disables the `documentHighlight` handler, extends `root_markers` (appending `.git`), and generates the `~/.config/kotlin-language-server/classpath` script.
+### Java source roots (sourcePaths)
 
-### c/cpp (clangd) wiring
+By default cross-module `gd` lands in the decompiled `jdt://` view of an injected jar. Source roots put real `.java` files first, so the same jump lands in editable source. Coverage is deliberately partial:
 
-Enable a clangd plugin as usual (LazyVim: the `lang.clangd` extra), then inject the AOSP options:
-
-```lua
--- lua/plugins/lsp.lua
-return {
-  {
-    "neovim/nvim-lspconfig",
-    opts = function(_, opts)
-      opts.servers = opts.servers or {}
-      opts.servers.clangd =
-        require("aosp-nav").cpp.configure(opts.servers.clangd or {})
-    end,
-  },
-}
-```
-
-No manual `compile_commands.json` needed. On every clangd attach the plugin resolves compile flags for the file via a three-tier chain (the `:Aosp` panel shows the active one as `cpp cdb: origin=...`):
-
-| origin | When | How it works |
-| ------ | ---- | ------------ |
-| `compdb` | `out/soong/development/ide/compdb/compile_commands.json` exists | clangd is pointed straight at that directory (native consumption, zero extra work) |
-| `cc_deps` | `out/soong/module_bp_cc_deps.json` exists | produced by **every ordinary build** (soong's `ccdeps_generator`, no `SOONG_GEN_COMPDB` needed); the plugin extracts the owning module's flags and writes entries into its own `compile_commands.json` under the plugin cache |
-| `bp` | neither exists | heuristic fallback: nearest `Android.bp` (include dirs / cflags) + bounded BFS over `header_libs` exports + a curated framework-header baseline |
-
-The self-managed CDB lives under `~/.cache/nvim/aosp_nav/` and grows one entry per file you actually open — clangd is wired with `--compile-commands-dir`, so no symlinks in the tree root. Your own `--compile-commands-dir` always wins. `:AospRescan` invalidates the cpp cache along with the jar cache.
-
-For the compdb tier (optional, most precise per-file flags) the old manual recipe still works: `SOONG_GEN_COMPDB=1` before the build puts the file at `out/soong/development/ide/compdb/compile_commands.json` — no symlink required anymore. See [Extending: browsing Android native code](#extending-browsing-android-native-code-navigation-and-completion-in-ccpp) for the full recipe.
-
-## Navigation modes
-
-A single key, `java.mode`, decides where jdtls's project root is and whether the plugin injects Java source roots.
-
-| `java.mode` | Workspace root | Source paths | What you get | Switching project |
-| ----------- | -------------- | ------------ | ------------ | ----------------- |
-| `project` (default) | the project dir your current file belongs to | that project's own source roots | only this module gets indexed — jumps inside it hit real `.java`, everything else opens jars | starts another jdtls for the new project |
-| `aosp` | the AOSP root | a preset core set + roots of every project you've opened | one shared index for the whole tree; cross-module jumps land in real sources | nothing to switch |
-| `infer` (not recommended) | the AOSP root | nothing — jdt.ls guesses a source root per file on first open | the plugin steps back completely; but AOSP's directory layout usually makes it guess wrong, so jumps still fall back to jars | nothing to switch |
-
-Both keep their index on disk; they differ in **scope**. `project` indexes one module at a time — the first import is cheap, and each project runs its own jdtls instance (idle ones are closed for you when a new project starts). `aosp` indexes the whole tree in one instance, so you can jump across modules into real sources. Mostly stay inside one module and want it ready fast? Pick `project`. Hop between modules all day? Pick `aosp`.
-
-`project` does inject source paths — just the roots of the project you're in, so classes you haven't opened yet still resolve to real sources instead of jars. Starting a project's jdtls takes about a minute the first time; after that it reuses the cached index and is ready in seconds (the panel shows `importing...` while it works). Moving between files in the same project costs nothing.
-
-**When `aosp` is worth it**: you hop between modules constantly and want jumps to real sources everywhere, and you can afford one heavy import. That's the trade-off — the first import covers the whole tree (it can easily take ten-plus minutes on a big tree), everything lives in one JVM that needs a large heap (8G+), and when a new module's roots get added at runtime, each one rebuilds the whole classpath (automatic, debounced) and then needs a reorder pass to move in front of the jars (also automatic, takes a dozen seconds or so, memory-hungry — it waits for a low-memory moment). None of this is manual work, but it's why `project` is the default: most days you live inside one or two modules, and per-project instances just behave better.
-
-`infer` is only there if you want jdt.ls to do everything by itself, or to compare against the plugin-managed modes. On real AOSP trees it usually loses to both.
-
-The old `java.workspace_mode` / `java.source_paths_mode` keys are gone — use `java.mode`.
-
-Two related rules:
-
-- **`android_root` wins**: set it explicitly, and any file under it is treated as being in that AOSP root (which is also the workspace root unless `mode = "project"`).
-- **Outside an AOSP tree nothing changes**: your own `root_dir` config applies as usual.
+- root window with no explicit selection: `frameworks/base/core/java` + `frameworks/base/services/core` as **source roots only**;
+- the **jar list** of a root window is still the full tree scan (minus jars of modules whose source roots were injected) — mainline implementation jars such as `framework-wifi.jar` stay on the classpath regardless of your source-root pick, so a Wifi class still resolves;
+- a subtree scope (e.g. `packages/modules/Connectivity`) auto-selects its production modules;
+- `:AospModules` picks modules yourself (saved **per window scope**); `source_roots` adds hand-written roots. Unpicked modules keep jar navigation but no source navigation.
 
 ## Commands
 
-For projects that have already been built, simply open a Java file — the plugin takes care of jar loading automatically.
+| Command | Description |
+| --- | --- |
+| `:Aosp` | Self-check panel (General / Java / Kotlin / C/C++). Keys: `e` fix Eclipse metadata, `m` modules, `r` rescan, `L` log, `<Tab>` expand row details, `q` close |
+| `:AospRescan[!]` | Drop the jar cache and rescan (also re-runs the Eclipse guard). `!` also restarts jdt.ls to re-apply start-time settings |
+| `:AospModules` | Pick source-root modules: `<Space>` toggle, `/` filter, `Tab` expand nested, `r` back to auto, `<CR>` accept (no-op if unchanged), `q`/`<Esc>` cancel |
+| `:AospReset` | Remove everything the plugin wrote: clear global state and the Kotlin dispatch script, sweep **all** `aosp-<hash>/` cache folders (including deleted checkouts), and report counts |
 
-For unbuilt projects — e.g. you have multiple Android checkouts, some built and some not — use `:AospCollectJars` to export the common jars from a built checkout for the unbuilt ones.
+## Window scope: root vs subdirectory
 
-| Command | What it does |
-| ------- | ------------ |
-| `:Aosp` | Open the info panel (session status + diagnostics + injected source roots, merged into one scratch buffer) |
-| `:Aosp!` | Force-apply every accumulated source root (`java.mode = "aosp"` only — nothing accumulates in the other modes) |
-| `:AospDebug` (or `!`) | Live GC / heap / threads of the running jdtls, read from the JVM itself (`:AospDebug!` also writes a thread dump) |
-| `:AospRescan [dir]` | Invalidate the jar cache, rescan, and refresh `import.exclusions` |
-| `:AospCleanWorkspace` (or `!`) | Delete the jdtls/Eclipse workspace dir so it re-imports (destructive; `:AospCleanWorkspace!` skips the confirmation) |
-| `:AospCollectJars` | Collect AOSP jars into the fallback dir |
+Neovim has no workspace folders, so the plugin derives an **effective window scope** and pins it at the first AOSP signal of each checkout for the whole nvim session:
 
-### :Aosp
+- cwd strictly inside the tree → that directory, clamped to its nearest enclosing git project root (starting in `frameworks/base/core/java` scopes to `frameworks/base`);
+- cwd == tree top → root window (the whole tree);
+- cwd outside the tree (or unknown) → nearest git project root of the first active AOSP file;
+- no signal → root window.
 
-One panel with two sections:
+The pin is per AOSP root. Crossing into another subtree later changes nothing — no re-plan, no prompt, no second jdt.ls; `root_dir` is the pinned scope. To work elsewhere, restart nvim there or `:cd` into it before the first AOSP file is focused. There is one jdt.ls JVM per checkout/workspace.
 
-- **diagnostics** — a checklist, each row marked `v`/`!` with a suggested next action: plugin version / jdtls clients and their root_dir / `referencedLibraries` count / whether `java.project.sourcePaths` was injected (expected in both modes; the row is a failure if it is missing) / `java.import.exclusions` count / gradle+maven disabled / AOSP root and workspace root with the active mode / session phase / jar cache freshness / stale Eclipse blockers / jdtls workspace directory and the "jdtls index" row / Kotlin script ownership and KLS client count / whether a foreign jdtls shares the same `-data` and who owns it (`nvim <pid>`, or an orphan) / the live `jdtls contract` verdict (an internal-consistency check against the running jdt.ls: the invisible-project naming and the `addToSourcePath` replies — a mismatch here means jdt.ls changed an implementation detail this plugin relies on). **The JVM `-Xmx` check is not here** — it moved to `:AospDebug` (below), which reads the live process instead of the launch command.
-- **source roots** — every source root currently injected into `java.project.sourcePaths`: the configured core set (with an `x` marking entries that exist on disk), and for each accumulated project its roots in LRU order. Useful when navigation lands in an unexpected implementation of a duplicated class.
+**Normal `:q` sends no signal to jdt.ls.** Neovim's LSP shutdown is when Eclipse flushes a clean workspace snapshot, and racing that save with SIGTERM previously left `.metadata` dirty (≈95 s recovery on the next open). After an abnormal exit (`:qa!`, crash), the next start reclaims orphan JVMs indexing the same workspace: SIGTERM, wait up to ~8 s, then start fresh — never SIGKILL, which corrupts `.metadata`. A JVM with a live editor (nvim/lvim) in its parent chain is never touched.
 
-Run it first when something is off.
+**`java.import.exclusions` is start-only.** jdt.ls reads it once at `initialize`; any directory with a `.project` file is imported as a real Eclipse project, suppressing the invisible project (injected jars/sourcePaths ignored, `gd` finds nothing). The plugin prepares exclusion patterns synchronously in the jdt.ls `root_dir` hook, before `initialize`: a cached scope is a store read, a cold scope is scanned once and persisted, and the deferred guard then hits the cache. Patterns go to both `initializeOptions.settings` and `workspace/didChangeConfiguration`. Standalone Java projects are untouched.
 
-`phase` is a live state: `idle` (nothing configured yet) / `indexing` (AOSP tree, jars found, jdt.ls still importing and building — the statusline shows `AOSP:n(idx)`) / `ready` (jdtls reported `ServiceReady`) / `no-out` (AOSP tree has no build output, running off the fallback dir). Files outside an AOSP tree get no phase at all — the statusline stays empty for them and the panel's `aosp root` row reads `<not an AOSP file>`.
+**Multiple checkouts** with the same scope leaf name get a short checkout-root hash appended to the jdt.ls project name (`Connectivity-<hash>`), so `-data`/`-configuration` never collide. The reaper uses the same name; non-AOSP projects are never renamed.
 
-### :AospDebug
+**Root vs scope**: the root (statusline / `:Aosp`) is always the AOSP tree top; the statusline adds the pinned scope (e.g. `AOSP:719@packages/modules/Connectivity`). The jar cache covers the whole tree, so classes outside the scope still resolve.
 
-Reports what the **running** jdtls is actually doing, read straight from the JVM with `jcmd`
-(read-only): heap, GC and threads. `:Aosp` shows what your launch command says — a correct
-`-Xmx` there is not evidence that the process is healthy.
+## Plain (non-AOSP) projects: the plugin stays out of the way
 
-- **what it shows** — pid and the `jcmd` binary used / uptime / RSS and thread count / GC policy and the share of uptime spent in GC / young and full GC counts with their real average interval / promotion per young GC / young and old generation used-committed-max / the live set measured at the last full GC / the verbatim `GC.heap_info` / `vm flags`.
-- **what it checks** — the `-Xmx` in the launch command (by value; this row moved here from `:Aosp`), and whether it is larger than the host's physical RAM (a heap cap above the machine gets the JVM OOM-killed before it hits its own ceiling), plus the live pathologies: a young generation the adaptive size policy squeezed far below the heap, GC eating the wall clock, a full GC every few seconds, a live set that will not fit the old generation, RSS above `-Xmx`.
-- **verdicts** flag only what needs action; "elevated but normal while importing" shapes are listed separately, each with a concrete suggestion.
-- **`:AospDebug!`** additionally writes a thread dump to `~/.cache/nvim/aosp_nav/` and tells you the path — use it when the UI looks stuck; read the file afterwards instead of holding nvim hostage.
-- **per tree** — the header names the tree and its `-data`, so with two AOSP checkouts in one session you know which one is reported.
-- **no jdtls** — one line saying so, plus the reason when the JVM, `jcmd` or `/proc` cannot be read.
-- **read-only** — never writes to the jdtls workspace; the thread dump goes to the plugin's own cache dir.
+The plugin only activates for files under a detected AOSP checkout:
 
-### :Aosp!
+- **Java** — no settings fragment injected, `root_dir` not rewritten; your jdt.ls behaves exactly as without the plugin.
+- **Kotlin** — `root_dir` (Gradle/Maven markers) and `documentHighlight` stay stock; the global classpath dispatch script passes non-AOSP paths through to fwcd's normal resolution.
+- **C/C++** — clangd argv and the compile-commands database are never touched.
 
-Re-applies the accumulated source roots to the **running** jdtls — for when the automatic apply was capped or never found a quiet moment to run.
+Plain projects never show in the statusline.
 
-This only does something in `java.mode = "aosp"` — that is the one mode where source roots accumulate as you browse (that's why the panel hides the command elsewhere). In `project` mode everything is injected when the project's jdtls imports, so there is nothing to force.
+## C/C++ navigation (clangd)
 
-Automatic apply runs once per session and is capped at 5 roots; turn it off with `java.source_apply_auto = false`. `:Aosp!` bypasses the cap and applies everything accumulated right now.
+Opening a C/C++ file under the detected root gives clangd real compile flags. Three tiers, in order:
 
-**Prefer restarting jdtls.** Accumulated roots are applied in one pass via `initialize.sourcePaths` on the next start — cheaper, and ordered before the jars. `:Aosp!` rebuilds the whole classpath once per root, so a large batch can exhaust the JVM heap (`-Xmx`) and get the process OOM-killed. Use it only when you need the roots *now*.
+1. **compdb** — `out/soong/development/ide/compdb/compile_commands.json` (generate with `m SOONG_GEN_COMPDB=1`): clangd just points at the directory, nothing is written.
+2. **cc_deps** — `out/soong/module_bp_cc_deps.json` (normal builds): the opened file's module is streamed into a plugin-managed `compile_commands.json` (include dirs, `-isystem`, `--target`).
+3. **Android.bp** — nearest `Android.bp` + `header_libs` resolution + a curated include baseline.
 
-### :AospRescan
+The checkout's prebuilt clangd wins, one on `PATH` is fallback, and an absolute `cmd[1]` you configured is never rewritten. `lspconfig_opts` installs both the native `cmd` hook (nvim ≥ 0.11) and the legacy `on_new_config` hook, so no manual `cmd` wiring is needed. A debounced restart happens only when the effective argv changes while clangd is running.
 
-Invalidates the jar cache, rescans the whole `out/` tree, and refreshes the `import.exclusions` cache. No argument uses the detected AOSP root; you can also pass a directory:
+## Kotlin support
 
-```
-:AospRescan [dir]
-```
+Upstream fwcd kotlin-language-server walks every workspace directory on startup — from an AOSP root it hangs. The plugin dispatches by project:
 
-jdt.ls builds its classpath only at `initialize` time, so **you must restart the LSP client (or nvim) for the refreshed jar list to take effect** — `:LspRestart` if your config provides it (nvim-lspconfig's `lspconfig.commands`); the refreshed `import.exclusions` likewise take effect on the next start.
+- A **global dispatch script** at `$XDG_CONFIG_HOME/kotlin-language-server/classpath` (default `~/.config/kotlin-language-server/classpath`) answers only for known AOSP roots; every other project falls through to fwcd's normal Gradle/Maven resolution. A user-managed script is never touched; scripts written by the aosp-nav family are backed up and taken over.
+- Inside the tree, `.kls/` support files remove unbounded scans, a pinned [ktlsp](https://codeberg.org/winlogon/ktlsp) binary is bootstrapped once (needs JDK 21), and orphan servers are reaped on exit.
 
-### :AospCleanWorkspace [!]
+Kotlin is on by default; disable with `kotlin = { enabled = false }`.
 
-Deletes the current jdtls Eclipse workspace directory, stops the client, and **restarts jdtls** (when the current buffer is a `.java` file) so it re-imports from scratch — no need to reopen the file yourself.
+## Troubleshooting
 
-When you need it:
+Run `:Aosp` first. It groups rows into General / Java / Kotlin / C/C++ with ✓ / ⚠ / - marks and `→` action hints; attach its output to bug reports. Keys: `e` clean stale Eclipse metadata, `m` modules, `r` rescan, `L` log, `<Tab>` full vmargs / module list, `q` close.
 
-- after the `import.exclusions` cache was refreshed, navigation still lands in `out/` or in duplicate classes from `out/`;
-- stale `.project`+`.classpath` directories were already imported as "existing projects" (see [Opening from the Android root](#opening-from-the-android-root-javaimportexclusions));
-- you rebuilt the jar list and want to force a fresh classpath.
+- **Live settings** wait for jdt.ls ServiceReady; adding/removing sourcePaths never restarts the JVM.
+- **Inlay hints**: the plugin forces `java.inlayHints.parameterNames.enabled = "none"` on AOSP trees (start + live). Without it jdt.ls throws `-32603` from `InlayHintVisitor.getParameterNames` when an AOSP stub/jar type has no `.java` compilation unit, and LazyVim's java extra enables it by default. Other inlay hints are unaffected.
+- **Eclipse guard**: stale `.project` dirs suppress injection. Press `e` only when the panel offers it — it retires the JVM, waits for exit, wipes its workspace and re-attaches (otherwise `gd` finds nothing). Once exclusions converge the row is informational (`-`, no `e`), and the `.project` dirs stay on disk by design.
 
-Asks for confirmation; `:AospCleanWorkspace!` skips it. **Only paths under `~/.cache/nvim/jdtls/` can be deleted**; anything else is refused. Re-importing a large module is expensive, so don't use it unless you need to.
+## Where state is stored
 
-### :AospCollectJars
-
-Collects jars from a built project's `out/` directory into the fallback dir (`~/.usr/android_jars/`). When you have multiple Android checkouts, some built and some not, run it once from the built one; afterwards even unbuilt projects get working navigation and completion, because jdtls resolves against the fallback dir.
+Everything rebuildable lives in `stdpath("cache")/aosp-nav`, one folder per checkout:
 
 ```
-:AospCollectJars [aosp_root] [output_dir]
+cache/aosp-nav/
+  global.json                 shared state (guard cache/exclusions, Kotlin roots,
+                              crash counts, own clangd args), keyed by absolute path
+  kotlin-workspace/           shared ktlsp storagePath (KLS indexes by project)
+  aosp-<djb2(root)>/          state.json (module selection, picker/guard state)
+                              jars.json (jar scan cache)
+                              cpp/ (managed clangd compilation database)
+data/aosp-nav/
+  ktlsp/                      downloaded binary (rebuild needs network)
 ```
 
-- No args: auto-detect android_root, output to `java.jar_fallback_dir`
-- With args: `:AospCollectJars ~/aosp ~/downloads/aosp_jars`
+`<djb2(root)>` is the checkout-root hash, so same-named subtrees never collide. Upgrading migrates the old flat `data/` layout once; `ktlsp/` stays in `data/`. Deleting the cache is safe — the plugin rescans. To retire one checkout, `rm -rf cache/aosp-nav/aosp-<hash>`; leftover `global.json` entries are keyed by absolute path and harmless. `:AospReset` clears global state and the dispatch script, then sweeps **every** `aosp-<hash>/` folder (including checkouts already deleted from disk) and reports the counts.
 
-### Statusline and diagnostics API
+The log at `stdpath("log")/aosp-nav.log` is capped at 2 MiB: once it passes that size it is trimmed on a line boundary to the newest 1 MiB.
 
-`require("aosp-nav").status()` returns the structured session state (a pure function, safe for lualine/heirline):
-
-```lua
--- lualine example
-{ function() return require("aosp-nav").statusline() end }
-```
-
-`statusline()` returns `""` outside an AOSP tree — including plain (non-AOSP) Java
-projects, which show nothing rather than an error — so it can live permanently in a
-status line. With two AOSP checkouts open in one session, the fragment always
-reflects the tree of the **current buffer**.
-
-`status()` fields: `phase`, `root`, `android_root`, `jars`, `cache_origin`, `jdtls_clients`, `mode`, `source_roots`, `source_projects`.
-
-## Options
-
-`Applies to` says which jar-collection path a key affects. `java.mode = "project"` (the
-default) collects jars from the **soong dependency closure**; `aosp` mode and the fallback
-path when the closure is unavailable use the **full-tree scan**; older make-based trees
-additionally use the **make scan**. A key marked `make scan` is inert on a modern tree.
-
-| Option                            | Default                                                      | Applies to                                  | Description                                                  |
-| --------------------------------- | ------------------------------------------------------------ | ------------------------------------------- | ------------------------------------------------------------ |
-| android_root                      | nil                                                          | all | nil = auto-detect, or an explicit AOSP root path. Detection walks up for a dir with `out/` products; below a vendor layout it also scans the top-level root for a sub-project that has them (see below) |
-| cache_dir                         | ~/.cache/nvim/aosp_nav                                       | all | jar list cache directory                                     |
-| log_level                         | warn                                                         | all | Message threshold (`debug`/`info`/`warn`/`error`/`off`); everything below is dropped silently. See [Messages and notifications](#messages-and-notifications) |
-| java.enabled                      | true                                                         | all | Enable the java sub-module                                   |
-| java.jar_fallback_dir             | ~/.usr/android_jars                                          | fallback only | Fallback jar directory when no build outputs exist           |
-| java.soong_tag_priority           | {combined, turbine-combined, turbine}                        | soong closure + full-tree scan | Order within the fallback bucket; javac/kotlinc belong to the own-source bucket and are always kept |
-| java.exclude_jars | {R.jar, stubs.jar, lint.jar, dex.jar, srcjarsN.jar, kapt-*.jar, stubs, *-stub, jrt-fs.jar, *-headers} | all | Exclusion rules (Lua patterns) matched against both jar and module names. Name-based, so they apply on every collection path - including the soong closure, where a tree may hold same-FQN stub libraries that would otherwise shadow the real class |
-| java.exclude_globs | {^prebuilts/sdk/sdk_} | full-tree scan | Lua-pattern exclusions on the path relative to .intermediates/. By default drops the prebuilt module-SDK stubs; user entries are appended to the defaults (see exclude_merge). Anchor with ^ for top-level precision, e.g. { "^external/cronet/" } |
-| java.exclude_paths | {linux_glibc_common, development/} | full-tree scan | Excluded path keywords (substring match); do NOT add android_common_apex (it would drop apex-only modules such as core-oj) |
-| java.exclude_merge | append | full-tree scan | Merge semantics for the jar-side exclusion lists (`exclude_jars` / `exclude_paths` / `exclude_globs`): append = user entries are added after defaults; replace = defaults are discarded. It does **not** apply to `import_exclusions`, which is derived (scanned) rather than chosen |
-| java.make_jar_priority            | {classes.jar, classes-header.jar, javalib.jar}               | make scan | Make build system jar priority — **make/fallback scan only** (ignored when the soong closure is used) |
-| java.make_blacklist               | {android_stubs_current_intermediates}                        | make scan | Make build excluded directories — **make/fallback scan only** (ignored when the soong closure is used) |
-| java.mode | project | all | `project` (default) = **one jdtls instance per project**: workspace root is the dir of **the project the current file belongs to**, sourcePaths are **that project's own** roots; `aosp` = workspace root is the AOSP root AND sourcePaths are injected (whole-tree index in one shared instance, cross-module jumps to real sources) |
-| java.source_apply_auto | true | all | Automatically apply the accumulated roots to the running jdtls (at most once per session, internally capped at 5 roots) |
-| java.core_source_roots | {frameworks/base/core/java, frameworks/base/services/core/java} | all | Preset source roots, relative to the AOSP root, injected from the first import. Replaces the default list wholesale |
-| java.source_paths_max_projects | 8 | all | Upper bound on accumulated `.git` projects (LRU eviction, `0` = unlimited) |
-| java.source_root_exclude | 7 curated test-suite patterns | all | Lua-pattern exclusions applied to a root's path relative to its project, e.g. `{ "^external/cronet/" }`. User entries are **appended** to the defaults (`java.exclude_merge`); `"replace"` drops them |
-| java.source_paths | nil | all | Explicit `java.project.sourcePaths`, relative to the AOSP root (absolute paths under the root are converted; entries outside it are dropped). Non-empty = full takeover |
-| java.disable_folding_range        | true                                                         | all | Disable foldingRange (avoids -32603)                         |
-| java.disable_gradle_import        | true                                                         | all | Disable Gradle/Maven import                                  |
-| java.import_exclusions_enabled    | true                                                         | all | Inject `java.import.exclusions` (AOSP projects only; see [Opening from the Android root](#opening-from-the-android-root-javaimportexclusions)) |
-| java.import_exclusions            | {}                                                           | all | Extra jdt.ls glob patterns, appended after the defaults; a leading `!` negates (order matters) |
-| java.import_exclusions_scan       | true                                                         | all | Background-scan the source tree for dirs holding a stale `.project` and exclude them automatically. A `.project` alone is enough: jdt.ls's `EclipseProjectImporter` imports on that file, and one imported visible project stops the invisible project for the whole root from ever being created (every jump then lands in the `jdt.ls-java-project` shell) |
-| java.import_exclusions_ttl        | 604800                                                       | all | Scan-cache lifetime (seconds); ≤0 = never expires, rescan only via `:AospRescan` |
-| java.kill_orphan_jdtls            | true                                                         | all | SIGTERM the jdtls JVM left behind by a dead nvim (it still holds your `-data`, so every later session fights it for the index). Only kills one that is both truly orphaned and pointed at this plugin's cache root; `false` = report only |
-| java.inlay_hints_mode             | auto                                                         | all | auto = forced off with jars / all without, or off/all        |
-| kotlin.enabled                    | true                                                         | all | Enable the kotlin sub-module (KLS)                           |
-| kotlin.curated_modules            | {framework, core-all, SystemUI, dagger...}                   | java.mode=project | Framework baseline for KLS jars; the jar source follows java.mode: project = module closure ∪ this baseline (falls back to the full-tree cache when the closure is not ready), aosp/infer = full-tree cache |
-| kotlin.soong_tag_priority         | {combined, javac, turbine-combined}                          | soong closure + full-tree scan | KLS-specific tag priority; combined first makes navigation land in decompiled method bodies (fernflower). Switch back to turbine-first if completion speed / memory matters more |
-| kotlin.make_jar_priority          | {classes-header.jar, classes.jar, javalib.jar}               | make scan | Make build system jar priority for Kotlin                    |
-| kotlin.disable_document_highlight | true                                                         | all | Disable documentHighlight (avoids KLS -32603)                |
-| kotlin.storage_path               | ~/.cache/kotlin-language-server                              | all | KLS cache directory (init_options.storagePath)               |
-
-## Messages and notifications
-
-The plugin talks to you through four levels, from least to most important:
-
-| Level | When |
-| ----- | ---- |
-| `debug` | routine progress and startup chatter — cache hits and misses, scan stats, workspace discovery, bookkeeping |
-| `info` | rare, newsworthy, non-blocking — nothing to do right now (e.g. "exclusions cache updated; takes effect on the next start") |
-| `warn` | something genuinely went wrong, but no action is required this second |
-| `error` | an operation failed hard |
-
-`log_level` sets the threshold (default `warn`); everything below it is dropped silently — those messages are never even built. A small must-see set ignores the threshold; the details live in the Development document.
-
-## Opening from the Android root (java.import.exclusions)
-
-**This plugin's workspace root is the AOSP root by default** (see [Navigation modes](#navigation-modes)), so jdt.ls would import projects recursively from the top of the tree. The plugin injects `java.import.exclusions` by default to prevent the resulting import explosion (build outputs under `out/`, the `.repo/` mirror, and leftover `.project`+`.classpath` directories).
-
-The injection is asynchronous, and **already-imported projects persist inside the Eclipse workspace — changing the setting alone will not remove them**, so when the plugin notifies you that the exclusion cache was updated, drop the workspace cache first:
+## Development
 
 ```
-:AospCleanWorkspace
+lua tests/run.lua              # pure-logic specs
+lua tests/run_e2e.lua          # vim shim + fake AOSP tree
+lua tests/run_spec_check.lua . # validates the README install specs
 ```
 
-This is a one-time step. The exclusion cache is refreshed together with the jars by `:AospRescan`.
-
-## FAQ
-
-### Client jdtls quit with exit code 13 and signal 0 (2026/10/21)
-If this happen after you upgrade jdtls to v1.62.0, please update jdk to version 25.
-
-### jdtls finishes indexing almost instantly and navigation does not work at all
-
-Symptom: after opening a Java file in the AOSP tree, jdtls reports "indexing done" right away and `gd` finds nothing (or lands in a read-only buffer).
-
-```vim
-:AospCleanWorkspace    " rebuild the jdtls data dir; the next start re-imports with exclusions in place
-```
-
-The plugin checks for this at startup and warns you; the `workspace blockers` line of `:Aosp` lists the offending projects.
-
-### Go-to-definition on a framework class opens a read-only/decompiled view
-
-That means jdt.ls resolved the type from a jar instead of from source. Check, in order:
-
-1. `:Aosp` — the `sourcePaths` row must read `injected (N entries)`. If it reads "NOT injected": under `java.mode = "aosp"` the configured `java.core_source_roots` did not resolve on disk (wrong AOSP version, or a typo); under `project` the current project has no scannable source roots. The source-roots section shows each entry with an `x` when it exists.
-2. `:Aosp` — the `source projects` row reads `core=N projects=N installed=N pending=N`. If `pending` is greater than 0, roots you have accumulated are **not** in the running workspace yet; see the next point. In `project` mode this row instead reads `project :` / `src roots : N root(s) of this project injected`.
-3. `:Aosp` — if the class lives in a project that is not listed under source roots, open any `.java` file from that project once; its roots are scanned in the background and remembered (cached on disk). If the project was pushed out by `source_paths_max_projects`, raise the limit or revisit it (`:AospRescan` clears the accumulation).
-4. When `pending > 0`, the plugin applies the pending roots automatically (once per session, at most 5 roots); if they are still pending, **restart nvim** — they are applied in one pass on the next start. `:Aosp!` forces them through now but rebuilds the classpath per root, so a large batch can OOM the JVM.
-5. To get the new roots in front of the jars as well → `:AospCleanWorkspace` (it re-imports automatically). That path costs a full re-index, and restarting the LSP client is not enough — jdt.ls skips re-importing a project it already knows.
-
-Note that classes **generated by the build** (AIDL/proto/aconfig Stub/Proxy, e.g. `INetworkOfferCallback`) have no `.java` anywhere in the tree — the jar is their only source, so a decompiled view is the correct answer there.
-
-### jdtls reports -32603: Internal error
-
-jdtls's FoldingRangeHandler throws a NegativeArraySizeException on certain tokens. The plugin disables foldingRange by default — use treesitter-based folding instead.
-
-### jdtls shows "Download gradle wrapper checksums"
-
-The plugin disables Gradle/Maven import by default, so this should not appear. If it still does, run `:Aosp` and check that the `gradle/maven import` row reads `gradle=false maven=false`; if a leftover is to blame, `:AospCleanWorkspace` rebuilds the workspace.
-
-### AIDL interfaces not found (e.g. INetworkOfferCallback / IActivityManager)
-
-AIDL/proto/aconfig classes (Stub/Proxy) are generated into `out/` by the build system — no corresponding `.java` exists in the source tree, so navigation landing in the decompiled view is expected and correct. No action is needed.
-
-### jdtls workspace cache path and first-index duration
-
-With `mode = "project"` (default) there is one jdtls workspace per module: `~/.cache/nvim/jdtls/<module-dir-name>/workspace` — buffers of the same module share one instance, and opening another module starts another instance (idle instances are reaped automatically when a new one starts). In `mode = "aosp"` the workspace root is the AOSP root, so there is exactly one workspace for the whole tree (e.g. `~/.cache/nvim/jdtls/aosp/workspace`). First-time indexing is CPU-heavy and takes a while depending on the tree and on how many source roots are injected; the index is persisted, so subsequent opens load incrementally. **Do not close/restart jdtls while indexing.** Under `mode = "project"`, switching projects re-imports and rebuilds the index — that is expected (the "~1 min" in the notice), not a fault.
-
-If config changes don't take effect or navigation breaks, rebuild the workspace:
-
-```
-:AospCleanWorkspace
-```
-
-or remove everything manually:
-
-```
-rm -rf ~/.cache/nvim/jdtls
-```
-
-### Two nvim instances open the same tree
-
-The Eclipse workspace path is derived from the AOSP root's directory name alone, so a second nvim on the same tree would normally point at the **same** `-data` — two JVMs then fight over one index (they keep deleting and rebuilding it) and the **first** window freezes. aosp-nav detects this automatically when the second window opens: it gives that window **its own isolated index** (`<name>-nvim<pid>`) and does **not** inject source roots or jars into it. That window still works (jdtls infers roots and falls back to jars), but cross-module jumps may land in jars — a notice says so, and the isolated index is deleted when that window exits. For full functionality, work in the first window, or close it and reopen this one.
-
-### Clearing the jar cache
-
-After rebuilding AOSP:
-
-```
-:AospRescan
-```
-
-Restart the LSP client afterwards for the refreshed jar list; accumulated source roots are applied automatically (or restart nvim to apply them in one pass).
-
-### Kotlin navigation lands in a test stub
-
-This is a known KLS limitation (KLS adds every `.java` file in the workspace to its source path, so same-named test stubs can shadow framework classes); when it happens, use grep/search to locate the real source.
-
-### Kotlin completion/navigation completely broken
-
-Check in order:
-
-1. `:Aosp` — check the `kls classpath` row (ownership should be `nvim`) and the `kls client` row
-2. `:checkhealth` or `:LspInfo` — confirm KLS is attached and root_dir is non-empty (empty means root_markers didn't take effect)
-3. `ls ~/.config/kotlin-language-server/classpath` — confirm the script exists and is executable
-4. `cd <aosp-module-root> && bash ~/.config/kotlin-language-server/classpath` — run it manually and confirm it outputs a non-empty jar list
-5. KLS needs to build an index the first time a large module is opened — wait for CPU usage to drop and try again
-
-After switching jar mode (curated/all) or changing the tag priority, clear the KLS cache: `rm -rf ~/.cache/kotlin-language-server`
-
-### Extending: browsing Android native code (navigation and completion in c/cpp)
-
-The plugin wires clangd automatically (see [c/cpp (clangd) wiring](#ccpp-clangd-wiring)) and resolves compile flags through the three-tier chain: `compdb` first, then `cc_deps`, then the `bp` heuristic fallback. Generating a compilation database is **optional** — it gives you the most precise per-file flags, but c/cpp navigation already works without it as long as the tree has `out/soong/module_bp_cc_deps.json` (produced by any ordinary build) or at least an `Android.bp` next to the file.
-
-To produce the `compdb` tier yourself:
-
-1. Enter the source root and set up the build environment (same as before a normal `make`)
-
-```
-cd /path/to/android/  # replace with your AOSP root
-source build/envsetup.sh
-lunch <your_target>       # e.g. lunch aosp_arm64-eng
-```
-
-2. Important — set SOONG_GEN_COMPDB=1
-
-```
-export SOONG_GEN_COMPDB=1
-# Optional: generate a pretty-printed (human-readable) JSON file
-export SOONG_GEN_COMPDB_DEBUG=1
-# Optional: specify the output directory; $(pwd) means the current directory
-export SOONG_LINK_COMPDB_TO=$(pwd)
-```
-
-3. Build, e.g. a single module
-
-```
-mm
-# Or build the whole project
-# make -j8
-```
-
-The file is usually generated at `out/soong/development/ide/compdb/compile_commands.json`. The plugin points clangd at that directory on its own, so no symlink is required. If you also want clangd's own upward search (or other tools) to find it, link it into the tree root:
-
-```
-cd /path/to/android/ # replace with your AOSP root
-ln -sf out/soong/development/ide/compdb/compile_commands.json .
-```
-
-Then open any cpp file in nvim.
-
-**Tip**
-
-You can wrap `SOONG_GEN_COMPDB=1` and the optional symlink into an extended `make` function in your `~/.bashrc`:
-
-```
-function make_ex() {
-    SOONG_GEN_COMPDB=1 SOONG_GEN_COMPDB_DEBUG=1 make "$@"
-    if [ -f "out/soong/development/ide/compdb/compile_commands.json" ]; then
-        ln -sf out/soong/development/ide/compdb/compile_commands.json .
-        echo "compile_commands.json is created"
-    fi
-}
-```
-
-Use `make_ex` instead of `make` when you want compile_commands.json generated (`lunch` stays the same).
-
-```
-source ~/.bashrc
-make_ex -j8               # instead of make
-```
+Jar-selection rules live in `lua/aosp-nav/defaults.lua`, mirroring `aosp-nav-vscode/resources/defaults.json @ 0.2.6` — keep both in sync.
 
 ## License
 

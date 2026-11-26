@@ -1,0 +1,110 @@
+local t = require("t")
+local json = require("aosp-nav.infra.json")
+
+t.describe("infra/json", function()
+  t.describe("decode", function()
+    t.it("decodes objects, arrays, scalars", function()
+      local v = json.decode('{"a": [1, 2, "x"], "b": true, "c": null, "n": -1.5}')
+      t.raw_eq(v.a[1], 1)
+      t.raw_eq(v.a[3], "x")
+      t.raw_eq(v.b, true)
+      t.truthy(json.is_null(v.c))
+      t.raw_eq(v.n, -1.5)
+    end)
+
+    t.it("preserves array positions of null", function()
+      local v = json.decode("[1,null,3]")
+      t.raw_eq(#v, 3)
+      t.raw_eq(v[1], 1)
+      t.truthy(json.is_null(v[2]))
+      t.raw_eq(v[3], 3)
+    end)
+
+    t.it("keeps big integral numbers exact", function()
+      local v = json.decode('{"mtime": 1731740000123}')
+      t.raw_eq(v.mtime, 1731740000123)
+    end)
+
+    t.it("handles escapes and unicode", function()
+      local v = json.decode('"a\\"b\\\\c\\n\\t\\u4e2d"')
+      t.raw_eq(v, 'a"b\\c\n\t中')
+    end)
+
+    t.it("surrogate pairs become UTF-8", function()
+      local v = json.decode('"\\ud83d\\ude00"') -- 😀
+      t.raw_eq(v, "\240\159\152\128")
+    end)
+
+    t.it("rejects malformed documents", function()
+      t.truthy((json.decode("{")) == nil)
+      t.truthy((json.decode("[1,")) == nil)
+      t.truthy((json.decode("nul")) == nil)
+      local _, err = json.decode("{} trailing")
+      t.truthy(err and err:find("trailing", 1, true))
+    end)
+
+    t.it("rejects out-of-range numbers that would decode to infinity", function()
+      t.truthy(json.decode('{"x":1e999}') == nil)
+      local _, err = json.decode("1e999")
+      t.truthy(err and err:find("range", 1, true))
+      -- ordinary large-but-finite values still work
+      t.raw_eq(json.decode("1e100"), 1e100)
+    end)
+
+    t.it("rejects leading zeros and bare control bytes", function()
+      t.truthy(json.decode("01") == nil)
+      t.truthy(json.decode("-01.5") == nil)
+      t.raw_eq(json.decode("0.5"), 0.5)
+      t.raw_eq(json.decode("-0"), 0)
+      local _, lead = json.decode("01")
+      t.truthy(lead and lead:find("leading zero", 1, true))
+      t.truthy(json.decode('"a\1b"') == nil)
+    end)
+
+    t.it("rejects lone surrogate escapes", function()
+      t.truthy(json.decode('"\\ud800"') == nil)
+      t.truthy(json.decode('"\\udc00"') == nil)
+      t.truthy(json.decode('"\\ud800x"') == nil)
+      t.raw_eq(json.decode('"\\ud83d\\ude00"'), "\240\159\152\128")
+    end)
+  end)
+
+  t.describe("encode", function()
+    t.it("encodes the plugin's file shapes canonically", function()
+      local s = json.encode({ jars = { "/a/b.jar", "/a/c.jar" }, n = 3 })
+      t.raw_eq(s, '{"jars":["/a/b.jar","/a/c.jar"],"n":3}')
+    end)
+
+    t.it("escapes strings like JSON.stringify", function()
+      t.raw_eq(json.encode({ 'say "hi"\n' }), '["say \\"hi\\"\\n"]')
+    end)
+
+    t.it("round trips through decode", function()
+      local v = { a = { "x", "y" }, b = true, c = 12 }
+      local v2 = json.decode(json.encode(v))
+      t.eq(v2, v)
+    end)
+
+    t.it("empty table encodes as object, empty_array as []", function()
+      t.raw_eq(json.encode({}), "{}")
+      t.raw_eq(json.encode(json.empty_array), "[]")
+    end)
+
+    t.it("rejects values that cannot round-trip", function()
+      t.throws(function()
+        json.encode(math.huge)
+      end, "non-finite")
+      t.throws(function()
+        json.encode(0 / 0)
+      end, "non-finite")
+      local cycle = {}
+      cycle.self = cycle
+      t.throws(function()
+        json.encode(cycle)
+      end, "cyclic")
+      -- a repeated but non-cyclic subtable is still valid
+      local shared = { 1 }
+      t.raw_eq(json.encode({ a = shared, b = shared }), '{"a":[1],"b":[1]}')
+    end)
+  end)
+end)

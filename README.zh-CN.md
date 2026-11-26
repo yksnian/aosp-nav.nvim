@@ -1,492 +1,217 @@
 # aosp-nav.nvim
 
-[English](README.md) | 简体中文
+[![CI](https://img.shields.io/badge/CI-lua_tests-blue.svg)](.github/workflows/ci.yml)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-用于阅读/修改 Android (AOSP) 系统源码的 Neovim 插件。
-仅需要已全编译的 Android 源码 (存在 out/soong/.intermediates)。
+在 **Neovim / LazyVim** 中为 Android（AOSP）源码提供导航：跨所有 Java、Kotlin 模块的跳转定义、补全与引用解析（frameworks/base、packages/modules/*、system_server 服务……），外加 clangd 的 C/C++ 支持。你只写配置值；jdt.ls、clangd、Kotlin 语言服务器的接线由插件完成。
 
-通常，nvim启用LSP插件后，打开Android项目，仅能跳转和补全基础的Java/kt文件内部和JDK符号，一旦涉及到Android相关的类就显示无定义。
+本项目是 [aosp-nav-vscode](https://github.com/yksnian/aosp-nav-vscode) 的 Neovim 对应版本：共享同一套 jar 选择规则，Kotlin classpath 通道互通。
 
-本插件利用 jdtls、kotlin-language-server 和 clangd 的能力，支持 Android framework/native (Java/Kotlin/cpp) 代码跳转和自动补全：
+## 基本原理
 
-- **Java**: 针对 Android 的 jdtls 配置 —— 支持所有 Java 模块的补全和跳转
-- **Kotlin**: 针对 kotlin-language-server (KLS) 的 AOSP classpath 配置 —— Kotlin 代码可跳转到 framework Java 源码
-- **c/cpp**: 跳转和补全依赖 clangd 和 Android 编译环境配置
+AOSP 不是 Gradle/Maven 工程：裸的 jdt.ls 只能看见你打开的文件，而构建产物里有 10000+ 个 jar，装着所有符号 —— 全喂进去会毁掉导航（重复类、stub jar 劫持符号、索引永远建不完）。aosp-nav 分四步：
 
-## 演示
+1. **探测** —— 打开 AOSP 检出里的 `.java`/`.kt` 文件时向上找到树根（`build/envsetup.sh` + `build/soong`，或 `.repo` 目录）。在此之前完全静默。
+2. **筛选** —— 从 `out/soong/module_bp_java_deps.json` 计算所选模块的依赖闭包：几百个 jar，而不是整棵构建树。
+3. **注入** —— jdt.ls 获得 `referencedLibraries`、导入开关与 `sourcePaths`，启动时下发、运行中实时推送（常规路径无需重启）。源码根让 `gd` 落进真实 `.java`，而不是 jar 反编译视图。Java buffer 上还会摘掉 jdt.ls 有 bug 的 `foldingRange` 能力，避免纯显示用途的 `-32603` 折叠/高亮报错（其他客户端与文件类型不受影响）。
+4. **缓存** —— jar 列表持久化，并在重建、配置变更时自动失效；再次打开很快。
 
-Android Java代码跳转![2026-09-01-10-04-53](https://github.com/user-attachments/assets/3a9ed67a-55fc-41e3-aca6-41554897a619)
+## 环境要求
 
-Android Java代码补全![2026-09-01-10-05-58](https://github.com/user-attachments/assets/d64d173f-4483-44dd-bd6c-3fbda535d5e6)
+- Neovim ≥ 0.9；≥ 0.11 才能用 clangd 原生 `cmd` hook（旧版本走 `on_new_config`）
+- Java 语言服务器客户端：[nvim-jdtls](https://github.com/mfussenegger/nvim-jdtls)（LazyVim 的 java extra 用的就是它），或任何以 `name = "jdtls"` 启动 jdt.ls 的配置
+- 可选，C/C++：经 [nvim-lspconfig](https://github.com/neovim/nvim-lspconfig) 接入的 clangd —— 优先树内预编译版，`PATH` 上的只是兜底
+- 可选，Kotlin：默认开启 —— 见 [Kotlin 支持](#kotlin-支持)
+- 一棵**已编译**的 AOSP 树（存在 `out/soong/.intermediates`）
 
-Android cpp代码演示。![cpp_demo](https://github.com/user-attachments/assets/8847ce0d-df1c-43b6-af34-2efd76b1e659)
+插件不设置 JVM 堆或 vmargs。大树请在自己的 jdtls 配置里加 `-Xmx8g`。
 
-## 功能
+## 安装与接线（LazyVim）
 
-- **android_root 自动检测**: 支持多子项目结构
-- **工作区根 = AOSP 根**: 整棵源码树共用一个 jdtls 索引, 跨模块跳转不需要任何手工标记, 详见 [导航模式](#导航模式)
-- **Soong intermediates jar 加载**: 自动从 `out/soong/.intermediates/` 下发现依赖 jar
-- **文件缓存**: 缓存到 `~/.cache/nvim/aosp_nav/`, 用 `:AospRescan` 一条命令全部刷新
-- **跨模块跳转到定义落到真实 `.java`**: 预置核心集从首次导入起就注入, 于是跳到 framework 类打开的是可编辑源码而不是只读的反编译视图
-- **AOSP 兼容性修复**: 自动应用 (foldingRange、Gradle/Maven 导入、inlay hints)
-- **Kotlin (kotlin-language-server) 支持**: Kotlin 可跳转到 framework Java 源码
-
-## 安装
-
-### 依赖
-
-- Neovim >= 0.10
-- [mfussenegger/nvim-jdtls](https://github.com/mfussenegger/nvim-jdtls)
-- [fwcd/kotlin-language-server](https://github.com/fwcd/kotlin-language-server) >= 1.3.13 (Kotlin 支持, 可用 mason 安装)
-- `fd` (推荐, 扫描快 3-10x) 或 `find` (备选)
-
-### lazy.nvim
+**添加** `lua/plugins/aosp-nav.lua`：
 
 ```lua
-{
-  "yksnian/aosp-nav.nvim",
-  dependencies = "mfussenegger/nvim-jdtls",
-  ft = "java",
-}
-```
-
-## 配置
-
-在 jdtls 配置前调用 `setup()`, 然后用 `configure` 注入 AOSP 特化配置:
-
-```lua
--- lua/plugins/jdtls.lua
-require("aosp-nav").setup()
-
+-- lua/plugins/aosp-nav.lua
 return {
   {
-    "mfussenegger/nvim-jdtls",
-    dependencies = "yksnian/aosp-nav.nvim",
-    ft = "java",
-    opts = function(_, opts)
-      -- 你的 jdtls 配置 (cmd, root_dir, on_attach 等)
-      -- JVM 参数必须用 --jvm-arg= 前缀; 裸 -Xmx8G 会被静默忽略。
-      opts.cmd = {
-        "jdtls",
-        "--jvm-arg=-Xmx8G",
-        "--jvm-arg=-Xms2G",
-      }
-      -- 不需要自己写 root_dir: configure 会接管 (AOSP 树内 -> AOSP 根,
-      -- 树外原样保留你自己的 root_dir / root_markers 语义)
-
-      -- 注入 AOSP 特化配置 (jar, foldingRange, gradle, import.exclusions 等)
-      return require("aosp-nav").java.configure(opts)
-    end,
-  },
-}
-```
-
-### 自定义配置
-
-```lua
-require("aosp-nav").setup({
-  cache_dir = "~/.cache/nvim/aosp_nav",
-  log_level = "warn",  -- "debug" | "info" | "warn" | "error" | "off"
-  java = {
-    jar_fallback_dir = "~/.usr/android_jars",
-    mode = "project",  -- "project" (默认) | "aosp" | "infer" (不推荐); 见 "导航模式"
-    core_source_roots = {
-      "frameworks/base/core/java",
-      "frameworks/base/services/core/java",
+    "yksnian/aosp-nav.nvim",
+    opts = {},                     -- 只写配置值；默认最佳配置在插件内
+    -- 薄接线：所有 hook 与异常兜底都实现在插件里。
+    -- require 必须留在回调内：lazy.nvim 解析 spec 时插件目录还未进 runtimepath。
+    specs = {
+      { "mfussenegger/nvim-jdtls", optional = true,
+        opts = function(_, opts) require("aosp-nav").jdtls_opts(opts) end },
+      { "neovim/nvim-lspconfig", optional = true,
+        opts = function(_, opts) require("aosp-nav").lspconfig_opts(opts) end },
+      { "nvimtools/none-ls.nvim", optional = true,
+        opts = function(_, opts) require("aosp-nav").none_ls_opts(opts) end },
+      { "nvim-lualine/lualine.nvim", optional = true,
+        opts = function() require("aosp-nav.status").setup_lualine() end },
     },
-    source_paths_max_projects = 8,  -- 累积项目数上限 (LRU 淘汰, 0 = 不限)
-    source_root_exclude = { "^external/cronet/" },
-    exclude_paths = { "linux_glibc_common" },  -- 勿加 "android_common_apex"; 见配置项表
-    disable_folding_range = true,
-    inlay_hints_mode = "auto",  -- "auto" | "off" | "all"
-  },
-})
-```
-
-### Kotlin (kotlin-language-server) 接线
-
-在 lspconfig 的 opts 中注入 KLS 配置 (以 LazyVim 为例):
-
-```lua
--- lua/plugins/lsp.lua
-return {
-  {
-    "neovim/nvim-lspconfig",
-    opts = function(_, opts)
-      opts.servers = opts.servers or {}
-      opts.servers.kotlin_language_server =
-        require("aosp-nav").kotlin.configure(opts.servers.kotlin_language_server or {})
-    end,
   },
 }
 ```
 
-`configure` 会注入 `init_options.storagePath`、禁用 `documentHighlight` handler、补全 `root_markers` (追加 `.git`), 并生成 `~/.config/kotlin-language-server/classpath` 脚本。
+`opts` 只放配置值；所有 hook 与兜底（clangd 原生/旧版 hook、KLS 初始化参数、ktlint 超时、Eclipse 护栏、inlay hint 崩溃规避）由插件负责。helper 只修补**已经配置**的 server/source：不会隐式启用或通过 Mason 安装，尊重 `false` / `enabled = false`，用户自定义的 clangd `cmd` 函数会被包装保留而非丢弃。`require("aosp-nav").specs()` 返回同一组包装，但只能在模块已可加载的场景调用 —— 绝不能放在 spec 文件顶层。
 
-### c/cpp（clangd）接线
+如果之前用本地 `dir` 路径安装，删掉那条 spec，切换到仓库形式后执行一次 `:Lazy clean`。
 
-照常启用 clangd 插件（LazyVim 勾选 `lang.clangd` extra 即可），然后注入 AOSP 特化配置：
+在树里打开 `.java`：状态栏出现 `AOSP:<n>` 即 classpath 已注入（`<n>` 是 jar 数，例如 `AOSP:774`）。首次扫描几秒；大树首次 jdt.ls 索引较久、一次性、CPU 高属正常。
 
-```lua
--- lua/plugins/lsp.lua
-return {
-  {
-    "neovim/nvim-lspconfig",
-    opts = function(_, opts)
-      opts.servers = opts.servers or {}
-      opts.servers.clangd =
-        require("aosp-nav").cpp.configure(opts.servers.clangd or {})
-    end,
-  },
-}
-```
+### 非 lazy 环境的接线
 
-无需手工准备 `compile_commands.json`。clangd 附着每个文件时，插件按三级链解析该文件的编译旗标（`:Aosp` 面板以 `cpp cdb: origin=...` 显示当前生效档）：
-
-| origin | 生效条件 | 工作方式 |
-| ------ | -------- | -------- |
-| `compdb` | `out/soong/development/ide/compdb/compile_commands.json` 存在 | clangd 直接指向该目录（原生消费，插件零介入） |
-| `cc_deps` | `out/soong/module_bp_cc_deps.json` 存在 | 该文件**普通编译即产生**（soong 的 `ccdeps_generator`，无需 `SOONG_GEN_COMPDB`）；插件按模块段提取旗标，写入插件缓存下自管的 `compile_commands.json` |
-| `bp` | 两者皆无 | 启发式兜底：nearest `Android.bp`（include 目录 / cflags）+ `header_libs` 限深 BFS + curated 框架头基线 |
-
-自管 CDB 位于 `~/.cache/nvim/aosp_nav/`，按实际打开的文件逐条增长——clangd 通过 `--compile-commands-dir` 接线，**树根不再需要软链接**。用户自己设的 `--compile-commands-dir` 永远优先。`:AospRescan` 会连带清掉 cpp 缓存。
-
-compdb 档（可选，逐文件旗标最精确）依旧可用老配方：编译前 `SOONG_GEN_COMPDB=1`，产物在 `out/soong/development/ide/compdb/compile_commands.json`——现在不再需要软链接。完整步骤见 [拓展：如何查看 Android Native 代码](#拓展如何查看-android-native-代码在-ccpp-中跳转和自动补全)。
-
-## 导航模式
-
-单个键 `java.mode` 同时决定 jdtls 的工程根 (Eclipse workspace 的 `root_dir`) 在哪, 以及是否注入 Java 源码根。
-
-| `java.mode` | 工作区根 | 源码根 | 效果 | 换项目 |
-| ----------- | -------- | ------ | ---- | ------ |
-| `project` (默认) | **当前文件所属项目**的目录 | 注入 (**仅该项目自己**的源码根) | 只索引这一个模块; 模块内跳转落真实 `.java`, 模块外一律打开 jar | **每项目一台** jdtls |
-| `aosp` | AOSP 根 | 注入 (预设核心集 + 访问过的项目累积) | 跨模块跳转落真实 `.java` | 无需切换 |
-| `infer` (不推荐) | AOSP 根 | 不注入 —— 由 jdt.ls 在文件首次打开时自己猜源码根 | 插件完全不插手, 但 AOSP 的目录结构经常让它猜错, 跳转还是落到 jar | 无需切换 |
-
-两种模式都要索引一整块 workspace 并把结果持久化, 区别只在**索引范围**: `aosp` 是整棵树, `project` 是一个模块 (换来更小的首次导入)。按你更在意"跨模块跳转"还是"开得快"来选。
-
-`project` 也注入源码根 —— 但只注入**你所在的这个项目的**, 这样该项目里没打开过的类也会落到真实源码而不是 jar; `aosp` 注入的是共享核心集加上你访问过的每个项目。
-
-`project` 模式下每个项目各跑一台 jdtls: 切到别的项目就为新项目再起一台 (旧的那台闲置了会自动关掉), 各自维护自己模块的索引。让一台 jdtls 在运行中切换工作区是行不通的 —— 它不会为新目录建索引工程, 所以只能每个项目一台。每个项目第一次导入要一分钟左右, 之后走缓存几秒就能用 (导入期间面板会显示 `importing...`)。在同一个项目里切换文件没有任何开销。
-
-**什么时候值得用 `aosp`**: 整天在模块之间来回跳、到处都要跳到真实源码, 且付得起一次重度导入。代价也在这里 —— 首次导入覆盖整棵树 (大树上一次往往要十几分钟); 所有东西挤在一台 JVM 里, 堆要给大 (8G 以上); 运行期发现新模块的根时, 每条都会重建一次整条 classpath (自动、去抖), 然后还要一轮重排才能排到 jar 前面 (同样自动, 十来秒, 内存消耗大 —— 宿主内存紧张时会自动跳过等下次启动)。这些都不用手动操作, 但这正是默认用 `project` 的原因: 大多数人日常就在一两个模块里, 每项目一台的体验明显更好。
-
-`infer` 保留下来, 只是给"什么都想让 jdt.ls 自己来"的场景, 或者用来对比插件托管和裸跑的差别 —— 在真正的 AOSP 树上, 它一般比不过前两种模式。
-
-旧的 `java.workspace_mode` / `java.source_paths_mode` 已删除 —— 请使用 `java.mode`。
-
-两条相关规则:
-
-- **`android_root` 优先级最高**: 显式配置时, 只要打开的文件在该目录之下, 就用它作为 AOSP 根 (`mode ~= "project"` 时也就是工作区根)。
-- **AOSP 树外不管**: 文件不在 AOSP 树内时 `configure` 把 `root_dir` 原样交还, 你自己的配置照常生效。
-
-## 命令
-
-对于已经编译过的项目, 直接打开 Java 文件即可 —— 插件会自动处理 jar 加载。
-
-对于未编译的项目 —— 例如你有多套 Android 检出, 有些编译过有些没有 —— 用 `:AospCollectJars` 把已编译检出的公共 jar 导出给未编译的那些用。
-
-| 命令 | 作用 |
-| ---- | ---- |
-| `:Aosp` | 打开信息面板 (会话状态 + 诊断清单 + 已注入源码根, 合并到同一个 scratch buffer) |
-| `:Aosp!` | 强制注入全部已累积源码根, 越过每会话自动上限 |
-| `:AospDebug` (或 `!`) | 直读正在运行的 jdtls 的活 JVM: 堆 / GC / 线程 (`:AospDebug!` 另落一份 thread dump) |
-| `:AospRescan [dir]` | 作废 jar 缓存并重扫, 同时刷新 `import.exclusions` |
-| `:AospCleanWorkspace` (或 `!`) | 删除 jdtls/Eclipse workspace 目录使其重新导入 (破坏性; `:AospCleanWorkspace!` 跳过确认) |
-| `:AospCollectJars` | 收集 AOSP jar 到 fallback 目录 |
-
-### :Aosp
-
-一个面板, 两部分:
-
-- **diagnostics** —— 一份检查清单, 逐项带 `v`/`!` 标记与下一步动作提示: 插件版本 / jdtls 客户端与其 root_dir / `referencedLibraries` 条数 / `java.project.sourcePaths` 是否被注入 (两种模式都期望"已注入", 缺失即故障) / `java.import.exclusions` 条数 / gradle+maven 是否关闭 / AOSP 根与工作区根及当前模式 / 会话 phase / jar 缓存新鲜度 / Eclipse 残留 blockers / jdtls workspace 目录与 "jdtls index" 行 / Kotlin 脚本归属与 KLS 客户端数 / 是否有外部 jdtls 共用同一 `-data` 以及它属于谁 (`nvim <pid>` 还是孤儿) / `jdtls contract` 一行 (对正在运行的 jdt.ls 的内部契约自检: invisible project 命名与 `addToSourcePath` 返回文案 —— 不匹配意味着 jdt.ls 改了本插件依赖的实现细节)。**JVM `-Xmx` 检查不在这里** —— 已搬到 `:AospDebug` (见下), 那里读的是活进程而不是启动命令行。
-- **source roots** —— 当前注入 `java.project.sourcePaths` 的全部源码根: 配置的核心集 (存在磁盘上的条目标 `x`), 以及每个已累积项目的源码根 (按 LRU 顺序)。当跳转落到同名类的意外实现时用来看清来源。
-
-出问题时先跑这个。
-
-`phase` 是活状态: `idle` (尚未配置) / `indexing` (AOSP 树, 已找到 jar, jdt.ls 仍在导入与构建 —— 状态栏显示 `AOSP:n(idx)`) / `ready` (jdt.ls 已报 `ServiceReady`) / `no-out` (AOSP 树里没有编译产物, 走的 fallback)。非 AOSP 文件**没有** phase —— 状态栏对它们保持空串, 面板的 `aosp root` 行显示 `<not an AOSP file>`。
-
-### :AospDebug
-
-报告**正在运行的** jdtls 究竟在干什么 —— 用 `jcmd` 只读直读 JVM: 堆、GC、线程。
-`:Aosp` 看的是启动命令行写了什么, 那里的 `-Xmx` 正确
-**不等于**进程健康。
-
-- **看什么** —— pid 与实际用到的 `jcmd` / uptime / RSS 与线程数 / GC 策略与 GC 占墙钟的比例 / young 与 full GC 的次数及真实平均间隔 / 每次 young GC 的晋升量 / 新生代与老年代的 used-committed-max / 上次 full GC 实测的存活集 / 原样的 `GC.heap_info` / `vm flags`。
-- **查什么** —— 启动命令行里的 `-Xmx` (按数值判; 这一行已从 `:Aosp` 搬来), 以及它是否比宿主物理内存还大 (堆上限高过整机时 JVM 够不着自己的天花板, 先被 OOM 杀掉), 外加活进程的病态形态: 新生代被自适应策略压到远小于堆 / GC 吃掉墙钟 / 每几秒一次 full GC / 存活集放不进老年代 / RSS 超过 `-Xmx`。
-- **判定** 只标出需要动手的; "偏高但在导入期正常"的形态另列, 每条都给具体建议。
-- **`:AospDebug!`** 另外落一份 thread dump 到 `~/.cache/nvim/aosp_nav/` 并给出路径 —— 界面像卡住时用它; 抓完读文件, 不必占着 nvim。
-- **按树** —— 头部写明是哪棵树及其 `-data`, 一个会话里有两套 AOSP 检出时知道报的是谁。
-- **没有 jdtls** —— 一行说明; JVM、`jcmd` 或 `/proc` 读不到时一并给出原因。
-- **只读** —— 从不写 jdtls 工作区; thread dump 落在插件自己的缓存目录。
-
-### :Aosp!
-
-把已累积的源码根重新注入**正在运行**的 jdtls —— 自动注入被上限截断、或一直没等到就绪窗口时的兜底。
-
-只有 `java.mode = "aosp"` 下它才有事可做 —— 只有这个模式会随浏览积累源码根 (其他模式下面板干脆不显示这条命令)。`project` 模式的根在导入时就注入完了, 没有可强推的累积。
-
-自动注入每会话做一次, 单次最多 5 条; 想关掉设 `java.source_apply_auto = false`。`:Aosp!` 越过上限, 立即注入当前全部累积。
-
-**优先重启 jdtls。** 累积的源码根会在下次启动经 `initialize.sourcePaths` 一次性注入 —— 更省内存, 且顺序排在 jar 之前。`:Aosp!` 每注入一条就重建一次整条 classpath, 批量大时会把 JVM 堆 (`-Xmx`) 撑爆而被 OOM 杀掉。只在**现在就要**用上这些根时才敲它。
-
-### :AospRescan
-
-作废 jar 缓存, 重扫整个 `out/` 树, 并刷新 `import.exclusions` 缓存。无参数时用检测到的 AOSP 根; 也可以传一个目录:
-
-```
-:AospRescan [dir]
-```
-
-jdt.ls 的 classpath 只在 initialize 时构建, 所以**必须重启 LSP 客户端 (或重开 nvim) 才能让刷新后的 jar 列表生效** —— 若你的配置提供了 `:LspRestart` (nvim-lspconfig 的 `lspconfig.commands`), 就是它; 刷新后的 `import.exclusions` 同样下次启动才生效。
-
-### :AospCleanWorkspace [!]
-
-删除当前 jdtls 的 Eclipse workspace 目录, 停掉客户端, 并**自动重启 jdtls** (当前缓冲是 `.java` 文件时) 让它从零重新导入 —— 不用你自己重开文件。
-
-什么时候需要:
-
-- `import.exclusions` 缓存刷新之后仍能跳进 `out/` 或 `out/` 下的重复类;
-- 残留 `.project`+`.classpath` 目录被当成"已存在工程"导入过 (见 [从 Android 根目录打开](#从-android-根目录打开-javaimportexclusions));
-- jar 列表重建后想强制刷新 classpath。
-
-带确认提示; `:AospCleanWorkspace!` 跳过确认。**只允许删除 `~/.cache/nvim/jdtls/` 之下的路径**, 其他路径直接拒绝。重新导入大模块代价高昂, 非必要别用。
-
-### :AospCollectJars
-
-从已编译项目的 `out/` 目录收集 jar 到 fallback 目录 (`~/.usr/android_jars/`)。当你有多个 Android 检出、有些编译过有些没有时, 在已编译的那个里跑一次; 之后即使未编译的项目也能正常跳转和补全, 因为 jdtls 会用 fallback 目录来解析。
-
-```
-:AospCollectJars [aosp_root] [output_dir]
-```
-
-- 无参数: 自动检测 android_root, 输出到 `java.jar_fallback_dir`
-- 指定参数: `:AospCollectJars ~/aosp ~/downloads/aosp_jars`
-
-### 状态栏与诊断 API
-
-`require("aosp-nav").status()` 返回结构化会话状态 (纯函数, 可直接用于 lualine/heirline):
+上面 `opts = {}` 的作用是让 lazy.nvim 调用 `setup()` 并应用那四个 helper 包装。不用 lazy.nvim 时，自己调用一次 `setup()`，并把同一组 helper 用在原本就要传给各 server 的配置表上：
 
 ```lua
--- lualine 示例
-{ function() return require("aosp-nav").statusline() end }
+local aosp_nav = require("aosp-nav")
+aosp_nav.setup({})                                    -- 一次即可，须在任何 LSP 启动前
+
+-- jdt.ls：把 AOSP 片段合进传给 start_or_attach 的 config。
+-- 用 jdtls_opts 而非只调 jdtls_settings：它还会把 root_dir 钉到窗口范围，
+-- 并在 initialize 前注入只在启动时生效的导入排除规则。
+local config = ...                                    -- 你的 jdtls config
+aosp_nav.jdtls_opts(config)
+require("jdtls").start_or_attach(config)
+
+-- lspconfig 风格：原地修改 opts 表。这会同时接好 clangd 两条路径
+-- （nvim ≥ 0.11 的原生 `cmd` 与旧版 on_new_config）和 KLS 的 storagePath 修复；
+-- 只修补你**已经配置**的 server。
+aosp_nav.lspconfig_opts(lspconfig_opts)               -- 你的 lspconfig opts 表
+aosp_nav.none_ls_opts(none_ls_opts)                   -- 你的 none-ls opts 表
 ```
 
-`statusline()` 在非 AOSP 场景返回 `""` —— 包括普通 (非 AOSP) Java 工程, 它们什么都不显示而不是报错 —— 可以常驻状态栏。同一个会话里开着两棵 AOSP 树时, 状态栏始终反映**当前 buffer 所属树**的状态。
-
-`status()` 字段: `phase`、`root`、`android_root`、`jars`、`cache_origin`、`jdtls_clients`、`mode`、`source_roots`、`source_projects`。
+`require("aosp-nav").specs()` 以编程方式返回同一组四个包装；不要把它放在 lazy spec 文件顶层（那时模块还没进 `package.path`）。完全不接线也能工作 —— 插件会向**运行中**的 jdt.ls 推送设置并重写 clangd 的 CDB，只是少了首次启动即生效的便利。
 
 ## 配置项
 
-`生效范围` 说明该键作用于哪条 jar 收集路径。`java.mode = "project"`（默认）从 **soong 依赖闭包**取 jar；`aosp` 模式、以及闭包不可用时的兜底路径走**全树扫描**；make 时代的老树另外还有 **make 扫描**。标 `make scan` 的键在现代树上不生效。
+七个键；能从工程结构推导的一律推导（AOSP 根、窗口范围、模块选择、Java autobuild、prebuilt clangd、ktlsp 引导、进程清理、clangd 重启防抖）。
 
-| 项                                | 默认                                                         | 生效范围                                                      | 说明                                                         |
-| --------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| android_root                      | nil                                                          | 全部 | nil=自动检测, 或指定 AOSP 根目录。检测会向上找带 `out/` 产物的目录; 厂商布局下还会在顶层根里扫描带产物的子项目 (见下) |
-| cache_dir                         | ~/.cache/nvim/aosp_nav                                       | 全部 | jar 列表缓存目录                                             |
-| log_level                         | warn                                                         | 全部 | 消息阈值 (`debug`/`info`/`warn`/`error`/`off`); 低于阈值的一律静默丢弃。见 [消息与通知](#消息与通知) |
-| java.enabled                      | true                                                         | 全部 | 启用 java 子模块                                             |
-| java.jar_fallback_dir             | ~/.usr/android_jars                                          | 仅兜底 | 无编译产物时 fallback jar 目录                               |
-| java.soong_tag_priority           | {combined, turbine-combined, turbine}                        | soong 闭包 + 全树扫描 | 兜底桶内部顺序; javac/kotlinc 属自身产物桶, 恒全保留         |
-| java.exclude_jars | {R.jar, stubs.jar, lint.jar, dex.jar, srcjarsN.jar, kapt-*.jar, stubs, *-stub, jrt-fs.jar, *-headers} | 全部 | 排除规则 (Lua 模式), 同时匹配 jar 名与模块名。名字级规则, **所有收集路径都生效** —— 包括 soong 闭包: 树内可能有与框架类**同 FQN 的桩库**, 不排掉会抢在真实现之前 |
-| java.exclude_globs | {^prebuilts/sdk/sdk_} | 全树扫描 | Lua 模式排除: 匹配 .intermediates/ 之后的相对路径。默认剔除预构建 module SDK 桩; 用户自定义时与默认值**拼接** (见 exclude_merge); 锚定 ^ 可精确到顶层目录, 如 { "^external/cronet/" } |
-| java.exclude_paths | {linux_glibc_common, development/} | 全树扫描 | 排除的路径关键词 (子串匹配); 勿加 android_common_apex (会误杀只有 apex 变体的 core-oj 等模块) |
-| java.exclude_merge | append | 全树扫描 | **jar 侧**排除列表 (`exclude_jars` / `exclude_paths` / `exclude_globs`) 的合并语义: append=用户项追加到默认值后 (推荐); replace=整体替换默认值。**不适用于** `import_exclusions` —— 那一项是插件扫描推导出来的, 不是用户选的 |
-| java.make_jar_priority            | {classes.jar, classes-header.jar, javalib.jar}               | make 扫描 | Make 构建系统 jar 优先级 — **仅 make/兜底扫描** (走 soong 闭包时不生效) |
-| java.make_blacklist               | {android_stubs_current_intermediates}                        | make 扫描 | Make 构建排除目录 — **仅 make/兜底扫描** (走 soong 闭包时不生效) |
-| java.mode | project | 全部 | `project` (默认) = **每个项目一台 jdtls**: 工作区根为**当前文件所属项目**的目录, sourcePaths 为**该项目自己**的源码根; `aosp` = 工作区根为 AOSP 根**且**注入 sourcePaths (整树共享一份索引, 跨模块跳转到真实源码) |
-| java.source_apply_auto | true | 全部 | 累积到新源码根时 (以及 jdtls attach 补存量时) 自动增量注入运行中的工作区。每会话最多一次, 且内部单次上限 5 条; 只在 `mode == "aosp"` 且 jdtls 在跑时生效 |
-| java.core_source_roots | {frameworks/base/core/java, frameworks/base/services/core/java} | 全部 | 预置源码根 (相对 AOSP 根), 从首次导入起就注入。整表替换默认值 (同 `kotlin.curated_modules` 语义); 磁盘上不存在的条目自动跳过。给得越多首次索引越重 |
-| java.source_paths_max_projects | 8 | 全部 | 累积的 `.git` 项目数上限 (LRU 淘汰, `0` = 不限)。上限与累积集合都会跨会话保留 |
-| java.source_root_exclude | 7 条精选测试套件模式 | 全部 | Lua 模式排除, 匹配源码根相对所属项目的路径, 如 `{ "^external/cronet/" }`。默认值补齐内建剪枝抓不到的测试目录家族 (`apct-tests/`、`perftests/`、`test-*`、`integration-tests`、`multivalentTests`、`testrunner-src`) —— frameworks/base 实测 28 个根 / 815 文件 ≈ 注入量的 6%。用户项**追加**在默认值之后 (走 `java.exclude_merge`); 写 `"replace"` 才掀掉默认项。改这个列表会自动让源码根缓存失效 (缓存头带指纹)。其余剪枝规则 (测试根 / JDK 影子根 / 同名影子根) 属算法的一部分 |
-| java.source_paths | nil | 全部 | 显式指定 `java.project.sourcePaths` (相对 AOSP 根; 树内的绝对路径会自动转成相对, 树外的丢弃)。非空即完全接管: 不再使用核心集与项目累积。除非想钉死一份固定列表, 否则不要设置 |
-| java.disable_folding_range        | true                                                         | 全部 | 禁用 foldingRange (避 -32603)                                |
-| java.disable_gradle_import        | true                                                         | 全部 | 禁用 Gradle/Maven 导入                                       |
-| java.import_exclusions_enabled    | true                                                         | 全部 | 是否注入 `java.import.exclusions` (仅 android 项目; 见 [从 Android 根目录打开](#从-android-根目录打开-javaimportexclusions)) |
-| java.import_exclusions            | {}                                                           | 全部 | 追加的 jdt.ls glob 排除模式, 排在默认值之后; `!` 开头 = 反向放行 (顺序敏感) |
-| java.import_exclusions_scan       | true                                                         | 全部 | 是否后台扫描源码树里残留的 `.project` 目录并自动排除。**只认 `.project` 一个文件**: jdt.ls 的 `EclipseProjectImporter` 就是凭它导入的, 而只要有一个可见工程被导进来, 整个根的不可见工程就再也建不出来 (之后所有跳转都落进 `jdt.ls-java-project` 假工程) |
-| java.import_exclusions_ttl        | 604800                                                       | 全部 | 扫描结果缓存有效期 (秒); ≤0 = 永不过期, 仅 `:AospRescan` 强制重扫 |
-| java.kill_orphan_jdtls            | true                                                         | 全部 | 启动时 SIGTERM 掉"孤儿"jdtls —— 上一个 nvim 已经退出、却还占着同一份 `-data` 的那台 (之后每个会话都要跟它抢索引)。只杀"确实是孤儿"**且** `-data` 在本插件缓存根之下的; 设 `false` 只报告不杀 |
-| java.inlay_hints_mode             | auto                                                         | 全部 | auto=有jar强制off/无jar all, 或 off/all                      |
-| kotlin.enabled                    | true                                                         | 全部 | 启用 kotlin 子模块 (KLS)                                     |
-| kotlin.curated_modules            | {framework, core-all, SystemUI, dagger...}                   | java.mode=project | KLS 的框架基线; jar 来源跟随 java.mode: project=模块闭包 ∪ 本清单基线 (闭包未就绪回退全量缓存), aosp/infer=全量缓存 |
-| kotlin.soong_tag_priority         | {combined, javac, turbine-combined}                          | soong 闭包 + 全树扫描 | KLS 专用 tag 优先级; combined 优先使跳转可见方法体 (fernflower 反编译), 补全优先/内存敏感可改回 turbine 优先 |
-| kotlin.make_jar_priority          | {classes-header.jar, classes.jar, javalib.jar}               | make 扫描 | Kotlin 的 Make 构建系统 jar 优先级                           |
-| kotlin.disable_document_highlight | true                                                         | 全部 | 禁用 documentHighlight (避 KLS -32603)                       |
-| kotlin.storage_path               | ~/.cache/kotlin-language-server                              | 全部 | KLS 缓存目录 (init_options.storagePath)                      |
-
-## 消息与通知
-
-插件按重要性分四档与你沟通, 由低到高:
-
-| 档 | 时机 |
-| -- | ---- |
-| `debug` | 例行进度与启动噪音 —— jar 缓存命中/未命中、扫描统计、工作区发现、记账 |
-| `info` | 少见、有新闻价值、非阻塞 —— 当下无需动作 (如"排除项缓存已更新, 下次启动生效") |
-| `warn` | 确实出了问题, 但此刻无需立即处理 |
-| `error` | 某个操作硬失败 |
-
-`log_level` 设定阈值 (默认 `warn`), 低于阈值的一律静默丢弃 —— 那些消息连构造都不会发生。另有少量必看消息无视阈值; 细节见开发文档。
-
-## 从 Android 根目录打开 (java.import.exclusions)
-
-**本插件的工作区根默认就是 AOSP 根** (见 [导航模式](#导航模式)), 所以 jdt.ls 会从整棵树的根开始递归导入工程。插件默认注入 `java.import.exclusions` 来避免由此产生的导入爆炸 (`out/` 下的构建产物、`.repo/` 镜像, 以及遗留的 `.project`+`.classpath` 目录)。
-
-注入是异步的, 且**已导入的工程会持久化在 Eclipse workspace 里 —— 仅改设置不会让它们消失**, 所以当插件通知你排除项缓存已更新时, 先删掉工作区缓存:
-
-```
-:AospCleanWorkspace
+```lua
+require("aosp-nav").setup({
+  enabled = true,
+  android_root = nil,           -- 显式指定根；nil 时按打开的文件自动探测
+  exclude = {
+    jars = {},                  -- 对 jar 文件名与模块名生效的正则
+    paths = {},                 -- 对 .intermediates/ 相对路径生效的子串
+    globs = {},                 -- 对同一相对路径生效的正则
+  },
+  source_roots = {},            -- 手写的源码根追加（相对根或绝对路径）
+  kotlin = { enabled = true },  -- 默认开启；设为 false 关闭
+  cpp = { enabled = true },     -- clangd / CDB 集成
+  log_level = "info",
+})
 ```
 
-这是一次性步骤。排除缓存随 jar 一起由 `:AospRescan` 刷新。
+排除条目总是**追加**在内置默认规则之后（已覆盖所有已知 stub 家族）—— 没有 replace 模式，丢掉默认规则会让导航静默失效。
 
-## FAQ
+模块选择是 `:AospModules` 写入的按 checkout 持久状态（`stdpath("cache")/aosp-nav/aosp-<djb2(root)>/state.json`），不是配置项。
 
-### Client jdtls quit with exit code 13 and signal 0 (2026/10/21)
-升级jdtls 1.62.0后JDK版本低于25就会出现，请更新JDK版本至25。
+**Java autobuild** 是派生值，不可配置：根窗口或注入的 sourcePaths 超过 100 时关闭，其他情况开启；只在 jdt.ls 启动时下发，实时增删 sourcePath 不会切换。`:Aosp` 面板会显示原因。
 
-### jdtls 几乎不索引就结束, 跳转全部失效
+### Java 源码根（sourcePaths）
 
-症状: 打开 AOSP 里的 java 文件后 jdtls 很快就"索引完成", `gd` 找不到任何东西 (或落在只读缓冲里)。
+默认情况下跨模块 `gd` 会落到注入 jar 的反编译 `jdt://` 视图。注入**源码根**后，真实 `.java` 文件排在 jar 之前，同样的跳转会落到可编辑源码。覆盖面刻意保持局部：
 
-```vim
-:AospCleanWorkspace    " 重建 jdtls 数据目录; 下次启动重新导入, 排除项已就绪
-```
+- 根窗口未显式选择时，默认 `frameworks/base/core/java` + `frameworks/base/services/core` —— **只针对源码根**；
+- 根窗口的 **jar 列表**仍是全树扫描的完整集合（减去源码根已覆盖模块自身的 jar）—— `framework-wifi.jar` 等主线实现 jar 始终在 classpath 上，与选了哪些源码根无关，所以 Wifi 类仍能解析；
+- 子树范围（如 `packages/modules/Connectivity`）自动选择其下的生产模块；
+- `:AospModules` 自选模块（按**窗口范围分别保存**）；`source_roots` 添加手写根。未选中的模块保留 jar 导航，但没有源码导航。
 
-插件启动时会自检并给出提示, `:Aosp` 面板里的 `workspace blockers` 行也会列出这些工程名。
+## 命令
 
-### 跳转到 framework 类时打开的是只读/反编译视图
+| 命令 | 说明 |
+| --- | --- |
+| `:Aosp` | 自检面板（通用 / Java / Kotlin / C/C++）。按键：`e` 修复 Eclipse 元数据、`m` 选模块、`r` 重扫、`L` 打开日志、`<Tab>` 展开行细节、`q` 关闭 |
+| `:AospRescan[!]` | 丢弃 jar 缓存并重新扫描（同时重跑 Eclipse 护栏）。`!` 还会重启 jdt.ls，让启动期设置重新下发 |
+| `:AospModules` | 选择源码根模块：`<Space>` 勾选、`/` 过滤、`Tab` 展开子模块、`r` 回到自动选择、`<CR>` 确认（未改动时 no-op）、`q`/`<Esc>` 取消 |
+| `:AospReset` | 回滚插件写入的一切：清空全局状态与 Kotlin 分发脚本，清扫**所有** `aosp-<hash>/` 缓存目录（含已删除的 checkout），并报告数量 |
 
-说明 jdt.ls 从 jar 而不是源码解析了这个类型。依次检查:
+## 窗口范围：从根打开还是从子目录打开
 
-1. `:Aosp` 面板的 `sourcePaths` 一行必须是 `injected (N entries)`。`java.mode = "aosp"` 时若显示 "NOT injected", 说明 `java.core_source_roots` 在磁盘上没解析出来 (AOSP 版本不同或写错了) —— 源码根一栏会给存在的条目标 `x`; `project` 模式若显示 "NOT injected", 说明当前项目目录下没扫出源码根。
-2. 同一页的 `source projects` 一行形如 `core=N projects=N installed=N pending=N`。`pending > 0` 表示累积的源码根还没进当前工作区, 见下一条。`project` 模式下这一栏改为 `project :` / `src roots : N root(s) of this project injected`。
-3. `:Aosp` 源码根一栏 —— 如果这个类所属项目不在列表里, 打开该项目下任意一个 `.java` 文件一次, 它的源码根会在后台扫出来并写进缓存。若该项目被 `source_paths_max_projects` 挤掉了, 提高上限或再打开一次它的文件 (`:AospRescan` 清空累积)。
-4. `pending > 0` 时插件会自动应用 (每会话一次, 最多 5 条); 若仍未生效, **重启 nvim** —— 下次启动会一次性注入。`:Aosp!` 能立刻强行注入, 但它每注入一条就重建一次 classpath, 批量大时可能把 JVM 撑到 OOM。
-5. 想让新源码根也排到 jar **之前** → `:AospCleanWorkspace` (会自动重新导入)。这条路的代价是整库重新索引, 且只重启 LSP 客户端不够 —— jdt.ls 会跳过它已经认识的工程。
+Neovim 没有工作区文件夹概念，插件会推导**有效窗口范围**，并在每个 checkout 第一次出现 AOSP 信号时锁定，整个 nvim 会话不再变化：
 
-注意**构建生成**的类 (AIDL/proto/aconfig 的 Stub/Proxy, 例如 `INetworkOfferCallback`) 在源码树里根本没有 `.java`, jar 是它们的唯一来源, 落到反编译视图是正确结果。
+- cwd 严格位于树内 → 取该目录，并收敛到最近的上层 git 工程根（在 `frameworks/base/core/java` 启动就锁定到 `frameworks/base`）；
+- cwd == 树顶 → 根窗口（整棵树）；
+- cwd 在树外（或未知）→ 第一个 AOSP 文件最近的上层 git 工程根；
+- 完全没有信号 → 根窗口。
 
-### jdtls 报 -32603: Internal error
+锁定是按 AOSP 根分别记录的。之后再跨到别的子树不会重新规划、不弹确认框、也不会启动第二个 jdt.ls；`root_dir` 就是锁定的范围。要在别的子树工作，请从该目录重启 nvim（或在第一个 AOSP 文件获得焦点前先 `:cd` 进去）。每个 checkout/工作区只有一个 jdt.ls JVM。
 
-jdtls 的 FoldingRangeHandler 在解析某些 token 时抛 NegativeArraySizeException. 插件已默认禁用 foldingRange, 折叠使用 treesitter 即可.
+**正常 `:q` 故意不向 jdt.ls 发信号。** Neovim 的 LSP `shutdown` 正是 Eclipse 落盘干净 workspace 快照的时机，若用 SIGTERM 抢在这之前，`.metadata` 会被标记为脏（下次打开约 95 秒恢复）。上次异常退出（`:qa!`、崩溃）留下还在索引同一工作区的孤儿 JVM 时，下次启动会先回收：发 SIGTERM、最多等约 8 秒，再拉起新的 —— 绝不用 SIGKILL（会破坏 `.metadata`）。父进程链里有存活编辑器（nvim/lvim）的 JVM 绝不会被误杀。
 
-### jdtls 显示 Download gradle wrapper checksums
+**`java.import.exclusions` 只在启动时读取。** jdt.ls 在 `initialize` 阶段读一次，任何含 `.project` 文件的目录都会被当成真实 Eclipse 项目导入，压制 invisible project（注入的 jar/sourcePaths 失效、`gd` 找不到定义）。插件在 jdt.ls 的 `root_dir` hook 里、`initialize` 之前同步准备好排除规则：有缓存就只读 store，冷启动则扫描一次并持久化，延迟护栏随后直接命中缓存；规则同时写进 `initializeOptions.settings` 与 `workspace/didChangeConfiguration`。独立 Java 项目不受影响。
 
-插件已默认禁用 Gradle/Maven 导入, 正常情况下不会再出现。若仍然出现, 先跑 `:Aosp` 确认 `gradle/maven import` 一项是 `gradle=false maven=false`; 是残留的话 `:AospCleanWorkspace` 重建 workspace 即可。
+**多份 checkout** 若有同名子树，插件会在 jdt.ls 项目名后追加 checkout 根的短 hash（`Connectivity-<hash>`），使 `-data`/`-configuration` 不冲突；孤儿回收用同一个名字。AOSP 之外的独立 Java 项目不会被改名。
 
-### AIDL 接口找不到 (如 INetworkOfferCallback / IActivityManager)
+**root 与范围**：root（状态栏 / `:Aosp` 显示的）永远是 AOSP 树顶；状态栏在 jar 数旁加上锁定的范围（例如 `AOSP:719@packages/modules/Connectivity`）。jar 缓存覆盖整棵树，所以范围外的类仍能跳转导航。
 
-AIDL/proto/aconfig 类 (Stub/Proxy) 由构建系统生成到 `out/`, **源码树内不存在对应 `.java` 文件**, 所以跳转落到反编译视图是预期且正确的。无需处理。
+## 非 AOSP 工程：插件不介入
 
-### jdtls workspace 缓存路径与首次索引耗时
+插件只对探测到的 AOSP 检出内的文件生效：
 
-`mode = "project"` (默认) 下每个模块各有一个 jdtls workspace: `~/.cache/nvim/jdtls/<项目目录名>/workspace` —— 同模块的 buffer 共享一台, 打开其他模块自动另起一台 (新台启动前会自动回收无 buffer 的闲置实例)。`mode = "aosp"` 时工作区根是 AOSP 根, 整棵树只有一个 workspace (如 `~/.cache/nvim/jdtls/aosp/workspace`)。首次索引很耗 CPU, 耗时取决于树的大小与注入的源码根数量; 索引会持久化, 之后重开为增量加载。**索引期间请勿关闭/重启 jdtls**。`mode = "project"` 下切换项目会重导入并重建索引, 这是预期行为 (提示里说的"约 1 分钟"), 不是故障。
+- **Java** —— 不注入任何设置片段、不改写 `root_dir`；你的 jdt.ls 配置和没装插件时完全一样。
+- **Kotlin** —— `root_dir`（Gradle/Maven 标记）与 `documentHighlight` 保持原样；全局 classpath 分发脚本对非 AOSP 路径原样放行，走 fwcd 正常解析。
+- **C/C++** —— clangd 的 argv 与 compile-commands 数据库不会被改动。
 
-配置改动不生效、跳转异常时, 重建 workspace:
+普通工程也不会出现在状态栏里。
 
-```
-:AospCleanWorkspace
-```
+## C/C++ 导航（clangd）
 
-或手动全部清除:
+在探测到的 AOSP 根下打开 C/C++ 文件时，clangd 拿到的是真实编译参数。三级来源，按序：
 
-```
-rm -rf ~/.cache/nvim/jdtls
-```
+1. **compdb** —— `out/soong/development/ide/compdb/compile_commands.json`（用 `m SOONG_GEN_COMPDB=1` 生成）：clangd 直接指向该目录，不写任何内容。
+2. **cc_deps** —— `out/soong/module_bp_cc_deps.json`（常规构建产物）：把打开文件的模块编译参数流入插件托管的 `compile_commands.json`（include 目录、`-isystem`、`--target`）。
+3. **Android.bp** —— 最近的 `Android.bp` + `header_libs` 解析 + 精选 include 基线。
 
-### 两个 nvim 打开同一棵树
+优先用树内预编译 clangd，`PATH` 上的只是兜底，你自己写成绝对路径的 `cmd[1]` 不会被改写。`lspconfig_opts` 会同时装好原生 `cmd` hook（nvim ≥ 0.11）与旧版 `on_new_config` hook，无需手写 `cmd`。只有 clangd 运行中生效 argv 变化时才防抖重启。
 
-Eclipse workspace 的路径只由 AOSP 根目录名决定, 所以同一棵树上的第二个 nvim 本来会指向**同一份** `-data` —— 于是两个 JVM 抢同一份索引 (反复删除重建), **先开的那个窗口卡死**。第二个窗口打开时插件会自动检测到这一点: 给这个窗口**一份独立的索引** (`<名字>-nvim<pid>`), 且**不**向它注入源码根与 jar。这个窗口照样能用 (jdtls 自己推断源码根、跳转退回 jar), 但跨模块跳转可能落进 jar —— 会有提示说明; 该窗口退出时这份隔离索引会被删掉。要完整功能, 请在第一个窗口工作, 或关掉它后重开本窗口。
+## Kotlin 支持
 
-### jar 缓存清除
+上游 fwcd kotlin-language-server 启动时会遍历工作区的每个目录 —— 从 AOSP 根启动会永久卡死。因此插件按工程分发：
 
-AOSP 重新编译后:
+- `XDG_CONFIG_HOME` 下的**全局分发脚本** `$XDG_CONFIG_HOME/kotlin-language-server/classpath`（未设置时为 `~/.config/kotlin-language-server/classpath`）只对已知 AOSP 根应答；其他工程原样放行，走 fwcd 正常的 Gradle/Maven 解析。用户自管脚本永不上碰；aosp-nav 家族写的脚本会先备份再接管。
+- 树内由 `.kls/` 支持文件消除无界扫描，自动引导固定版本的 [ktlsp](https://codeberg.org/winlogon/ktlsp)（一次性下载，需要 JDK 21），退出时清理孤儿服务进程。
 
-```
-:AospRescan
-```
+Kotlin 默认开启；用 `kotlin = { enabled = false }` 关闭。
 
-之后重启 LSP 客户端让刷新后的 jar 列表生效; 累积的源码根由插件自动应用 (重启 nvim 则会一次性注入)。
+## 故障排查
 
-### Kotlin 跳转到测试 stub 文件
+先运行 `:Aosp`。面板按 通用 / Java / Kotlin / C/C++ 分组，用 ✓ / ⚠ / - 标记和 `→` 动作提示；提 issue 请附面板输出。按键：`e` 清理陈旧 Eclipse 元数据、`m` 选模块、`r` 重扫、`L` 打开日志、`<Tab>` 展开行细节、`q` 关闭。
 
-这是 KLS 已知限制 —— KLS 会把 workspace 内所有 `.java` 文件加入 source path, 所以同名的测试 stub 可能遮蔽 framework 类; 遇到时用 grep/搜索定位真实源码。
+- **实时设置**会等 jdt.ls 报告 ServiceReady 后再下发；增删 sourcePath 不会重启 JVM。
+- **Inlay hints**：插件在 AOSP 树里强制下发 `java.inlayHints.parameterNames.enabled = "none"`（启动时与实时同步都下发）。否则 AOSP stub/jar 里的类型没有 `.java` compilation unit，jdt.ls 的 `InlayHintVisitor.getParameterNames` 会抛 `-32603 Internal error`，而 LazyVim 的 java extra 默认开启它。变量类型等其他 inlay hint 不受影响。
+- **Eclipse 护栏**：残留 `.project` 目录会压制注入。只在面板给出提示时按 `e` —— 它会先彻底停掉 JVM、等待退出，再清理 workspace 并重新 attach（否则 `gd` 找不到定义）。排除规则一旦收敛，该行只作信息展示（`-`，不再提示按 `e`），`.project` 目录按设计会一直留在磁盘上。
 
-### Kotlin 补全/跳转全不工作
+## 状态存放位置
 
-按顺序检查:
-
-1. `:Aosp` 看 `kls classpath` 一项的归属是否为 `nvim`, 以及 `kls client` 是否 attach
-2. `:checkhealth` 或 `:LspInfo` 确认 KLS 已 attach 且 root_dir 非空 (为空说明 root_markers 未生效)
-3. `ls ~/.config/kotlin-language-server/classpath` 确认脚本已生成且可执行
-4. `cd <AOSP模块根> && bash ~/.config/kotlin-language-server/classpath` 手动运行, 确认输出非空 jar 列表
-5. KLS 首次打开大模块需建立索引, 等待 CPU 降下来后再试
-
-切换 jar 模式 (curated/all) 或修改 tag 优先级后, 建议清理 KLS 缓存: `rm -rf ~/.cache/kotlin-language-server`
-
-### 拓展：如何查看 Android Native 代码（在 c/cpp 中跳转和自动补全）
-
-插件会自动接线 clangd（见 [c/cpp（clangd）接线](#ccpp-clangd-接线)），并按 `compdb` → `cc_deps` → `bp` 三级链解析编译旗标。生成 compile_commands.json 是**可选**的：它能提供最精确的逐文件旗标；但只要树里有 `out/soong/module_bp_cc_deps.json`（普通编译即会产生），或文件旁边至少有 `Android.bp`，c/cpp 跳转和补全就已经可用。
-
-如需自行生成 `compdb` 档：
-
-1. 进入源码根目录，配置编译参数（和平时 make 前操作一样）
+所有可重建的状态都在 `stdpath("cache")/aosp-nav`，每个 checkout 一个文件夹：
 
 ```
-cd /path/to/android/  # 替换为你的 AOSP 根目录
-source build/envsetup.sh
-lunch <your_target>       # 例如: lunch aosp_arm64-eng
+cache/aosp-nav/
+  global.json                 共享状态（护栏缓存/排除规则、kotlin root 映射、
+                              崩溃计数、自有 clangd 参数），按绝对路径作 key
+  kotlin-workspace/           共享的 ktlsp storagePath（KLS 内部按项目再分索引）
+  aosp-<djb2(root)>/          state.json（模块选择、picker/护栏状态）
+                              jars.json（jar 扫描缓存）
+                              cpp/（托管的 clangd 编译数据库）
+data/aosp-nav/
+  ktlsp/                      下载的二进制（删除后需联网重建）
 ```
 
-2. 重要，设置 SOONG_GEN_COMPDB=1
+`<djb2(root)>` 是 checkout 根的哈希，所以同名子树的 AOSP 树也不会冲突。升级时会一次性迁移旧的扁平 `data/` 布局；`ktlsp/` 留在 `data/`。删除 cache 目录总是安全的 —— 插件会重新扫描。停用某个 checkout 只需 `rm -rf cache/aosp-nav/aosp-<hash>`；它在 `global.json` 里的残留条目以绝对路径为 key，树删掉后也无害。`:AospReset` 会清空全局状态与分发脚本，然后清扫**所有** `aosp-<hash>/` 文件夹（包括已从磁盘删除的 checkout）并报告数量。
+
+日志位于 `stdpath("log")/aosp-nav.log`，上限 2 MiB：超过后按整行裁剪，只保留最近 1 MiB。
+
+## 开发
 
 ```
-export SOONG_GEN_COMPDB=1
-# 可选：生成格式化（便于阅读）的 JSON 文件
-export SOONG_GEN_COMPDB_DEBUG=1
-# 可选：指定输出目录，$(pwd) 表示当前目录
-export SOONG_LINK_COMPDB_TO=$(pwd)
+lua tests/run.lua              # 纯逻辑测试套
+lua tests/run_e2e.lua          # 端到端：vim shim + 假 AOSP 树
+lua tests/run_spec_check.lua . # 校验两份 README 的安装 spec
 ```
 
-3. 执行编译，例如某个模块
+jar 选择规则位于 `lua/aosp-nav/defaults.lua`，镜像 `aosp-nav-vscode/resources/defaults.json @ 0.2.6` —— 改规则时两侧保持同步。
 
-```
-mm
-# 或者编译整个 Android 项目
-# make -j8
-```
-
-文件通常生成在 `out/soong/development/ide/compdb/compile_commands.json`。插件会自动把 clangd 指向该目录，因此不再需要软链接。若还希望 clangd 自身的向上查找（或其它工具）能找到它，可在源码根目录下创建软链接：
-
-```
-cd /path/to/android/ # 替换为你的 AOSP 根目录
-ln -sf out/soong/development/ide/compdb/compile_commands.json .
-```
-
-然后用 nvim 打开你需要查看的 cpp 文件即可。
-
-**备注**
-
-可以将 `SOONG_GEN_COMPDB=1` 和可选的软链接封装为 make 的拓展函数放到 `~/.bashrc` 文件中：
-
-```
-function make_ex() {
-    SOONG_GEN_COMPDB=1 SOONG_GEN_COMPDB_DEBUG=1 make "$@"
-    if [ -f "out/soong/development/ide/compdb/compile_commands.json" ]; then
-        ln -sf out/soong/development/ide/compdb/compile_commands.json .
-        echo "compile_commands.json is created"
-    fi
-}
-```
-
-想生成 compile_commands.json 时用 `make_ex` 替代 `make` 编译项目（lunch 照常使用）。
-
-```
-source ~/.bashrc
-make_ex -j8               # 代替 make
-```
-
-## License
+## 许可证
 
 MIT
