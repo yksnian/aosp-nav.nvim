@@ -66,6 +66,7 @@
 
 local pathutil = require("aosp-nav.util.path")
 local jvm_lc = require("aosp-nav.java.jvm_lifecycle")
+local navlog = require("aosp-nav.log")
 
 local M = {}
 
@@ -111,9 +112,41 @@ function M.push_settings(client, settings_java)
   -- notification died inside changetracking.flush (self.flags == nil).
   -- Every live push was silently lost; only startup settings ever reached
   -- jdt.ls. Test shims declared notify as a plain function, hiding this.
-  client:notify("workspace/didChangeConfiguration", {
-    settings = { java = settings_java },
-  })
+  local params = { settings = { java = settings_java } }
+  local target = client
+  -- nvim-jdtls may hand us a decorated client; send through the canonical
+  -- Client registered for this id so changetracking state is guaranteed.
+  if vim and vim.lsp and vim.lsp.get_client_by_id and client and client.id then
+    target = vim.lsp.get_client_by_id(client.id) or client
+  end
+  local ok, err = pcall(target.notify, target, "workspace/didChangeConfiguration", params)
+  if not ok then
+    -- Last resort: the client id IS its RPC channel in Neovim. This bypasses
+    -- any wrapper entirely; document-change flushing is irrelevant here.
+    navlog.warn("[aosp-nav] jdt.ls notify failed: " .. tostring(err) .. "; using rpcnotify")
+    if vim and vim.rpcnotify and client and client.id then
+      ok = pcall(vim.rpcnotify, client.id, "workspace/didChangeConfiguration", params)
+    end
+  end
+  if ok then
+    local libs = settings_java
+      and settings_java.project
+      and settings_java.project.referencedLibraries
+    navlog.debug(
+      string.format(
+        "[aosp-nav] jdt.ls settings push delivered: %d jar(s), %d source root(s)",
+        libs and #libs or 0,
+        settings_java
+            and settings_java.project
+            and settings_java.project.sourcePaths
+            and #settings_java.project.sourcePaths
+          or 0
+      )
+    )
+  else
+    navlog.error("[aosp-nav] jdt.ls settings push could not be delivered")
+  end
+  return ok
 end
 
 local function default_defer(fn, ms)
