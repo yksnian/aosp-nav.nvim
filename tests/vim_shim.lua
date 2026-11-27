@@ -343,7 +343,9 @@ function M.make_jdtls_client(root_dir)
     requests = {},
     stopped = false,
   }
-  function client.notify(method, params)
+  -- colon-style to match the real vim.lsp.Client:notify (0.10+); a plain
+  -- function here hides dot/colon mistakes in the plugin's live pushes
+  function client:notify(method, params)
     client.notifications[#client.notifications + 1] = { method = method, params = params }
   end
   -- LSP callbacks are (err, result); defined colon-style to match nvim's

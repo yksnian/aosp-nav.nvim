@@ -19,7 +19,8 @@ local function fake_client(opts)
     config = { root_dir = opts.root_dir or "/aosp/packages/modules/Conn", cmd = {} },
     notifications = {},
   }
-  function client.notify(method, params)
+  -- colon-style to match the real vim.lsp.Client:notify (0.10+)
+  function client:notify(method, params)
     client.notifications[#client.notifications + 1] = { method = method, params = params }
   end
   return client
@@ -169,6 +170,28 @@ t.describe("jdtls channel: ServiceReady gate", function()
       end,
     })
     t.raw_eq(ran, 1, "queueing never strands the sync forever")
+  end)
+end)
+
+t.describe("jdtls channel: live notification signature", function()
+  t.it("push_settings uses Client:notify (colon), not a plain-dot call", function()
+    -- Real vim.lsp.Client:notify is a colon method (runtime/lua/vim/lsp/client.lua).
+    -- A dot call shifts the arguments and dies inside changetracking.flush;
+    -- every live jar push was then silently lost. The fake clients above now
+    -- use colon style too, so keep an explicit metatable-based guard here.
+    local calls = {}
+    local proto = {}
+    function proto:notify(method, params)
+      calls[#calls + 1] = { self = self, method = method, params = params }
+    end
+    local client = setmetatable({ id = 777 }, { __index = proto })
+    channel.push_settings(client, {
+      project = { referencedLibraries = { "/j/a.jar" } },
+    })
+    t.raw_eq(#calls, 1, "one notification")
+    t.raw_eq(calls[1].self, client, "self is the client, not the method name")
+    t.raw_eq(calls[1].method, "workspace/didChangeConfiguration")
+    t.raw_eq(calls[1].params.settings.java.project.referencedLibraries[1], "/j/a.jar")
   end)
 end)
 

@@ -105,7 +105,13 @@ M.client_for = client_for
 ---Push settings via didChangeConfiguration. jdt.ls applies
 ---referencedLibraries and (client-root-relative) sourcePaths changes live.
 function M.push_settings(client, settings_java)
-  client.notify("workspace/didChangeConfiguration", {
+  -- Client:notify is a colon method in Neovim 0.10+ (vim.lsp/client.lua).
+  -- Calling it with a dot used to shift every argument by one: `method`
+  -- became the params table, `self` became the method string, and the real
+  -- notification died inside changetracking.flush (self.flags == nil).
+  -- Every live push was silently lost; only startup settings ever reached
+  -- jdt.ls. Test shims declared notify as a plain function, hiding this.
+  client:notify("workspace/didChangeConfiguration", {
     settings = { java = settings_java },
   })
 end
