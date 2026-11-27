@@ -4,7 +4,8 @@
 -- any statusline (lualine, heirline, fidget...) can show it; the plugin
 -- spec in the README wires a lualine component automatically.
 --
--- States: idle / scanning / ready(n) / no-out / blocked(n stale)
+-- States: idle / scanning / ready(n) / source-only / blocked(n stale)
+-- `no-out` is kept as a legacy alias for callers that still publish it.
 -- vim.g.aosp_nav = { status = "ready", jars = 774, root = "/aosp",
 --                    scope = "packages/modules/Connectivity"|nil,
 --                    detail = "cached", blocked = 0 }
@@ -84,8 +85,10 @@ function M.component()
   if g.status == "scanning" then
     return "AOSP:…"
   end
-  if g.status == "no-out" then
-    return "AOSP:no-out"
+  -- Degraded beats `blocked`: a pending Eclipse clean is a ready-state
+  -- concern, while "no build outputs" is the reason there are no jars at all.
+  if g.status == "source-only" or g.status == "no-out" then
+    return "AOSP:src"
   end
   if g.status == "blocked" or (g.blocked and g.blocked > 0) then
     return string.format("AOSP:%d stale", g.blocked)

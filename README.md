@@ -22,7 +22,7 @@ AOSP is not a Gradle/Maven project: a bare jdt.ls sees only the file you opened,
 - A jdt.ls client: [nvim-jdtls](https://github.com/mfussenegger/nvim-jdtls) (LazyVim's java extra) or any setup starting jdt.ls with `name = "jdtls"`
 - Optional C/C++: clangd via [nvim-lspconfig](https://github.com/neovim/nvim-lspconfig) — the checkout's prebuilt clangd wins, one on `PATH` is fallback
 - Optional Kotlin: on by default — see [Kotlin support](#kotlin-support)
-- A **compiled** AOSP tree (`out/soong/.intermediates` present)
+- An AOSP checkout; a **compiled** tree (`out/soong/.intermediates` present) is optional — without build outputs the plugin enters [source-only mode](#without-build-outputs-source-only)
 
 The plugin never sets JVM heap or vmargs. For a large tree, add `-Xmx8g` in your own jdtls config.
 
@@ -57,7 +57,7 @@ return {
 
 If you previously installed from a local `dir` path, remove that entry and run `:Lazy clean` once after switching to the repository form.
 
-Open a `.java` file in the tree: the statusline shows `AOSP:<n>` once the classpath is in (`<n>` is the jar count, e.g. `AOSP:774`). The first scan takes seconds; the first jdt.ls index of a large tree takes a while, once, with high CPU.
+Open a `.java` file in the tree: the statusline shows `AOSP:<n>` once the classpath is in (`<n>` is the jar count, e.g. `AOSP:774`), or `AOSP:src` when the tree has no build outputs. The first scan takes seconds; the first jdt.ls index of a large tree takes a while, once, with high CPU.
 
 ### Wiring in a non-lazy setup
 
@@ -118,6 +118,14 @@ By default cross-module `gd` lands in the decompiled `jdt://` view of an injecte
 - a subtree scope (e.g. `packages/modules/Connectivity`) auto-selects its production modules;
 - `:AospModules` picks modules yourself (saved **per window scope**); `source_roots` adds hand-written roots. Unpicked modules keep jar navigation but no source navigation.
 
+### Without build outputs (source-only)
+
+An unbuilt checkout is still a valid AOSP tree. Instead of failing, the plugin enters `source-only`: no `referencedLibraries` are written (an existing classpath is left untouched), and `sourcePaths` are derived from the open file's module — the `Android.bp` directory itself when its basename is `java`/`src`/`kotlin`, otherwise `src/java` → `src/main/java` → `src` → `java` → `kotlin` — plus any `source_roots` you configured (16 roots max). Cross-module jumps into jars do not work until you build; navigation inside the opened module does.
+
+- The statusline shows `AOSP:src`; `:Aosp` adds a `build outputs` row and marks jar scan/source as info (`-`), never as ✓/⚠.
+- No jar cache is written **or deleted**. After `lunch + m`, entering an AOSP buffer again (or `:AospRescan`) upgrades the session to normal `ready` operation.
+- `.kls` support files and the Kotlin classpath script are still written, but ktlsp is **not** downloaded when you open a Java file on an unbuilt tree; the first `.kt` file triggers that download. With no jars, Kotlin dependency resolution is empty — only the source roots above are navigable.
+
 ## Commands
 
 | Command | Description |
@@ -171,7 +179,7 @@ The checkout's prebuilt clangd wins, one on `PATH` is fallback, and an absolute 
 Upstream fwcd kotlin-language-server walks every workspace directory on startup — from an AOSP root it hangs. The plugin dispatches by project:
 
 - A **global dispatch script** at `$XDG_CONFIG_HOME/kotlin-language-server/classpath` (default `~/.config/kotlin-language-server/classpath`) answers only for known AOSP roots; every other project falls through to fwcd's normal Gradle/Maven resolution. A user-managed script is never touched; scripts written by the aosp-nav family are backed up and taken over.
-- Inside the tree, `.kls/` support files remove unbounded scans, a pinned [ktlsp](https://codeberg.org/winlogon/ktlsp) binary is bootstrapped once (needs JDK 21), and orphan servers are reaped on exit.
+- Inside the tree, `.kls/` support files remove unbounded scans, a pinned [ktlsp](https://codeberg.org/winlogon/ktlsp) binary is bootstrapped once (needs JDK 21), and orphan servers are reaped on exit. On an unbuilt tree the support files are still written but the binary download waits for the first `.kt` file.
 
 Kotlin is on by default; disable with `kotlin = { enabled = false }`.
 
@@ -179,6 +187,7 @@ Kotlin is on by default; disable with `kotlin = { enabled = false }`.
 
 Run `:Aosp` first. It groups rows into General / Java / Kotlin / C/C++ with ✓ / ⚠ / - marks and `→` action hints; attach its output to bug reports. Keys: `e` clean stale Eclipse metadata, `m` modules, `r` rescan, `L` log, `<Tab>` full vmargs / module list, `q` close.
 
+- **No `out/`**: the statusline reads `AOSP:src` and only module-internal Java navigation works. Build the tree and re-enter an AOSP buffer (or `:AospRescan`) to restore jar-based cross-module navigation; Kotlin dependencies stay unresolved until then. Set `source_roots` explicitly when the open file is not under a module with an `Android.bp`.
 - **Live settings** wait for jdt.ls ServiceReady; adding/removing sourcePaths never restarts the JVM.
 - **Inlay hints**: the plugin forces `java.inlayHints.parameterNames.enabled = "none"` on AOSP trees (start + live). Without it jdt.ls throws `-32603` from `InlayHintVisitor.getParameterNames` when an AOSP stub/jar type has no `.java` compilation unit, and LazyVim's java extra enables it by default. Other inlay hints are unaffected.
 - **Eclipse guard**: stale `.project` dirs suppress injection. Press `e` only when the panel offers it — it retires the JVM, waits for exit, wipes its workspace and re-attaches (otherwise `gd` finds nothing). Once exclusions converge the row is informational (`-`, no `e`), and the `.project` dirs stay on disk by design.

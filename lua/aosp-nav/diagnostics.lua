@@ -136,6 +136,10 @@ function M.collect(D)
     root_source = "last session"
   end
   local sess = root and S.sessions[pathutil.normalize(root)]
+  local phase_label = "no session yet"
+  if sess then
+    phase_label = sess.phase == "source-only" and "source-only (no build outputs)" or sess.phase
+  end
   -- The jar count belongs to the Java "jar source" row; repeating it here
   -- was the most visible duplication in the panel. "active editor" is the
   -- default source and adds nothing; the other two mean root did NOT come
@@ -147,15 +151,20 @@ function M.collect(D)
   row(
     root ~= nil,
     "root",
-    root ~= nil
-        and string.format(
-          "%s%s — %s",
-          root,
-          root_source_note,
-          sess and sess.phase or "no session yet"
-        )
+    root ~= nil and string.format("%s%s — %s", root, root_source_note, phase_label)
       or "not detected (no AOSP file open and no AOSP workspace folder)"
   )
+  if sess and sess.phase == "source-only" then
+    -- The reason for the degraded state is a fact, not a failure: source
+    -- roots come from the open file, cross-module jars need a build.
+    row(
+      nil,
+      "build outputs",
+      "missing or empty — source-only (module sources from the open file)",
+      "build the tree (lunch + m), then :AospRescan for cross-module jars",
+      "General"
+    )
+  end
 
   -- window scope (the VS Code workspace-folder counterpart): it, not the
   -- root, scopes the module picker, the auto module selection and the
@@ -224,7 +233,18 @@ function M.collect(D)
     end
     -- sess.meta is written by session._scan_root (the Java jar scan); its
     -- verify counts jars, so this row belongs under Java, not General.
-    row(nil, "jar scan", short, nil, "Java", full)
+    if sess.phase == "source-only" then
+      row(
+        nil,
+        "jar scan",
+        "skipped (no build outputs)",
+        nil,
+        "Java",
+        "source-only: sourcePaths were planned without scanning jars"
+      )
+    else
+      row(nil, "jar scan", short, nil, "Java", full)
+    end
   end
 
   -- Java runtime facts the VSCode panel shows next to the plan: which
@@ -306,7 +326,18 @@ function M.collect(D)
         and string.format(", %d module jar(s) removed (sources injected)", sess.own_jars_dropped)
       or ""
     local injected = string.format("%d jar(s) injected", #sess.jars)
-    if p.mode == "closure" then
+    if sess.phase == "source-only" then
+      -- An empty jar list is the designed degraded state, not a failed
+      -- fallback: no ✓/⚠ here, just the fact and what it means.
+      row(
+        nil,
+        "jar source",
+        "0 injected (source-only)",
+        nil,
+        "Java",
+        "no build outputs: no jar classpath; sourcePaths cover the opened module"
+      )
+    elseif p.mode == "closure" then
       -- Module selection is reported once, in sourceRootModules below (with
       -- its concrete paths). The reconciliation is diagnostic detail, so
       -- <Tab> reveals it while the default row stays a single count.
@@ -386,7 +417,9 @@ function M.collect(D)
         false,
         "sourcePaths",
         short,
-        "press m to pick modules under this window (or r for auto)",
+        sess.phase == "source-only"
+            and "set source_roots or build the tree (lunch + m) for cross-module navigation"
+          or "press m to pick modules under this window (or r for auto)",
         "Java",
         full
       )
@@ -539,6 +572,16 @@ function M.collect(D)
     end
     if #missing > 0 then
       row(false, "kotlin ktlsp", "missing: " .. table.concat(missing, ", "), nil, "Kotlin")
+    elseif sess and sess.phase == "source-only" then
+      -- Support files are present, so there is no warning; but with no jars
+      -- the Kotlin server has no cross-module dependency resolution yet.
+      row(
+        nil,
+        "kotlin ktlsp",
+        string.format("%d exclusions; source-only (no Kotlin dependency jars)", kp.exclusions),
+        nil,
+        "Kotlin"
+      )
     else
       row(
         true,

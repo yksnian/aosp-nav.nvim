@@ -1078,9 +1078,9 @@ t.describe("E2E: kotlin channel", function()
     shim.set_active_file(module_dir .. "/NetdClient.kt", "kotlin")
     local captured = nil
     local real_apply = kotlin.apply_full
-    kotlin.apply_full = function(root, jars, l, extra)
+    kotlin.apply_full = function(root, jars, l, extra, opts)
       captured = extra
-      return real_apply(root, jars, l, extra)
+      return real_apply(root, jars, l, extra, opts)
     end
     session._state().sessions[AOSP] = nil
     session.run_for(AOSP)
@@ -3016,6 +3016,109 @@ t.describe("E2E: source-only mode (no out)", function()
     t.raw_eq(sess.phase, "ready", "a rebuilt tree upgrades from source-only")
     t.truthy(sess.jars and #sess.jars > 0, "real jars are injected again")
     t.truthy(store:read_cache(AOSP), "jar cache is written again")
+  end)
+
+  t.it("statusline and panel describe the degraded state without false warnings", function()
+    local old_cf = enter_no_out()
+    local S = session._state()
+    session.run_for(AOSP)
+    S.deps.current_file = old_cf
+
+    t.raw_eq(vim.g.aosp_nav.status, "source-only", "the status global carries the new phase")
+    t.raw_eq(require("aosp-nav.status").component(), "AOSP:src")
+    local diagnostics = require("aosp-nav.diagnostics")
+    local aosp_nav = require("aosp-nav")
+    local text = diagnostics.render(diagnostics.collect({
+      cfg = aosp_nav.get_opts,
+      store = aosp_nav._store(),
+      workspace_folders = function()
+        return { AOSP }
+      end,
+    }))
+    t.truthy(text:find("source-only (no build outputs)", 1, true), "root row is readable")
+    t.truthy(text:find("- build outputs: missing or empty", 1, true), "degradation reason is shown")
+    t.truthy(text:find("- jar scan: skipped (no build outputs)", 1, true))
+    t.truthy(text:find("- jar source: 0 injected (source-only)", 1, true))
+    t.falsy(text:find("✓ jar source", 1, true), "no empty classpath is reported as success")
+    t.falsy(text:find("⚠ jar source", 1, true), "no empty classpath is reported as a failure")
+  end)
+
+  t.it("checkhealth explains missing build outputs without a hard error", function()
+    local old_cf = enter_no_out()
+    local S = session._state()
+    session.run_for(AOSP)
+    S.deps.current_file = old_cf
+    shim._cwd = AOSP
+    local saved_health = vim.health
+    local seen = { ok = {}, warn = {}, err = {}, info = {} }
+    vim.health = {
+      start = function() end,
+      ok = function(m)
+        seen.ok[#seen.ok + 1] = m
+      end,
+      warn = function(m)
+        seen.warn[#seen.warn + 1] = m
+      end,
+      error = function(m)
+        seen.err[#seen.err + 1] = m
+      end,
+      info = function(m)
+        seen.info[#seen.info + 1] = m
+      end,
+    }
+    require("aosp-nav.health").check()
+    vim.health = saved_health
+    local joined = table.concat(seen.err, "\n") .. "\n" .. table.concat(seen.warn, "\n")
+    t.falsy(joined:find("build the tree first", 1, true), "no hard error for a missing out/")
+    t.truthy(joined:find("source-only", 1, true), "degradation is explained")
+    t.truthy(
+      table.concat(seen.warn, "\n"):find("source-only session", 1, true),
+      "the session row reports the degraded state"
+    )
+  end)
+
+  t.it("writes .kls support files without downloading ktlsp on a Java file", function()
+    local old_cf = enter_no_out()
+    local S = session._state()
+    aosp_nav.set_opts({ kotlin = { enabled = true }, log_level = "debug" })
+    local kotlin = require("aosp-nav.kotlin.channel")
+    local real_bootstrap = kotlin.ensure_bootstrap
+    local calls = 0
+    kotlin.ensure_bootstrap = function()
+      calls = calls + 1
+    end
+    session.run_for(AOSP)
+    kotlin.ensure_bootstrap = real_bootstrap
+    S.deps.current_file = old_cf
+
+    t.raw_eq(calls, 0, "a source-only Java scan stays offline")
+    local probe = kotlin.probe(AOSP)
+    t.truthy(probe.exclusions and probe.exclusions > 5, "kls exclusions written")
+    t.truthy(probe.gitignore, "gitignore prune written")
+    t.truthy(probe.kls_classpath, "kls-classpath script written")
+  end)
+
+  t.it("opening a .kt file triggers the deferred ktlsp bootstrap", function()
+    local old_cf = enter_no_out()
+    local S = session._state()
+    aosp_nav.set_opts({ kotlin = { enabled = true }, log_level = "debug" })
+    local kotlin = require("aosp-nav.kotlin.channel")
+    local real_bootstrap = kotlin.ensure_bootstrap
+    local calls = 0
+    kotlin.ensure_bootstrap = function()
+      calls = calls + 1
+    end
+    session.run_for(AOSP)
+    S.deps.current_file = old_cf
+    t.raw_eq(calls, 0, "still offline before a Kotlin buffer")
+
+    shim.set_active_file(
+      AOSP .. "/frameworks/base/core/java/com/android/internal/util/Sample.kt",
+      "kotlin"
+    )
+    shim.fire_filetype("kotlin")
+    kotlin.ensure_bootstrap = real_bootstrap
+    t.raw_eq(calls, 1, "the first Kotlin buffer triggers the download")
   end)
 end)
 

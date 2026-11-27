@@ -1138,7 +1138,7 @@ function M._scan_root(root)
       sess.phase = "source-only"
       sess.source_only_stamp = stamp
       if deps.status then
-        deps.status.set(root, "no-out", 0)
+        deps.status.set(root, "source-only", 0)
       end
       if deps.notify and notified_once(root, "source-only") then
         deps.notify(
@@ -1349,7 +1349,7 @@ function M._scan_root(root)
   -- apply below: KLS bootstrap/cleanup has no outer pcall of its own, and a
   -- bubble-up would be normalized to phase=failed by the queue error path.
   if cfg.kotlin.enabled and deps.kotlin then
-    local ok_kotlin, err_kotlin = pcall(deps.kotlin.apply, root, jars, log)
+    local ok_kotlin, err_kotlin = pcall(deps.kotlin.apply, root, jars, log, source_only)
     if not ok_kotlin then
       log("[aosp-nav] kotlin apply failed (Java navigation continues): " .. tostring(err_kotlin))
     end
@@ -1392,7 +1392,7 @@ function M._scan_root(root)
   if degraded then
     notify_reset(root, "scan-failed") -- a still-unbuilt tree is not a failure
     if deps.status then
-      deps.status.set(root, "no-out", 0)
+      deps.status.set(root, "source-only", 0)
       deps.status.set_blocked(guard.get_blocked_count())
     end
   else

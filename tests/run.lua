@@ -62,6 +62,7 @@ local specs = {
   "spec.guard_prestart_spec",
   "spec.log_spec",
   "spec.diagnostics_spec",
+  "spec.status_spec",
 }
 
 for _, spec in ipairs(specs) do

@@ -318,7 +318,7 @@ function M.setup(opts)
       })
     end,
     kotlin = {
-      apply = function(root, jars, l)
+      apply = function(root, jars, l, source_only)
         local kotlin = require("aosp-nav.kotlin.channel")
         -- KLS is rooted at the nearest module dir, and the global classpath
         -- script dispatches on an exact $PWD match. Pass that module dir so
@@ -331,7 +331,7 @@ function M.setup(opts)
             extra[1] = dir
           end
         end
-        kotlin.apply_full(root, jars, l, extra)
+        kotlin.apply_full(root, jars, l, extra, { no_bootstrap = source_only })
       end,
     },
   }
@@ -452,6 +452,14 @@ function M.setup(opts)
       last_aosp_file = file
       -- scope-aware run: re-plans when the effective folder changed
       session.run_for_scoped(root, effective_folder(root))
+      -- A source-only scan deliberately skips the ktlsp download so a Java
+      -- file on an unbuilt tree stays offline. The first real Kotlin buffer
+      -- is when the JVM is actually needed.
+      if cfg.kotlin.enabled and args.match == "kotlin" then
+        pcall(function()
+          require("aosp-nav.kotlin.channel").ensure_bootstrap()
+        end)
+      end
       -- eclipse guard: deferred past activation so the (expensive) tree
       -- walk does not compete with the language server import; scoped to
       -- the effective folder (the VS Code guard scans workspace folders)
@@ -545,6 +553,13 @@ function M.setup(opts)
       if ft == "java" or ft == "kotlin" then
         last_aosp_file = file
         session.run_for_scoped(root, effective_folder(root))
+        -- A Kotlin buffer restored at startup needs the same deferred ktlsp
+        -- bootstrap as the FileType hook (which may not have fired yet).
+        if ft == "kotlin" and cfg.kotlin.enabled then
+          pcall(function()
+            require("aosp-nav.kotlin.channel").ensure_bootstrap()
+          end)
+        end
       elseif ft == "c" or ft == "cpp" then
         require("aosp-nav.clangd.controller").on_file(file)
       end

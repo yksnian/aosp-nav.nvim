@@ -22,7 +22,7 @@ AOSP 不是 Gradle/Maven 工程：裸的 jdt.ls 只能看见你打开的文件�
 - Java 语言服务器客户端：[nvim-jdtls](https://github.com/mfussenegger/nvim-jdtls)（LazyVim 的 java extra 用的就是它），或任何以 `name = "jdtls"` 启动 jdt.ls 的配置
 - 可选，C/C++：经 [nvim-lspconfig](https://github.com/neovim/nvim-lspconfig) 接入的 clangd —— 优先树内预编译版，`PATH` 上的只是兜底
 - 可选，Kotlin：默认开启 —— 见 [Kotlin 支持](#kotlin-支持)
-- 一棵**已编译**的 AOSP 树（存在 `out/soong/.intermediates`）
+- 一棵 AOSP 检出；**已编译**的树（存在 `out/soong/.intermediates`）是可选的 —— 没有构建产物时插件进入[源码导航降级模式](#没有构建产物source-only)
 
 插件不设置 JVM 堆或 vmargs。大树请在自己的 jdtls 配置里加 `-Xmx8g`。
 
@@ -56,7 +56,7 @@ return {
 
 如果之前用本地 `dir` 路径安装，删掉那条 spec，切换到仓库形式后执行一次 `:Lazy clean`。
 
-在树里打开 `.java`：状态栏出现 `AOSP:<n>` 即 classpath 已注入（`<n>` 是 jar 数，例如 `AOSP:774`）。首次扫描几秒；大树首次 jdt.ls 索引较久、一次性、CPU 高属正常。
+在树里打开 `.java`：状态栏出现 `AOSP:<n>` 即 classpath 已注入（`<n>` 是 jar 数，例如 `AOSP:774`）；树尚未编译时显示 `AOSP:src`。首次扫描几秒；大树首次 jdt.ls 索引较久、一次性、CPU 高属正常。
 
 ### 非 lazy 环境的接线
 
@@ -117,6 +117,14 @@ require("aosp-nav").setup({
 - 子树范围（如 `packages/modules/Connectivity`）自动选择其下的生产模块；
 - `:AospModules` 自选模块（按**窗口范围分别保存**）；`source_roots` 添加手写根。未选中的模块保留 jar 导航，但没有源码导航。
 
+### 没有构建产物（source-only）
+
+未编译的 checkout 仍是合法的 AOSP 树。插件不会失败，而是进入 `source-only`：不写 `referencedLibraries`（已有 classpath 保持原样），`sourcePaths` 从当前文件所在模块推导 —— `Android.bp` 目录名本身是 `java`/`src`/`kotlin` 时就用它，否则按 `src/java` → `src/main/java` → `src` → `java` → `kotlin` 顺序取第一个存在的，再合并你配置的 `source_roots`（最多 16 个）。构建前跨模块跳转到 jar 不可用，但当前模块内部导航可用。
+
+- 状态栏显示 `AOSP:src`；`:Aosp` 增加一行 `build outputs`，jar 扫描与 jar 来源显示为信息（`-`），不会误报 ✓/⚠。
+- 不写**也不删** jar 缓存。执行 `lunch + m` 后再进入 AOSP 缓冲区（或 `:AospRescan`），会话自动升级为正常的 `ready` 模式。
+- `.kls` 支撑文件和 Kotlin classpath 分发脚本照常写入，但在未编译的树上打开 Java 文件**不会**下载 ktlsp；第一次打开 `.kt` 文件才触发下载。没有 jar 时 Kotlin 依赖解析为空，仅上面这些源码根内的导航可用。
+
 ## 命令
 
 | 命令 | 说明 |
@@ -170,7 +178,7 @@ Neovim 没有工作区文件夹概念，插件会推导**有效窗口范围**，
 上游 fwcd kotlin-language-server 启动时会遍历工作区的每个目录 —— 从 AOSP 根启动会永久卡死。因此插件按工程分发：
 
 - `XDG_CONFIG_HOME` 下的**全局分发脚本** `$XDG_CONFIG_HOME/kotlin-language-server/classpath`（未设置时为 `~/.config/kotlin-language-server/classpath`）只对已知 AOSP 根应答；其他工程原样放行，走 fwcd 正常的 Gradle/Maven 解析。用户自管脚本永不上碰；aosp-nav 家族写的脚本会先备份再接管。
-- 树内由 `.kls/` 支持文件消除无界扫描，自动引导固定版本的 [ktlsp](https://codeberg.org/winlogon/ktlsp)（一次性下载，需要 JDK 21），退出时清理孤儿服务进程。
+- 树内由 `.kls/` 支持文件消除无界扫描，自动引导固定版本的 [ktlsp](https://codeberg.org/winlogon/ktlsp)（一次性下载，需要 JDK 21），退出时清理孤儿服务进程。未编译的树上支撑文件照写，但二进制下载会推迟到第一次打开 `.kt` 文件。
 
 Kotlin 默认开启；用 `kotlin = { enabled = false }` 关闭。
 
@@ -178,6 +186,7 @@ Kotlin 默认开启；用 `kotlin = { enabled = false }` 关闭。
 
 先运行 `:Aosp`。面板按 通用 / Java / Kotlin / C/C++ 分组，用 ✓ / ⚠ / - 标记和 `→` 动作提示；提 issue 请附面板输出。按键：`e` 清理陈旧 Eclipse 元数据、`m` 选模块、`r` 重扫、`L` 打开日志、`<Tab>` 展开行细节、`q` 关闭。
 
+- **没有 `out/`**：状态栏显示 `AOSP:src`，只有模块内部 Java 导航可用。编译后重新进入 AOSP 缓冲区（或 `:AospRescan`）即可恢复基于 jar 的跨模块导航；在此之前 Kotlin 依赖解析为空。若当前文件不在带 `Android.bp` 的模块下，请用 `source_roots` 显式指定源码根。
 - **实时设置**会等 jdt.ls 报告 ServiceReady 后再下发；增删 sourcePath 不会重启 JVM。
 - **Inlay hints**：插件在 AOSP 树里强制下发 `java.inlayHints.parameterNames.enabled = "none"`（启动时与实时同步都下发）。否则 AOSP stub/jar 里的类型没有 `.java` compilation unit，jdt.ls 的 `InlayHintVisitor.getParameterNames` 会抛 `-32603 Internal error`，而 LazyVim 的 java extra 默认开启它。变量类型等其他 inlay hint 不受影响。
 - **Eclipse 护栏**：残留 `.project` 目录会压制注入。只在面板给出提示时按 `e` —— 它会先彻底停掉 JVM、等待退出，再清理 workspace 并重新 attach（否则 `gd` 找不到定义）。排除规则一旦收敛，该行只作信息展示（`-`，不再提示按 `e`），`.project` 目录按设计会一直留在磁盘上。

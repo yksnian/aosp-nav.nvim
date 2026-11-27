@@ -2,6 +2,8 @@
 -- Reports the plugin's environment: tree detection, build outputs, cache,
 -- module index, language-server wiring hints.
 
+local pathutil = require("aosp-nav.util.path")
+
 local M = {}
 
 local function ok(msg)
@@ -60,7 +62,7 @@ function M.check()
         .. (bufname ~= "" and bufname or "none")
         .. ", cwd: "
         .. cwd
-        .. ") — open a java/kotlin/c file inside a compiled tree (out/soong/.intermediates must exist)"
+        .. ") — open a java/kotlin/c file inside an AOSP checkout (build outputs are optional)"
     )
     return
   end
@@ -70,13 +72,17 @@ function M.check()
   if fs.is_dir(root .. "/out/soong/.intermediates") then
     ok("soong intermediates present")
   else
-    err("out/soong/.intermediates missing — build the tree first")
+    warn(
+      "out/soong/.intermediates missing — source-only mode: module sources from the open file are "
+        .. "navigable; build the tree (lunch + m) for cross-module jars"
+    )
   end
   if fs.is_file(root .. "/out/soong/module_bp_java_deps.json") then
     ok("java build index present (module_bp_java_deps.json)")
   else
     warn(
-      "out/soong/module_bp_java_deps.json missing — the closure cannot be computed; the full-list fallback applies"
+      "out/soong/module_bp_java_deps.json missing — the closure cannot be computed; source-only "
+        .. "derives source roots from the open file (source_roots adds more)"
     )
   end
   if fs.is_file(root .. "/out/soong/module_bp_cc_deps.json") then
@@ -90,10 +96,19 @@ function M.check()
   -- session state
   local session = require("aosp-nav.session")
   local S = session._state()
-  local sess = S.sessions[root]
+  local sess = S.sessions[pathutil.normalize(root)]
   if sess then
     if sess.phase == "ready" then
       ok(string.format("session ready: %d jars injected (%s)", #sess.jars, sess.plan.mode))
+    elseif sess.phase == "source-only" then
+      local n = sess.source_paths and sess.source_paths.rel_paths and #sess.source_paths.rel_paths
+        or 0
+      warn(
+        string.format(
+          "source-only session: %d source root(s), no jars — cross-module navigation needs a build",
+          n
+        )
+      )
     else
       info("session phase: " .. sess.phase)
     end

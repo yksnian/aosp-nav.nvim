@@ -516,11 +516,16 @@ function M.ensure_kls_support(root, jars)
 end
 
 ---Apply + kls support in one call (the session's kotlin hook).
-function M.apply_full(root, jars, log2, extra_paths)
+---`opts.no_bootstrap` is for source-only trees: support files are still
+---written, but a Java file open must not download the ~87 MiB ktlsp binary.
+---Opening a real .kt file triggers ensure_bootstrap from the FileType hook.
+function M.apply_full(root, jars, log2, extra_paths, opts)
   local r = M.apply(root, jars, log2, extra_paths)
   if not r.blocked then
     M.ensure_kls_support(root, jars)
-    M.ensure_bootstrap()
+    if not (opts and opts.no_bootstrap) then
+      M.ensure_bootstrap()
+    end
     M.cleanup_stale_procs()
   end
   return r
