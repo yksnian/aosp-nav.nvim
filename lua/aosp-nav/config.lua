@@ -7,6 +7,7 @@
 --
 --   enabled        master switch
 --   android_root   escape hatch for checkouts whose markers are unusual
+--   scope          "auto" (default) | "tree" — force the whole-tree window scope
 --   exclude        { jars, paths, globs } — user-private stubs/patterns
 --   source_roots   hand-written roots outside the build index
 --   kotlin.enabled Kotlin support (fwcd/ktlsp classpath channel)
@@ -46,6 +47,11 @@ M.defaults = {
   enabled = true,
   ---Explicit AOSP root; auto-detected per opened file when nil.
   android_root = nil,
+  ---Window scope: "auto" derives it from cwd + the active file (see scope.lua);
+  ---"tree" pins it to the AOSP checkout top regardless of cwd — useful when
+  ---nvim starts in a subtree (e.g. frameworks/base) but you want whole-tree
+  ---jar navigation (mainline modules such as Wifi) without a :cd + restart.
+  scope = "auto",
   ---User exclusion lists. Always appended to the built-in defaults (the
   ---defaults cover the AOSP stubs that must stay out of the classpath).
   exclude = {

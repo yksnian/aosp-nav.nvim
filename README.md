@@ -85,12 +85,13 @@ aosp_nav.none_ls_opts(none_ls_opts)                   -- your none-ls opts table
 
 ## Configuration
 
-Seven keys; everything derivable from the tree is derived (AOSP root, window scope, module selection, Java autobuild, prebuilt clangd, ktlsp bootstrap, process cleanup, clangd restart debounce).
+Eight keys; everything derivable from the tree is derived (AOSP root, module selection, Java autobuild, prebuilt clangd, ktlsp bootstrap, process cleanup, clangd restart debounce).
 
 ```lua
 require("aosp-nav").setup({
   enabled = true,
   android_root = nil,           -- explicit root; auto-detected per file when nil
+  scope = "auto",               -- "tree" pins the window to the AOSP checkout top (see below)
   exclude = {
     jars = {},                  -- regex on jar file name AND module name
     paths = {},                 -- substring on the path relative to .intermediates/
@@ -145,6 +146,8 @@ Neovim has no workspace folders, so the plugin derives an **effective window sco
 - no signal → root window.
 
 The pin is per AOSP root. Crossing into another subtree later changes nothing — no re-plan, no prompt, no second jdt.ls; `root_dir` is the pinned scope. To work elsewhere, restart nvim there or `:cd` into it before the first AOSP file is focused. There is one jdt.ls JVM per checkout/workspace.
+
+**Always use the whole tree**: set `scope = "tree"` in your `setup()` options when you start nvim in a subtree (e.g. `frameworks/base`) but want the VS Code "workspace folder = AOSP checkout" setup — whole-tree jar navigation, so mainline modules such as `packages/modules/Wifi` resolve from the same session. It pins the scope to the checkout top on first use, exactly as if you had launched nvim there; your cwd is **not** changed and no restart is needed. The root-window rules still apply: the two default source-root modules, autobuild off, and a single jdt.ls. Pick extra source roots with `:AospModules` (or `source_roots`) if you also want to jump into Wifi's real sources instead of its decompiled jars. Leave `scope` unset (or `"auto"`) for the cwd/file derivation above.
 
 **Normal `:q` sends no signal to jdt.ls.** Neovim's LSP shutdown is when Eclipse flushes a clean workspace snapshot, and racing that save with SIGTERM previously left `.metadata` dirty (≈95 s recovery on the next open). After an abnormal exit (`:qa!`, crash), the next start reclaims orphan JVMs indexing the same workspace: SIGTERM, wait up to ~8 s, then start fresh — never SIGKILL, which corrupts `.metadata`. A JVM with a live editor (nvim/lvim) in its parent chain is never touched.
 

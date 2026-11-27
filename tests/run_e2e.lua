@@ -2243,6 +2243,72 @@ t.describe("E2E: window scope + live source-path sync", function()
     t.truthy(sess)
     t.raw_eq(sess.folder, AOSP, "cwd == top stays a root window")
   end)
+
+  t.it("scope=tree: a subtree cwd still gets the whole-tree root window", function()
+    -- The user works in frameworks/base and opens a Wifi file from history;
+    -- with scope="tree" the plugin must pin the checkout top (the VS Code
+    -- "workspace folder = AOSP" setup) without touching cwd or restarting.
+    aosp_nav.set_opts({ kotlin = { enabled = false }, log_level = "debug", scope = "tree" })
+    session._state().sessions[AOSP] = nil
+    aosp_nav._clear_pinned_folders()
+    shim.shim.clients = {}
+    shim._cwd = AOSP .. "/frameworks/base"
+    shim.set_active_file(
+      AOSP .. "/packages/modules/Wifi/framework/java/com/example/wifi/Wifi.java",
+      "java"
+    )
+    shim.fire_filetype("java")
+    local sess = session._state().sessions[AOSP]
+    t.truthy(sess, "a session was planned")
+    t.raw_eq(sess.folder, AOSP, "scope=tree pins the checkout top despite a subtree cwd")
+    t.raw_eq(_G.vim.g.aosp_nav.scope, nil, "the statusline carries no subtree scope suffix")
+    t.raw_eq(sess.seeded_defaults, true, "root window seeds the default modules")
+    t.raw_eq(
+      sess.plan.mode,
+      "fallback",
+      "the whole-tree jar list is kept — mainline Wifi jars stay navigable"
+    )
+    local has_wifi = false
+    for _, j in ipairs(sess.jars) do
+      if j:find("Wifi/framework/java/wifi/android_common", 1, true) then
+        has_wifi = true
+      end
+    end
+    t.truthy(has_wifi, "the Wifi impl jar is injected (gd from frameworks/base can resolve it)")
+  end)
+
+  t.it("scope=tree pins jdtls root_dir to the checkout top even from a subtree cwd", function()
+    aosp_nav.set_opts({ kotlin = { enabled = false }, log_level = "debug", scope = "tree" })
+    aosp_nav._clear_pinned_folders()
+    shim._cwd = AOSP .. "/frameworks/base"
+    local opts = {
+      root_dir = function()
+        return AOSP .. "/frameworks/base"
+      end,
+      settings = { java = {} },
+    }
+    aosp_nav.jdtls_opts(opts)
+    local wifi_file = AOSP .. "/packages/modules/Wifi/framework/java/com/example/wifi/Wifi.java"
+    t.raw_eq(opts.root_dir(wifi_file), AOSP, "root_dir is the checkout top, not the cwd subtree")
+    t.raw_eq(opts.root_dir(AOSP .. "/frameworks/base/core/java/x.java"), AOSP, "and stays pinned")
+  end)
+
+  t.it("scope=tree does not leak into the next session when the option is cleared", function()
+    aosp_nav.set_opts({ kotlin = { enabled = false }, log_level = "debug", scope = "auto" })
+    session._state().sessions[AOSP] = nil
+    aosp_nav._clear_pinned_folders()
+    shim.shim.clients = {}
+    shim._cwd = AOSP .. "/frameworks/base"
+    shim.set_active_file(
+      AOSP .. "/frameworks/base/core/java/com/android/internal/util/ArrayUtils.java",
+      "java"
+    )
+    shim.fire_filetype("java")
+    local sess = session._state().sessions[AOSP]
+    t.truthy(sess)
+    t.raw_eq(sess.folder, AOSP .. "/frameworks/base", "auto scope follows cwd again")
+    t.falsy(sess.seeded_defaults, "a subtree window does not seed root defaults")
+  end)
 end)
 
 -- ---------------------------------------------------------------------------

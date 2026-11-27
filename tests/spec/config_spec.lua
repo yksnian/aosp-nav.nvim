@@ -16,9 +16,14 @@ t.describe("config.merge", function()
     t.same_list(c.source_roots, {})
   end)
 
-  t.it("has no derived knobs (scope / autobuild / prebuilt / ktlsp / debounce)", function()
+  t.it("has no derived knobs (autobuild / prebuilt / ktlsp / debounce)", function()
     local c = config.merge({})
-    t.raw_eq(c.scope, nil, "window scope is derived from cwd + the active file")
+    t.raw_eq(c.scope, "auto", "window scope defaults to derivation from cwd + active file")
+    t.raw_eq(
+      config.merge({ scope = "tree" }).scope,
+      "tree",
+      "tree scope is an explicit escape hatch"
+    )
     t.raw_eq(c.java, nil, "picker selection is state, not configuration")
     t.raw_eq(c.cpp.use_prebuilt, nil)
     t.raw_eq(c.cpp.restart_debounce_ms, nil)

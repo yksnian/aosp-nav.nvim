@@ -216,6 +216,15 @@ end
 ---Resolved on first use and then pinned for the session.
 local function effective_folder(root)
   return pinned_or_compute(root, function()
+    -- scope="tree" forces the whole-tree window (the VS Code "open the
+    -- checkout as the workspace folder" setup) even when nvim's cwd is a
+    -- subtree. resolves through the same pin, so cwd/file moves later are
+    -- still no-ops and there is still exactly one jdt.ls per checkout.
+    local cfg = C.opts
+    if cfg ~= nil and cfg.scope == "tree" then
+      C._last_scope_source = "tree"
+      return pathutil.normalize(root), "tree"
+    end
     local scope = require("aosp-nav.scope")
     local ok, folder, source = pcall(scope.effective_folder, root, {
       cwd = workspace_folders()[1],
@@ -657,6 +666,12 @@ local function scope_folder_for_path(path)
   -- here would let a second subtree resolve a different root_dir and start a
   -- second -Xmx8G jdt.ls; the pin is what keeps exactly one client alive.
   return pinned_or_compute(root, function()
+    -- Keep the jdt.ls root_dir in lockstep with effective_folder(): when
+    -- scope="tree" is set, both must pin the checkout top.
+    local cfg = C.opts
+    if cfg ~= nil and cfg.scope == "tree" then
+      return pathutil.normalize(root)
+    end
     local scope = require("aosp-nav.scope")
     local cwd = workspace_folders()[1]
     local ok, folder = pcall(scope.effective_folder, root, {

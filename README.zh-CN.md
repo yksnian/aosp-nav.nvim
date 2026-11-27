@@ -84,12 +84,13 @@ aosp_nav.none_ls_opts(none_ls_opts)                   -- 你的 none-ls opts 表
 
 ## 配置项
 
-七个键；能从工程结构推导的一律推导（AOSP 根、窗口范围、模块选择、Java autobuild、prebuilt clangd、ktlsp 引导、进程清理、clangd 重启防抖）。
+八个键；能从工程结构推导的一律推导（AOSP 根、模块选择、Java autobuild、prebuilt clangd、ktlsp 引导、进程清理、clangd 重启防抖）。
 
 ```lua
 require("aosp-nav").setup({
   enabled = true,
   android_root = nil,           -- 显式指定根；nil 时按打开的文件自动探测
+  scope = "auto",               -- "tree" 把窗口范围锁定到 AOSP checkout 顶部（见下文）
   exclude = {
     jars = {},                  -- 对 jar 文件名与模块名生效的正则
     paths = {},                 -- 对 .intermediates/ 相对路径生效的子串
@@ -144,6 +145,8 @@ Neovim 没有工作区文件夹概念，插件会推导**有效窗口范围**，
 - 完全没有信号 → 根窗口。
 
 锁定是按 AOSP 根分别记录的。之后再跨到别的子树不会重新规划、不弹确认框、也不会启动第二个 jdt.ls；`root_dir` 就是锁定的范围。要在别的子树工作，请从该目录重启 nvim（或在第一个 AOSP 文件获得焦点前先 `:cd` 进去）。每个 checkout/工作区只有一个 jdt.ls JVM。
+
+**始终使用整棵树**：如果你在子目录（例如 `frameworks/base`）启动 nvim，却想要 VS Code 那种“工作区文件夹 = AOSP checkout”的效果，就在 `setup()` 里设 `scope = "tree"`——整棵树的 jar 都在同一个会话里 navigate，`packages/modules/Wifi` 这类 mainline 模块因此能跳转解析。它会在首次使用时把范围锁定到 checkout 顶部，效果等同于从该目录启动 nvim；**不会**改动你的 cwd，也无需重启。根窗口的规则照旧：两个默认源码根模块、关闭 autobuild、只有一个 jdt.ls。若还想跳进 Wifi 的真实源码（而非反编译的 jar），再用 `:AospModules`（或 `source_roots`）挑选源码根。不设 `scope`（或设为 `"auto"`）则沿用上面的 cwd/文件推导。
 
 **正常 `:q` 故意不向 jdt.ls 发信号。** Neovim 的 LSP `shutdown` 正是 Eclipse 落盘干净 workspace 快照的时机，若用 SIGTERM 抢在这之前，`.metadata` 会被标记为脏（下次打开约 95 秒恢复）。上次异常退出（`:qa!`、崩溃）留下还在索引同一工作区的孤儿 JVM 时，下次启动会先回收：发 SIGTERM、最多等约 8 秒，再拉起新的 —— 绝不用 SIGKILL（会破坏 `.metadata`）。父进程链里有存活编辑器（nvim/lvim）的 JVM 绝不会被误杀。
 
