@@ -713,6 +713,21 @@ t.describe("E2E: clangd channel", function()
     t.raw_eq(type(fixed.init_options.storagePath), "string")
   end)
 
+  t.it("kotlin_lsp_opts root_dir resolves the AOSP module workspace", function()
+    local ok, channel = pcall(require, "aosp-nav.kotlin.channel")
+    if not ok then
+      return
+    end
+    shim.set_active_file(AOSP .. "/system/netd/server/NetdClient.kt", "kotlin")
+    local o = channel.lsp_opts({})
+    t.raw_eq(type(o.root_dir), "function")
+    local got = "unset"
+    o.root_dir(0, function(dir)
+      got = dir
+    end)
+    t.raw_eq(got, AOSP .. "/system/netd/server")
+  end)
+
   t.it("kotlin_lsp_opts strips documentHighlight via on_attach — AOSP buffers only", function()
     local ok, channel = pcall(require, "aosp-nav.kotlin.channel")
     if not ok then

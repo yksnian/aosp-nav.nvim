@@ -269,7 +269,7 @@ function M.lsp_opts(opts)
         local ar = require("aosp-nav.android_root")
         local root = ar.detect_aosp_root(name, fs.is_dir, fs.is_file)
         if root ~= nil then
-          dir = module_dir(name, root)
+          dir = M.module_dir(name, root)
         end
       end
       if dir == nil then
