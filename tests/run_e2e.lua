@@ -2539,6 +2539,42 @@ t.describe("E2E: AOSP root window start fragment", function()
     )
   end)
 
+  t.it("root_dir honors an explicit android_root on a tree detection cannot see", function()
+    -- An unusual checkout with none of the AOSP markers (no .repo, no
+    -- envsetup+soong, no out/). Detection returns nil; the session side still
+    -- runs on the explicit root, so the jdt.ls client root must agree.
+    local plain = "/tmp/aosp-nav-e2e-explicit-root"
+    sh("rm -rf " .. plain)
+    mkdirs(plain .. "/frameworks/base/core/java/com/example")
+    touch(plain .. "/frameworks/base/core/java/com/example/Feature.java")
+    aosp_nav.set_opts({ android_root = plain, scope = "tree", kotlin = { enabled = false } })
+    local host_root = plain .. "/frameworks/base"
+    local opts = {
+      root_dir = function()
+        return host_root
+      end,
+      settings = { java = {} },
+    }
+    aosp_nav.jdtls_opts(opts)
+    local inside = plain .. "/frameworks/base/core/java/com/example/Feature.java"
+    -- Restore the default config even if an assertion fails: a leaking
+    -- android_root would poison the next test, which assumes the default.
+    local ok, err = pcall(function()
+      t.raw_eq(opts.root_dir(inside), plain, "explicit root wins over a failed detection")
+      -- A file outside the explicit checkout is a plain Java project: the host
+      -- root_dir must survive, otherwise the plugin would take over non-AOSP code.
+      t.raw_eq(
+        opts.root_dir("/tmp/aosp-nav-e2e-plain/Foo.java"),
+        host_root,
+        "explicit root does not reach outside its tree"
+      )
+    end)
+    aosp_nav.set_opts({ android_root = nil, scope = "auto", kotlin = { enabled = false } })
+    if not ok then
+      error(err, 0)
+    end
+  end)
+
   t.it("pinned root_dir never supersedes a client (no second JVM)", function()
     local gate = require("aosp-nav.java.client_gate")
     gate._reset()

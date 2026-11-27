@@ -658,7 +658,21 @@ end
 ---the jdtls root_dir hook, which nvim-jdtls calls with the file that
 ---triggers the start.
 local function scope_folder_for_path(path)
-  local root = ar.detect_aosp_root(path, fs.is_dir, fs.is_file)
+  -- An explicit android_root wins here exactly as it does on the session
+  -- side (init.lua:457/536/558), otherwise an unusual checkout that detection
+  -- cannot see would pin the session root but let the jdt.ls client root fall
+  -- back to LazyVim's — two roots, a second JVM or a mis-based sourcePaths.
+  -- Guard with is_within: a file outside the explicit checkout is a plain
+  -- Java project and must keep the host's own root_dir.
+  local cfg = C.opts
+  local explicit = cfg ~= nil and cfg.android_root or nil
+  local root = nil
+  if explicit ~= nil and pathutil.is_within(explicit, path) then
+    root = pathutil.normalize(explicit)
+  end
+  if root == nil then
+    root = ar.detect_aosp_root(path, fs.is_dir, fs.is_file)
+  end
   if root == nil then
     return nil
   end
