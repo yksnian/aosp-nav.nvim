@@ -494,7 +494,20 @@ function M.collect(D)
   local prebuilt = root and controller.find_aosp_clangd(root) or nil
   local clangds = clients_named("clangd")
   local cc = clangds[1]
-  local cc_cmd = cc and cc.config and type(cc.config.cmd) == "table" and cc.config.cmd or nil
+  -- The plugin's native cmd is a FUNCTION (it rewrites argv at spawn time to
+  -- inject --compile-commands-dir). It records the argv actually used in
+  -- controller._last_native_spawn.cmd. Only legacy setups keep a plain table.
+  -- Checking `type(cmd) == "table"` alone made an attached clangd look like
+  -- "not attached" in every native (nvim >= 0.11) setup.
+  local cc_cmd = nil
+  if cc and cc.config then
+    if type(cc.config.cmd) == "table" then
+      cc_cmd = cc.config.cmd
+    elseif controller.is_native_cmd(cc.config.cmd) then
+      local spawn = controller._last_native_spawn
+      cc_cmd = spawn and type(spawn.cmd) == "table" and spawn.cmd or nil
+    end
+  end
   local cdb_arg = nil
   for _, a in ipairs(cc_cmd or {}) do
     if a:find("--compile-commands-dir=", 1, true) then
@@ -509,16 +522,18 @@ function M.collect(D)
   if vim.lsp and vim.lsp.config and vim.lsp.config.clangd then
     auto_wired = controller.is_native_cmd(vim.lsp.config.clangd.cmd)
   end
-  if cc_cmd then
+  if cc then
     row(
       true,
       "clangd",
-      string.format(
-        "%s, %d arg(s)%s",
-        cc_cmd[1],
-        #cc_cmd,
-        cdb_arg and (", " .. cdb_arg) or ", no --compile-commands-dir"
-      ),
+      cc_cmd
+          and string.format(
+            "%s, %d arg(s)%s",
+            cc_cmd[1],
+            #cc_cmd,
+            cdb_arg and (", " .. cdb_arg) or ", no --compile-commands-dir"
+          )
+        or "attached (argv not recorded yet)",
       nil,
       "C/C++"
     )

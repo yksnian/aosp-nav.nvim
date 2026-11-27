@@ -1273,6 +1273,33 @@ t.describe("E2E: eclipse guard + commands", function()
       "compdb hint must not carry the stray 'nothing' suffix"
     )
 
+    -- clangd's native cmd is a function (aosp-nav rewrites argv at spawn),
+    -- not a table. An attached clangd must NOT be reported as "not attached".
+    local saved_clients_2 = shim.shim.clients
+    local controller_mod = require("aosp-nav.clangd.controller")
+    local native_wrapper = controller_mod.native_cmd({ "clangd", "--background-index" })
+    controller_mod._last_native_spawn = {
+      cmd = { "clangd", "--background-index", "--compile-commands-dir=/tmp/cdb" },
+    }
+    shim.shim.clients = {
+      {
+        id = 992,
+        name = "clangd",
+        config = { name = "clangd", root_dir = AOSP, cmd = native_wrapper },
+      },
+    }
+    local native_lines = diagnostics.collect(D)
+    local native_text = diagnostics.render(native_lines)
+    shim.shim.clients = saved_clients_2
+    t.falsy(
+      native_text:find("clangd: not attached", 1, true),
+      "native cmd function still counts as attached"
+    )
+    t.truthy(
+      native_text:find("compile-commands-dir=/tmp/cdb", 1, true),
+      "panel shows the spawned argv"
+    )
+
     -- jdt.ls vmargs: truncate to one panel line by default; <Tab> reveals the
     -- full argv (needed to tell which workspace JVM is running).
     local saved_clients = shim.shim.clients
