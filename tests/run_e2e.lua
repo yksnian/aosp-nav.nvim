@@ -3159,6 +3159,28 @@ t.describe("E2E: source-only mode (no out)", function()
     t.truthy(store:read_cache(AOSP), "jar cache is written again")
   end)
 
+  t.it("a compiled root is still a ✓ row", function()
+    build_tree()
+    shim.shim.reset_stat_cache()
+    local file = AOSP .. "/frameworks/base/core/java/com/android/internal/util/ArrayUtils.java"
+    touch(file)
+    shim.set_active_file(file, "java")
+    local S = session._state()
+    S.sessions[AOSP] = nil
+    session.run_for(AOSP)
+    t.raw_eq(S.sessions[AOSP].phase, "ready", "a compiled tree is ready")
+    local diagnostics = require("aosp-nav.diagnostics")
+    local text = diagnostics.render(diagnostics.collect({
+      cfg = aosp_nav.get_opts,
+      store = store,
+      workspace_folders = function()
+        return { AOSP }
+      end,
+    }))
+    t.truthy(text:find("✓ root:", 1, true), "a compiled root stays ✓")
+    t.falsy(text:find("⚠ root:", 1, true), "no warning on a healthy root")
+  end)
+
   t.it("statusline and panel describe the degraded state without false warnings", function()
     local old_cf = enter_no_out()
     local S = session._state()
@@ -3177,6 +3199,8 @@ t.describe("E2E: source-only mode (no out)", function()
       end,
     }))
     t.truthy(text:find("source-only (no build outputs)", 1, true), "root row is readable")
+    t.truthy(text:find("⚠ root:", 1, true), "a degraded root is a warning, not a success")
+    t.falsy(text:find("✓ root:", 1, true), "no ✓ on a source-only root")
     t.truthy(text:find("- build outputs: missing or empty", 1, true), "degradation reason is shown")
     t.truthy(text:find("- jar scan: skipped (no build outputs)", 1, true))
     t.truthy(text:find("- jar source: 0 injected (source-only)", 1, true))

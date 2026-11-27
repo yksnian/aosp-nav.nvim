@@ -148,8 +148,12 @@ function M.collect(D)
       and root_source ~= "active editor"
       and (" (" .. root_source .. ")")
     or ""
+  -- A detected root is normally ✓, but a source-only root is degraded: no
+  -- build outputs means no cross-module classpath. Mark it ⚠ so the top row
+  -- cannot be read as a fully working session.
+  local root_ok = root ~= nil and not (sess and sess.phase == "source-only")
   row(
-    root ~= nil,
+    root_ok,
     "root",
     root ~= nil and string.format("%s%s — %s", root, root_source_note, phase_label)
       or "not detected (no AOSP file open and no AOSP workspace folder)"
