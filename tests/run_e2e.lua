@@ -487,13 +487,14 @@ t.describe("E2E: setup + java session", function()
     )
   end)
 
-  t.it("a stale jar set triggers one plain re-push (no client restart)", function()
+  t.it("a stale jar set triggers one empty->full cycle (no client restart)", function()
     local session = require("aosp-nav.session")
     local channel = require("aosp-nav.java.jdtls_channel")
     local real_xml = channel.invisible_classpath_xml
     channel.invisible_classpath_xml = function()
-      -- a project created from a narrower start fragment: no libraries at
-      -- all, although the plan now carries the generated-source jar
+      -- a reused Eclipse workspace keeps its old .classpath although the
+      -- start fragment already carried the full jar list: jdt.ls sees no
+      -- preference change, so a plain re-push would be a no-op
       return '<classpathentry kind="src" path="_/framework/java"/>'
     end
     shim.shim.clients = {}
@@ -502,18 +503,23 @@ t.describe("E2E: setup + java session", function()
     session.run_for(AOSP)
     channel.invisible_classpath_xml = real_xml
 
-    local jar_pushes = 0
+    local jar_pushes, empty_pushes = 0, 0
     for _, n in ipairs(client.notifications) do
       local project = n.method == "workspace/didChangeConfiguration"
           and n.params.settings
           and n.params.settings.java
           and n.params.settings.java.project
         or nil
-      if project and project.referencedLibraries and #project.referencedLibraries > 0 then
-        jar_pushes = jar_pushes + 1
+      if project and project.referencedLibraries then
+        if #project.referencedLibraries > 0 then
+          jar_pushes = jar_pushes + 1
+        else
+          empty_pushes = empty_pushes + 1
+        end
       end
     end
     t.truthy(jar_pushes >= 2, "the initial push plus one heal push carry jars")
+    t.truthy(empty_pushes >= 1, "the heal drops every CPE_LIBRARY before re-adding jars")
     t.falsy(client.stopped, "the client was not restarted to fix a jar mismatch")
   end)
 

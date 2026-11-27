@@ -620,14 +620,15 @@ local function apply_to_client_impl(root, sess, client)
         )
         jdtls_channel.push_with_source_cycle(client, sess.jars, sp_rel, { cycle = true })
       elseif reason == "jars" and not sess.jar_heal_done then
-        -- A plain push can be dropped when jdt.ls is still importing the
-        -- project. Connectivity happened to get a source cycle that repaired
-        -- its jar set; Wifi had warm sourcePaths, no cycle, and kept its old
-        -- 301-jar classpath forever. One plain re-push is cheap and safe;
-        -- only a SECOND failure needs an explicit reload.
+        -- A plain re-push is a NO-OP on a reused Eclipse workspace: the start
+        -- fragment already carried this exact jar list, so jdt.ls sees no
+        -- preference change and never runs updateBinaries. Reproduced with a
+        -- real jdt.ls: 301-jar .classpath stayed at 301 after an identical
+        -- push, then updated to 304 (with the AIDL impl jar) after the
+        -- empty -> full source cycle. Force that edge here; no client restart.
         sess.jar_heal_done = true
-        log("[aosp-nav] jdt.ls jar set differs from the plan; re-pushing the jar list")
-        jdtls_channel.push_with_source_cycle(client, sess.jars, sp_rel, { cycle = false })
+        log("[aosp-nav] jdt.ls jar set differs from the plan; emptying and re-pushing the jar list")
+        jdtls_channel.push_with_source_cycle(client, sess.jars, sp_rel, { cycle = true })
       elseif reason == "jars" then
         log(
           "[aosp-nav] jdt.ls jar set still differs from the plan; keeping the running server "
