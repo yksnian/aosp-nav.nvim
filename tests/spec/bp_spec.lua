@@ -95,6 +95,111 @@ t.describe("parse_blueprint", function()
   end)
 end)
 
+t.describe("resolve_dep_include_dirs", function()
+  local root = "/aosp"
+  local consumer_dir = "/aosp/system/netd/server"
+
+  t.it("resolves shared_libs export_include_dirs relative to the dep's own bp dir", function()
+    local mods = bp.parse_blueprint(table.concat({
+      "cc_binary {",
+      '    name: "netd",',
+      '    shared_libs: ["libnetdutils"],',
+      "}",
+    }, "\n"))
+    local tree_index = {
+      -- Real-world shape: libnetdutils/Android.bp sits in a different tree,
+      -- and exports "include" relative to ITSELF, not to the consumer/root.
+      libnetdutils = {
+        bp_dir = "/aosp/packages/modules/Connectivity/staticlibs/netd/libnetdutils",
+        fields = { export_include_dirs = { "include" } },
+      },
+    }
+    local want = "/aosp/packages/modules/Connectivity/staticlibs/netd/libnetdutils/include"
+    local out = bp.resolve_dep_include_dirs(mods, mods[1], root, consumer_dir, 3, function(p)
+      return p == want
+    end, tree_index)
+    t.truthy(contains(out, want))
+  end)
+
+  t.it("still resolves header_libs and root-relative includes", function()
+    local mods = bp.parse_blueprint(table.concat({
+      "cc_binary {",
+      '    name: "app",',
+      '    header_libs: ["libhdr"],',
+      '    static_libs: ["libstat"],',
+      "}",
+    }, "\n"))
+    local tree_index = {
+      libhdr = {
+        bp_dir = "/aosp/x",
+        fields = { export_include_dirs = { "frameworks/base/include" } },
+      },
+      libstat = { bp_dir = "/aosp/y/z", fields = { export_include_dirs = { "export" } } },
+    }
+    local dirs = {
+      ["/aosp/frameworks/base/include"] = true,
+      ["/aosp/y/z/export"] = true,
+    }
+    local out = bp.resolve_dep_include_dirs(mods, mods[1], root, consumer_dir, 3, function(p)
+      return dirs[p] == true
+    end, tree_index)
+    t.truthy(contains(out, "/aosp/frameworks/base/include"))
+    t.truthy(contains(out, "/aosp/y/z/export"))
+  end)
+
+  t.it("follows header_libs transitively from shared_libs", function()
+    local mods = bp.parse_blueprint(table.concat({
+      "cc_binary {",
+      '    name: "app",',
+      '    shared_libs: ["libnetdutils"],',
+      "}",
+    }, "\n"))
+    local tree_index = {
+      libnetdutils = {
+        bp_dir = "/aosp/u",
+        fields = { header_libs = { "libbase_headers" } },
+      },
+      libbase_headers = { bp_dir = "/aosp/v", fields = { export_include_dirs = { "include" } } },
+    }
+    local want = "/aosp/v/include"
+    local out = bp.resolve_dep_include_dirs(mods, mods[1], root, consumer_dir, 3, function(p)
+      return p == want
+    end, tree_index)
+    t.truthy(contains(out, want))
+  end)
+
+  t.it("is cycle-safe and honors depth on transitive propagation", function()
+    local mods = bp.parse_blueprint(table.concat({
+      "cc_binary {",
+      '    name: "app",',
+      '    shared_libs: ["a"],',
+      "}",
+    }, "\n"))
+    local tree_index = {
+      -- a -> b -> c -> a: depth=1 lets a enqueue b, but b must not enqueue c.
+      a = {
+        bp_dir = "/aosp/a",
+        fields = { export_include_dirs = { "inc" }, header_libs = { "b" } },
+      },
+      b = {
+        bp_dir = "/aosp/b",
+        fields = { export_include_dirs = { "inc" }, header_libs = { "c" } },
+      },
+      c = {
+        bp_dir = "/aosp/c",
+        fields = { export_include_dirs = { "inc" }, header_libs = { "a" } },
+      },
+    }
+    local dirs = { ["/aosp/a/inc"] = true, ["/aosp/b/inc"] = true, ["/aosp/c/inc"] = true }
+    local out = bp.resolve_dep_include_dirs(mods, mods[1], root, consumer_dir, 1, function(p)
+      return dirs[p] == true
+    end, tree_index)
+    t.truthy(contains(out, "/aosp/a/inc"))
+    t.truthy(contains(out, "/aosp/b/inc"))
+    t.raw_eq(contains(out, "/aosp/c/inc"), false)
+  end)
+end)
+
 t.describe("pick_module", function()
   local mods = bp.parse_blueprint(BP)
 

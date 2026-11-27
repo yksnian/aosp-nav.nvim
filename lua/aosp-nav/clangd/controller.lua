@@ -296,6 +296,9 @@ local function bp_tree_index(root)
           if text then
             for _, m in ipairs(bp.parse_blueprint(text)) do
               if m.name and not index[m.name] then
+                -- Remember where the module was declared: export_include_dirs
+                -- are relative to this Android.bp, not the consumer's or root.
+                m.bp_dir = dir
                 index[m.name] = m
               end
             end

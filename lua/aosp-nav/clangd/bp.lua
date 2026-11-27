@@ -24,6 +24,7 @@ M.FIELD_SET = {
   cppflags = true,
   conlyflags = true,
   header_libs = true,
+  export_shared_lib_headers = true,
   whole_static_libs = true,
   static_libs = true,
   shared_libs = true,
@@ -283,6 +284,79 @@ function M.resolve_header_libs(mods, root_names, root, bp_dir, depth, is_dir, tr
   return out
 end
 
+---Resolve exported include dirs from ALL library dependency kinds.
+---`resolve_header_libs` only walks header_libs and resolves each export
+---against root/consumer-dir; real AOSP modules (e.g. libnetdutils) export
+---include dirs relative to their OWN Android.bp, and are often reached via
+---shared_libs/static_libs rather than header_libs. Walk all four kinds and
+---resolve each dep's exports against its own bp_dir first.
+---`mods` = modules in the consumer's Android.bp; `mod` = the picked module.
+---`tree_index` entries may carry `bp_dir` (the dir of their Android.bp).
+function M.resolve_dep_include_dirs(mods, mod, root, consumer_dir, depth, is_dir, tree_index)
+  local by_name = {}
+  for _, m in ipairs(mods) do
+    if m.name and not by_name[m.name] then
+      by_name[m.name] = m
+    end
+  end
+  local lookup = function(name)
+    if by_name[name] then
+      return by_name[name], consumer_dir
+    end
+    local indexed = tree_index and tree_index[name] or nil
+    if indexed then
+      return indexed, indexed.bp_dir or consumer_dir
+    end
+    return nil, nil
+  end
+
+  local out = {}
+  local seen = {}
+  local queue = {}
+  local function enqueue(names)
+    for _, name in ipairs(names or {}) do
+      if not seen[name] then
+        seen[name] = true
+        queue[#queue + 1] = { name = name, d = 0 }
+      end
+    end
+  end
+  if mod then
+    for _, key in ipairs({ "header_libs", "shared_libs", "static_libs", "whole_static_libs" }) do
+      enqueue(mod.fields[key])
+    end
+  end
+
+  local qi = 1
+  while qi <= #queue do
+    local item = queue[qi]
+    qi = qi + 1
+    local dep, dep_dir = lookup(item.name)
+    if dep then
+      for _, d in ipairs(dep.fields.export_include_dirs or {}) do
+        local abs = resolve_path(d, root, dep_dir, is_dir)
+        if is_dir(abs) then
+          out[#out + 1] = abs
+        end
+      end
+      -- Only header_libs (and export_shared_lib_headers) propagate headers
+      -- transitively; shared/static libs link code, they don't re-export an
+      -- arbitrary library's headers unless explicitly listed.
+      if item.d < depth then
+        for _, key in ipairs({ "header_libs", "export_shared_lib_headers" }) do
+          for _, name in ipairs(dep.fields[key] or {}) do
+            if not seen[name] then
+              seen[name] = true
+              queue[#queue + 1] = { name = name, d = item.d + 1 }
+            end
+          end
+        end
+      end
+    end
+  end
+  return out
+end
+
 ---Fallback tier: nearest Android.bp + curated include baseline.
 ---opts: { curated_includes = {...}, header_lib_depth = n, is_dir = fn,
 ---         bp = path (pre-resolved), read_file = fn, tree_index = table }
@@ -317,9 +391,9 @@ function M.lookup_bp(root, file, opts)
         end
         for _, d in
           ipairs(
-            M.resolve_header_libs(
+            M.resolve_dep_include_dirs(
               mods,
-              m.fields.header_libs or {},
+              m,
               root,
               bp_dir,
               opts.header_lib_depth or 3,
