@@ -18,6 +18,73 @@ local srp = require("aosp-nav.java.source_roots_plan")
 
 local M = {}
 
+-- source-only (no build index) source-root derivation. See SOURCE_ONLY_PLAN.md:
+-- these are measured against a real AOSP tree (4235 java dirs / 1721 BP):
+--   * a BP dir named java/src/kotlin IS the source root (fw/base/core/java)
+--   * otherwise src/java > src/main/java > src > java > kotlin, first match
+--     only — src/java and src/main/java must NOT be combined with src, or
+--     jdt.ls treats "java"/"main" as the first package segment.
+-- Cap stays well below the 100-sourcePaths autobuild cutoff.
+local NO_INDEX_ROOT_LIMIT = 16
+local NO_INDEX_SOURCE_DIRS = { "src/java", "src/main/java", "src", "java", "kotlin" }
+
+local function nearest_bp_dir(start, root, io_)
+  if not start or not io_.is_file then
+    return nil
+  end
+  local dir = pathutil.normalize(start)
+  if io_.is_file(dir) then
+    dir = pathutil.parent(dir)
+  end
+  root = pathutil.normalize(root)
+  while dir and dir ~= "" do
+    if
+      io_.is_file(pathutil.join(dir, "Android.bp"))
+      or io_.is_file(pathutil.join(dir, "Android.mk"))
+    then
+      return dir
+    end
+    if dir == root then
+      return nil -- never treat the tree itself as a module
+    end
+    local up = pathutil.parent(dir)
+    if up == nil or up == dir then
+      return nil
+    end
+    dir = up
+  end
+  return nil
+end
+
+---Derive a few source roots for an unbuilt tree from the active file (or the
+---window folder). Returns paths relative to `root`; `io_.is_dir/is_file`
+---decide which candidates actually exist. Never scans the whole tree.
+local function derive_no_index_roots(root, file, folder, io_)
+  local out, seen = {}, {}
+  local function add(p)
+    if p and not seen[p] then
+      seen[p] = true
+      out[#out + 1] = p
+    end
+  end
+  local module = nearest_bp_dir(file or folder, root, io_)
+  if module then
+    local base = pathutil.basename(module)
+    if base == "java" or base == "src" or base == "kotlin" then
+      add(pathutil.relative(root, module))
+    else
+      for _, rel in ipairs(NO_INDEX_SOURCE_DIRS) do
+        local p = pathutil.join(module, rel)
+        if io_.is_dir(p) then
+          add(pathutil.relative(root, p))
+          break -- mutually exclusive: only the highest-priority layout wins
+        end
+      end
+    end
+  end
+  return out
+end
+
 local function contains(list, value)
   for _, v in ipairs(list or {}) do
     if v == value then
@@ -38,8 +105,10 @@ end
 ---   missing = { configured entries that do not exist },
 ---   modules = { effective module dirs } , module_source = label,
 ---   skipped_outside = n, no_index = bool,
+---@param current_file string|nil active AOSP file; only used when there is no
+---  build index (source-only mode) to derive a module source root.
 --- }
-function M.collect_desired(cfg, root, folder, explicit_modules, io_, load_index, log)
+function M.collect_desired(cfg, root, folder, explicit_modules, io_, load_index, log, current_file)
   local paths = {} -- workspace-relative
   local abs_paths = {}
   local missing = {}
@@ -55,6 +124,11 @@ function M.collect_desired(cfg, root, folder, explicit_modules, io_, load_index,
   if explicit_modules == nil then
     if pathutil.relative(pathutil.normalize(folder), pathutil.normalize(root)) == "" then
       modules = {}
+      -- A root window with no build index still needs source-only derivation
+      -- from the active file; otherwise an unbuilt tree has zero sourcePaths.
+      if load_index() == nil then
+        no_index = true
+      end
     else
       local index = load_index()
       if index then
@@ -108,6 +182,19 @@ function M.collect_desired(cfg, root, folder, explicit_modules, io_, load_index,
             #modules
           )
         )
+      end
+    end
+  end
+
+  -- No build index (source-only): without derivation the fragment is empty
+  -- and gd cannot even jump inside the module the user is editing. Derive a
+  -- handful of source roots from the active file / window scope. Existing
+  -- configured roots are kept first; the cap is applied to the merged set.
+  if no_index then
+    for _, p in ipairs(derive_no_index_roots(root, current_file, folder, io_)) do
+      entries[#entries + 1] = p
+      if #entries >= NO_INDEX_ROOT_LIMIT then
+        break
       end
     end
   end

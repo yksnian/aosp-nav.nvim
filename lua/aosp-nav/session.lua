@@ -69,6 +69,7 @@ local S = {
 -- forward declarations (defined below; M.init references them)
 local apply_to_client
 local register_attach_reapply
+local settled -- defined after build_stamp; run_for (above it) calls this
 local attach_reapply_registered = false
 
 local function log(...)
@@ -209,8 +210,8 @@ function M.run_for(root)
     S.inflight[root] = nil
   end
   local sess = S.sessions[root]
-  if sess and sess.phase == "ready" then
-    return -- already applied
+  if sess and settled(root, sess) then
+    return -- already applied (ready, or source-only with an unchanged stamp)
   end
   if sess and sess.phase == "scanning" then
     -- 没有在跑的扫描却处于 scanning: 上一次失败了, 归一后重新排队
@@ -235,7 +236,7 @@ function M.wait_for(root, cb)
 end
 
 ---Run for `root` scoped to `folder` (the effective window scope, scope.lua).
----A ready session planned for a DIFFERENT folder is re-planned on the spot —
+---A settled session planned for a DIFFERENT folder is re-planned on the spot —
 ---the jar cache and the build index stay valid, so the re-plan is a cheap
 ---closure computation; anything else joins the normal queue. The
 ---FileType/VimEnter triggers call this so moving between subtrees (or
@@ -246,7 +247,7 @@ function M.run_for_scoped(root, folder)
   if folder ~= nil and folder ~= "" then
     folder = pathutil.normalize(folder)
     local sess = S.sessions[root]
-    if sess and sess.phase == "ready" and sess.folder and sess.folder ~= folder then
+    if sess and settled(root, sess) and sess.folder and sess.folder ~= folder then
       local old_rel = pathutil.relative(root, sess.folder) or sess.folder
       local new_rel = pathutil.relative(root, folder) or folder
       log(
@@ -280,6 +281,22 @@ local function build_stamp(root)
     return n
   end
   return math.max(n, d)
+end
+
+---A session whose plan has been applied and needs no re-scan. `ready` is
+---unconditionally settled; `source-only` is settled ONLY while the build
+---stamp is unchanged — building out/ flips the stamp (nil -> number), so the
+---next trigger re-plans and upgrades the session to the full jar list. Never
+---write `source-only` as `ready`: the four settled() call sites would then
+---short-circuit forever and a later build would never be picked up.
+settled = function(root, sess)
+  if not sess then
+    return false
+  end
+  if sess.phase == "ready" then
+    return true
+  end
+  return sess.phase == "source-only" and build_stamp(root) == sess.source_only_stamp
 end
 
 ---The first workspace folder that lies INSIDE `root` (or equals it).
@@ -478,7 +495,13 @@ local function apply_to_client_impl(root, sess, client)
   local sig_key = client.id .. "\0" .. root
   local pushed_sig = S.sp_pushed[sig_key]
   local sp_changed = pushed_sig ~= nil and sig ~= nil and pushed_sig ~= sig
-  local want_cycle = sp_rel ~= nil
+  -- source-only has no jar set to order and must not consume the one-shot
+  -- heal token: when out/ comes back, the real jar push still needs it. It
+  -- also must NOT send an explicit empty jar list — that is the heal's
+  -- "drop every CPE_LIBRARY" step and would wipe the user's classpath.
+  local source_only = sess.phase == "source-only"
+  local want_cycle = not source_only
+    and sp_rel ~= nil
     and (sp_changed or (not cycle_done[client.id] and not start_had_sources))
   if want_cycle then
     cycle_done[client.id] = true
@@ -738,13 +761,19 @@ local function apply_to_client_impl(root, sess, client)
     end, want_cycle and 1000 or 2000)
   end
 
-  jdtls_channel.push_with_source_cycle(client, sess.jars, sp_rel, {
+  -- jars=nil in source-only: build_settings keeps the key out of the live
+  -- fragment, so jdt.ls keeps whatever classpath it already has. Passing the
+  -- empty sess.jars here would write referencedLibraries=[] and wipe it.
+  jdtls_channel.push_with_source_cycle(client, source_only and nil or sess.jars, sp_rel, {
     cycle = want_cycle,
     on_done = schedule_removals,
   })
 
-  -- crash probe (after the injection so messages do not mix)
-  local cmd = client.config and client.config.cmd or {}
+  -- crash probe (after the injection so messages do not mix). Skipped in
+  -- source-only: a degraded apply can be re-run on every BufEnter; a
+  -- "no new crash" probe would zero a real OOM counter (threshold 2) and a
+  -- genuinely broken workspace would never be rebuilt.
+  local cmd = source_only and {} or (client.config and client.config.cmd or {})
   local data_dir = nil
   for i, a in ipairs(cmd) do
     if a == "-data" and cmd[i + 1] then
@@ -858,7 +887,7 @@ register_attach_reapply = function()
     end
     for root, sess in pairs(S.sessions) do
       if
-        sess.phase == "ready"
+        settled(root, sess)
         and sess.jars
         and not (sess.applied_clients and sess.applied_clients[client.id])
         and pathutil.is_within(root, dir)
@@ -890,7 +919,7 @@ function M.cached_java_settings(root)
   end
   root = pathutil.normalize(root)
   local sess = S.sessions[root]
-  if sess and sess.phase == "ready" and sess.settings_fragment then
+  if sess and settled(root, sess) and sess.settings_fragment then
     return sess.settings_fragment
   end
   local cfg = S.deps.cfg()
@@ -935,7 +964,8 @@ function M.cached_java_settings(root)
       modules,
       io_,
       load_index,
-      function() end
+      function() end,
+      S.deps.current_file and S.deps.current_file(root) or nil
     )
     if ok then
       sp = got
@@ -1058,61 +1088,74 @@ function M._scan_root(root)
   end
 
   -- ------------------------------------------------------ scan miss --
+  -- No out / no soong jars used to abort here with phase=failed, which
+  -- starved sourcePaths, the Kotlin support files and the jdt.ls push. The
+  -- tree is still a valid AOSP checkout (root detection never depended on
+  -- out), so downgrade to source-only and continue the whole chain with an
+  -- EMPTY jar list. Two rules keep this safe:
+  --   * never write a jar cache (empty jars cannot pass is_cache_valid), and
+  --     never delete an existing cache either — out may come back.
+  --   * the live push carries jars=nil (no classpath change), never an empty
+  --     jar list — see apply_to_client_impl.
+  local source_only = false
   if jars == nil then
     local base_ok = fs.is_dir(pathutil.join(root, scanner.SOONG_BASES[1]))
       or fs.is_dir(pathutil.join(root, scanner.SOONG_BASES[2]))
     if not base_ok then
-      -- make-era or no build outputs
+      -- make-era tree or no build outputs at all
+      source_only = true
+    else
+      local engine = filters_mod.FilterEngine.new(ex, log)
+      local scanned = async.await(function(cb)
+        async.run(
+          function()
+            return scanner.scan_soong(root, defaults, engine, function(base)
+              return walk.scan_jars(base, {
+                on_dirs = function(n)
+                  if deps.status then
+                    deps.status.set(root, "scanning", 0, string.format("%d dirs", n))
+                  end
+                end,
+              })
+            end)
+          end,
+          cb,
+          function(err)
+            log("[aosp-nav] jar scan failed: " .. tostring(err))
+          end
+        )
+      end)
+      if scanned ~= nil then
+        jars = scanned.jars
+        stats = scanned.stats
+      end
+      if jars == nil or #jars == 0 then
+        source_only = true
+      end
+    end
+    if source_only then
+      jars = {}
+      sess.phase = "source-only"
+      sess.source_only_stamp = stamp
       if deps.status then
         deps.status.set(root, "no-out", 0)
       end
-      sess.phase = "failed"
-      return
-    end
-    local engine = filters_mod.FilterEngine.new(ex, log)
-    local scanned = async.await(function(cb)
-      async.run(
-        function()
-          return scanner.scan_soong(root, defaults, engine, function(base)
-            return walk.scan_jars(base, {
-              on_dirs = function(n)
-                if deps.status then
-                  deps.status.set(root, "scanning", 0, string.format("%d dirs", n))
-                end
-              end,
-            })
-          end)
-        end,
-        cb,
-        function(err)
-          log("[aosp-nav] jar scan failed: " .. tostring(err))
-        end
-      )
-    end)
-    if scanned == nil then
-      if deps.status then
-        deps.status.set(root, "no-out", 0)
+      if deps.notify and notified_once(root, "source-only") then
+        deps.notify(
+          "[aosp-nav] no build outputs found; source-only mode — module sources are navigable, "
+            .. "build the tree (lunch + m) for cross-module jar navigation."
+        )
       end
-      sess.phase = "failed"
-      return
+    else
+      selector.apply_dir_priority(jars, defaults)
+      store:write_cache(root, {
+        version = cache_model.CACHE_VERSION,
+        filters_hash = fhash,
+        generated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        jars = jars,
+        build_mtime_ms = stamp,
+      })
     end
-    jars = scanned.jars
-    stats = scanned.stats
-    if jars == nil or #jars == 0 then
-      if deps.status then
-        deps.status.set(root, "no-out", 0)
-      end
-      sess.phase = "failed"
-      return
-    end
-    selector.apply_dir_priority(jars, defaults)
-    store:write_cache(root, {
-      version = cache_model.CACHE_VERSION,
-      filters_hash = fhash,
-      generated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-      jars = jars,
-      build_mtime_ms = stamp,
-    })
   end
 
   -- ----------------------------------------------- module selection --
@@ -1216,7 +1259,16 @@ function M._scan_root(root)
   -- -------------------------------------------------- source paths --
   local sp
   if window_folder then
-    sp = source_paths.collect_desired(cfg, root, window_folder, modules, io_, load_index, log)
+    sp = source_paths.collect_desired(
+      cfg,
+      root,
+      window_folder,
+      modules,
+      io_,
+      load_index,
+      log,
+      deps.current_file and deps.current_file(root) or nil
+    )
     sess.source_paths = sp
     -- 三方根不走 sourcePaths 的事实只在 :Aosp 面板展示 (sp.third_party):
     -- 用户改不了它, 弹窗只会变成噪音。
@@ -1291,8 +1343,16 @@ function M._scan_root(root)
   end
 
   -- ---------------------------------------------------- kotlin --
+  -- Kotlin support files (.kls exclusions / gitignore prune / classpath
+  -- script) are written even in source-only mode so an unbuilt tree does not
+  -- show "missing ..." warnings. Keep failures here from aborting the Java
+  -- apply below: KLS bootstrap/cleanup has no outer pcall of its own, and a
+  -- bubble-up would be normalized to phase=failed by the queue error path.
   if cfg.kotlin.enabled and deps.kotlin then
-    deps.kotlin.apply(root, jars, log)
+    local ok_kotlin, err_kotlin = pcall(deps.kotlin.apply, root, jars, log)
+    if not ok_kotlin then
+      log("[aosp-nav] kotlin apply failed (Java navigation continues): " .. tostring(err_kotlin))
+    end
   end
 
   -- ---------------------------------------------------- jdt.ls apply --
@@ -1301,8 +1361,14 @@ function M._scan_root(root)
   -- relative sourcePaths, ordering cycle first time) + crash probe
   -- (module-level, so warm restarts reuse it).
   local client = jdtls_channel.client_for(root)
+  local function apply_guarded(c)
+    local ok, err = pcall(apply_to_client, root, sess, c)
+    if not ok then
+      log("[aosp-nav] jdt.ls apply failed: " .. tostring(err))
+    end
+  end
   if client then
-    apply_to_client(root, sess, client)
+    apply_guarded(client)
   else
     -- The scan finished while jdt.ls is still spawning (or not started).
     -- The start-time opts hook already ran with an empty jar cache, so
@@ -1315,16 +1381,27 @@ function M._scan_root(root)
         return
       end
       log("[aosp-nav] jdt.ls attached after the scan; delivering the live push now")
-      apply_to_client(root, sess, c)
+      apply_guarded(c)
     end)
   end
 
   -- ------------------------------------------------------ status --
-  sess.phase = "ready"
-  notify_reset(root, "scan-failed") -- a recovered tree may fail again later
-  if deps.status then
-    deps.status.set(root, "ready", #jars, from_cache and "cached" or "scan")
-    deps.status.set_blocked(guard.get_blocked_count())
+  -- source-only stays its own phase (never fake "ready"): settled() compares
+  -- the recorded stamp so building out/ upgrades it on the next trigger.
+  local degraded = sess.phase == "source-only"
+  if degraded then
+    notify_reset(root, "scan-failed") -- a still-unbuilt tree is not a failure
+    if deps.status then
+      deps.status.set(root, "no-out", 0)
+      deps.status.set_blocked(guard.get_blocked_count())
+    end
+  else
+    sess.phase = "ready"
+    notify_reset(root, "scan-failed") -- a recovered tree may fail again later
+    if deps.status then
+      deps.status.set(root, "ready", #jars, from_cache and "cached" or "scan")
+      deps.status.set_blocked(guard.get_blocked_count())
+    end
   end
 
   -- 首次索引耗时属于过程播报: 只进日志 / :Aosp 面板, 不弹窗。

@@ -277,6 +277,11 @@ function M.setup(opts)
     status = status,
     workspace_folders = workspace_folders,
     effective_folder = effective_folder,
+    -- source-only mode derives module source roots from the active file when
+    -- there is no build index; the root window has no other module signal.
+    current_file = function(root)
+      return current_aosp_file(root)
+    end,
     schedule = function(fn)
       if vim and vim.schedule then
         vim.schedule(fn)

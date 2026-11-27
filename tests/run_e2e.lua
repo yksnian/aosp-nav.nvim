@@ -2938,5 +2938,86 @@ t.describe("E2E: guard exclusions ready before jdtls initialize", function()
   end)
 end)
 
+-- ---------------------------------------------------------------------------
+-- source-only mode: a tree with no build outputs must still deliver module
+-- source navigation instead of phase=failed (SOURCE_ONLY_PLAN.md stage 1).
+-- ---------------------------------------------------------------------------
+
+t.describe("E2E: source-only mode (no out)", function()
+  local session = require("aosp-nav.session")
+  local aosp_nav = require("aosp-nav")
+  local store = aosp_nav._store()
+
+  local function enter_no_out()
+    -- Rebuild a clean fixture, then remove every build output.
+    build_tree()
+    -- a real core/java BP boundary so source-only derivation has a module
+    -- (build_tree only plants Android.bp under system/netd/server)
+    touch(AOSP .. "/frameworks/base/core/java/Android.bp")
+    os.execute("rm -rf '" .. AOSP .. "/out'")
+    shim.shim.reset_stat_cache()
+    store:remove_cache(AOSP)
+    local S = session._state()
+    S.sessions[AOSP] = nil
+    S.queue = {}
+    S.queued[AOSP] = nil
+    S.inflight[AOSP] = nil
+    S.sp_pushed = {}
+    S.sp_pushed_lists = {}
+    aosp_nav._clear_pinned_folders()
+    aosp_nav.set_opts({ kotlin = { enabled = false }, log_level = "debug" })
+    shim.shim.clients = {}
+    -- The active file is in frameworks/base/core/java — a BP dir named java.
+    local file = AOSP .. "/frameworks/base/core/java/com/android/internal/util/ArrayUtils.java"
+    shim.set_active_file(file, "java")
+    local old_cf = S.deps.current_file
+    S.deps.current_file = function()
+      return file
+    end
+    return old_cf
+  end
+
+  t.it("no out enters source-only, injects module sourcePaths, writes no jar cache", function()
+    local old_cf = enter_no_out()
+    local S = session._state()
+    session.run_for(AOSP)
+    S.deps.current_file = old_cf
+
+    local sess = S.sessions[AOSP]
+    t.raw_eq(sess.phase, "source-only", "no out is no longer a failed session")
+    t.truthy(sess.source_paths, "a sourcePaths plan was produced")
+    t.truthy(
+      #sess.source_paths.abs_paths >= 1
+        and sess.source_paths.abs_paths[1]:find("frameworks/base/core/java", 1, true),
+      "the active file's module source root is injected"
+    )
+    t.raw_eq(store:read_cache(AOSP), nil, "no empty jar cache is written")
+    t.truthy(sess.settings_fragment, "a start fragment still exists")
+    local proj = sess.settings_fragment.project
+    t.falsy(proj and proj.referencedLibraries, "start fragment does not claim an empty classpath")
+    t.truthy(proj and proj.sourcePaths and #proj.sourcePaths > 0, "start fragment carries sources")
+  end)
+
+  t.it("building out/ upgrades source-only to ready on the next scan", function()
+    local old_cf = enter_no_out()
+    local S = session._state()
+    session.run_for(AOSP)
+    t.raw_eq(S.sessions[AOSP].phase, "source-only")
+
+    -- Build the tree again (fresh stamp) and clear the pinned scope so the
+    -- scan re-runs. settled(source-only) must see the new stamp and re-plan.
+    build_tree()
+    shim.shim.reset_stat_cache()
+    S.sessions[AOSP] = nil
+    session.run_for(AOSP)
+    S.deps.current_file = old_cf
+
+    local sess = S.sessions[AOSP]
+    t.raw_eq(sess.phase, "ready", "a rebuilt tree upgrades from source-only")
+    t.truthy(sess.jars and #sess.jars > 0, "real jars are injected again")
+    t.truthy(store:read_cache(AOSP), "jar cache is written again")
+  end)
+end)
+
 local failures = t.print_summary()
 os.exit(failures == 0 and 0 or 1)
