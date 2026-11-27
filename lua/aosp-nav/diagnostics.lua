@@ -169,7 +169,7 @@ function M.collect(D)
       false,
       "build outputs",
       "missing or empty — source-only (module sources from the open file)",
-      "build the tree (lunch + m), then :AospRescan for cross-module jars",
+      "build the android source tree",
       "General"
     )
   end
