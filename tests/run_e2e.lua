@@ -487,6 +487,36 @@ t.describe("E2E: setup + java session", function()
     )
   end)
 
+  t.it("a stale jar set triggers one plain re-push (no client restart)", function()
+    local session = require("aosp-nav.session")
+    local channel = require("aosp-nav.java.jdtls_channel")
+    local real_xml = channel.invisible_classpath_xml
+    channel.invisible_classpath_xml = function()
+      -- a project created from a narrower start fragment: no libraries at
+      -- all, although the plan now carries the generated-source jar
+      return '<classpathentry kind="src" path="_/framework/java"/>'
+    end
+    shim.shim.clients = {}
+    local client = shim.make_jdtls_client(AOSP)
+    session._state().sessions[AOSP] = nil
+    session.run_for(AOSP)
+    channel.invisible_classpath_xml = real_xml
+
+    local jar_pushes = 0
+    for _, n in ipairs(client.notifications) do
+      local project = n.method == "workspace/didChangeConfiguration"
+          and n.params.settings
+          and n.params.settings.java
+          and n.params.settings.java.project
+        or nil
+      if project and project.referencedLibraries and #project.referencedLibraries > 0 then
+        jar_pushes = jar_pushes + 1
+      end
+    end
+    t.truthy(jar_pushes >= 2, "the initial push plus one heal push carry jars")
+    t.falsy(client.stopped, "the client was not restarted to fix a jar mismatch")
+  end)
+
   t.it("scan finishing BEFORE jdt.ls attaches still delivers on attach (deferred push)", function()
     local session = require("aosp-nav.session")
     local channel = require("aosp-nav.java.jdtls_channel")

@@ -374,6 +374,24 @@ t.describe("jdtls channel: the source cycle", function()
       )
     end)
 
+    t.it("a similarly named jar does not hide a missing planned library", function()
+      -- Wifi's classpath contains net-utils-framework-wifi.jar, whose name
+      -- CONTAINS "framework-wifi.jar". A basename substring check used to
+      -- report the AIDL implementation jar as present when it was absent.
+      local xml = table.concat({
+        '<classpathentry kind="src" path="_/framework/java"/>',
+        '<classpathentry kind="lib" path="/aosp/out/net-utils-framework-wifi.jar"/>',
+      }, "\n")
+      t.raw_eq(
+        channel.classpath_stale_reason(
+          xml,
+          { "framework/java" },
+          { "/aosp/out/framework-wifi.impl/combined/framework-wifi.jar" }
+        ),
+        "jars"
+      )
+    end)
+
     t.it("jar mismatch wins over order so a recreate is not skipped", function()
       -- both problems present: the ONLY reason that needs a restart must be
       -- reported, otherwise a missing jar would be "healed" by a cycle.

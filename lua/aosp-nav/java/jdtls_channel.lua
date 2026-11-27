@@ -394,9 +394,8 @@ end
 ---  "order" — src entries sit behind the first lib (a settings source cycle
 ---            rebuilds the classpath sources-first; no restart needed)
 ---  "roots" — expected source roots are absent (same cycle fix)
----  "jars"  — a planned library is missing. Diagnostic only now: the live
----            push converges on a running server, and a fresh jar set is
----            picked up by the next explicit reload. Never a restart reason.
+---  "jars"  — a planned library is missing. The caller re-pushes the jar set
+---            once (no restart); an explicit reload is the last resort.
 ---nil means the classpath is current.
 function M.classpath_stale_reason(xml, rel_paths, jar_paths)
   if type(xml) ~= "string" then
@@ -404,14 +403,20 @@ function M.classpath_stale_reason(xml, rel_paths, jar_paths)
   end
   local first_src, first_lib
   local present = {}
+  local libs = {}
   local i = 0
   for line in xml:gmatch("[^\r\n]+") do
     i = i + 1
     local kind = line:match('kind="([^"]+)"')
-    if kind == "lib" and first_lib == nil then
-      first_lib = i
+    local path = line:match('path="([^"]*)"')
+    if kind == "lib" then
+      if first_lib == nil then
+        first_lib = i
+      end
+      if path ~= nil then
+        libs[path] = true
+      end
     elseif kind == "src" then
-      local path = line:match('path="([^"]*)"')
       if path ~= nil and path ~= "src" then
         present[path] = true
         if first_src == nil then
@@ -432,13 +437,11 @@ function M.classpath_stale_reason(xml, rel_paths, jar_paths)
     -- each one appear verbatim in .classpath makes every heal report a
     -- missing jar and recreate the project forever (client churn + SIGTERM
     -- exit 143). Skip non-jar archives in this check.
-    if
-      jar:match("%.aar$") == nil
-      and not (
-        xml:find('path="' .. jar .. '"', 1, true)
-        or xml:find(jar:match("[^/]+$") or jar, 1, true)
-      )
-    then
+    -- Compare the FULL path, never a basename substring: Wifi's classpath
+    -- already contains net-utils-framework-wifi.jar, which literally contains
+    -- "framework-wifi.jar". The loose match hid a missing implementation jar
+    -- and gd into its AIDL-generated classes kept failing.
+    if jar:match("%.aar$") == nil and not libs[jar] then
       missing_jar = true
       break
     end
