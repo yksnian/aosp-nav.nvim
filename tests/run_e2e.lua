@@ -1614,6 +1614,35 @@ t.describe("E2E: eclipse guard + commands", function()
     t.raw_eq(nsp, 0, "source-push dedup markers cleared")
   end)
 
+  t.it("a reset during the jar scan cannot write a ghost cache", function()
+    build_tree()
+    shim.shim.reset_stat_cache()
+    local session = require("aosp-nav.session")
+    local store = require("aosp-nav")._store()
+    store:remove_cache(AOSP)
+    local S = session._state()
+    S.sessions[AOSP] = nil
+    local scanner = require("aosp-nav.core.scanner")
+    local real_scan = scanner.scan_soong
+    scanner.scan_soong = function()
+      -- Simulate :AospReset landing while _scan_root is suspended at the
+      -- async jar scan: epoch changes, session is wiped.
+      session.reset()
+      return {
+        jars = {
+          AOSP
+            .. "/out/soong/.intermediates/frameworks/base/framework/android_common/javac/framework.jar",
+        },
+        stats = {},
+      }
+    end
+    local ok, err = pcall(session.run_for, AOSP)
+    scanner.scan_soong = real_scan
+    t.truthy(ok, tostring(err))
+    t.raw_eq(store:read_cache(AOSP), nil, "the stale coroutine writes no jar cache")
+    t.falsy(S.sessions[AOSP], "the wiped session is not resurrected")
+  end)
+
   t.it(":AospReset sweeps checkout folders of removed projects", function()
     local aosp_nav = require("aosp-nav")
     local store = aosp_nav._store()
@@ -3134,6 +3163,134 @@ t.describe("E2E: source-only mode (no out)", function()
     shim.fire_filetype("kotlin")
     kotlin.ensure_bootstrap = real_bootstrap
     t.raw_eq(calls, 1, "the first Kotlin buffer triggers the download")
+  end)
+
+  t.it("a degraded push keeps the classpath, the cycle token and the crash counter", function()
+    local old_cf = enter_no_out()
+    local S = session._state()
+    shim._cwd = AOSP
+    aosp_nav._clear_pinned_folders()
+    shim.shim.clients = {}
+    local client = shim.make_jdtls_client(AOSP)
+    local crash = require("aosp-nav.jdtls.crash_signals")
+    local real_probe = crash.probe_jdtls_crash
+    local probes = 0
+    local function fake_probe()
+      probes = probes + 1
+      return nil
+    end
+    local function project_pushes(c)
+      local out = {}
+      for _, n in ipairs(c.notifications) do
+        if n.method == "workspace/didChangeConfiguration" and n.params.settings.java.project then
+          out[#out + 1] = n.params.settings.java.project
+        end
+      end
+      return out
+    end
+    crash.probe_jdtls_crash = fake_probe
+    local ok, err = pcall(session.run_for, AOSP)
+    crash.probe_jdtls_crash = real_probe
+    t.truthy(ok, tostring(err))
+    S.deps.current_file = old_cf
+
+    local degraded = project_pushes(client)
+    t.raw_eq(#degraded, 1, "source-only sends one plain push")
+    t.falsy(degraded[1].referencedLibraries, "no empty classpath is sent")
+    t.truthy(degraded[1].sourcePaths and #degraded[1].sourcePaths > 0)
+    t.raw_eq(S.sessions[AOSP].sp_push.mode, "plain")
+    t.raw_eq(probes, 0, "no crash probe while degraded")
+
+    -- The same client must still own the one-shot ordering cycle when out/
+    -- comes back; consuming it on the empty push would leave jars behind
+    -- sources forever.
+    build_tree()
+    shim.shim.reset_stat_cache()
+    S.sessions[AOSP] = nil
+    crash.probe_jdtls_crash = fake_probe
+    local ok2, err2 = pcall(session.run_for, AOSP)
+    crash.probe_jdtls_crash = real_probe
+    t.truthy(ok2, tostring(err2))
+    t.raw_eq(S.sessions[AOSP].phase, "ready")
+    t.raw_eq(S.sessions[AOSP].sp_push.mode, "cycle", "the real jar push still cycles")
+    local after = project_pushes(client)
+    t.raw_eq(#after, 3, "the cycle sends the empty step, then the full push")
+    t.truthy(after[3].referencedLibraries and #after[3].referencedLibraries > 0)
+    t.truthy(probes >= 1, "the ready path still runs the crash probe")
+  end)
+
+  t.it("two consecutive source-only scans push once with no queue leak", function()
+    local old_cf = enter_no_out()
+    local S = session._state()
+    shim._cwd = AOSP
+    aosp_nav._clear_pinned_folders()
+    shim.shim.clients = {}
+    local client = shim.make_jdtls_client(AOSP)
+    session.run_for(AOSP)
+    session.run_for(AOSP)
+    S.deps.current_file = old_cf
+
+    local pushes = 0
+    for _, n in ipairs(client.notifications) do
+      if n.method == "workspace/didChangeConfiguration" and n.params.settings.java.project then
+        pushes = pushes + 1
+      end
+    end
+    t.raw_eq(pushes, 1, "a settled degraded session is not re-pushed")
+    t.raw_eq(#S.queue, 0, "no queued work is left behind")
+    local ninflight, nrunning = 0, 0
+    for _ in pairs(S.inflight) do
+      ninflight = ninflight + 1
+    end
+    for _ in pairs(S.running) do
+      nrunning = nrunning + 1
+    end
+    t.raw_eq(ninflight, 0, "no inflight waiter is left behind")
+    t.raw_eq(nrunning, 0, "no scan coroutine is left behind")
+    t.raw_eq(S.active, 0, "the concurrency counter is back to zero")
+  end)
+
+  t.it(":AospRescan keeps the old cache and explains the degraded state", function()
+    local old_cf = enter_no_out()
+    local S = session._state()
+    -- A cache left over from an earlier build (its jars are gone now) must
+    -- survive both the scan and an explicit rescan of an unbuilt tree.
+    store:write_cache(AOSP, {
+      version = 8,
+      filters_hash = "old-cache",
+      jars = { AOSP .. "/out/soong/.intermediates/gone.jar" },
+      build_mtime_ms = 1,
+    })
+    session.run_for(AOSP)
+    S.deps.current_file = old_cf
+    t.truthy(store:read_cache(AOSP), "the old cache survives the source-only scan")
+
+    local summary
+    session.rescan(AOSP, function(s)
+      summary = s
+    end)
+    t.truthy(summary and summary:find("source-only", 1, true), "summary names the state")
+    t.truthy(summary:find("source root", 1, true), "summary explains what is navigable")
+    t.truthy(store:read_cache(AOSP), "rescan does not delete the retained cache")
+    t.raw_eq(S.sessions[AOSP].phase, "source-only")
+  end)
+
+  t.it(":AospRescan on a compiled tree still reports injected jars", function()
+    local old_cf = enter_no_out()
+    build_tree()
+    shim.shim.reset_stat_cache()
+    local S = session._state()
+    S.sessions[AOSP] = nil
+    session.run_for(AOSP)
+
+    local summary
+    session.rescan(AOSP, function(s)
+      summary = s
+    end)
+    S.deps.current_file = old_cf
+    t.raw_eq(S.sessions[AOSP].phase, "ready")
+    t.truthy(summary and summary:find("jars injected", 1, true), "ready summary is unchanged")
+    t.truthy(store:read_cache(AOSP), "a compiled tree still writes the jar cache")
   end)
 end)
 

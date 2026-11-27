@@ -711,3 +711,18 @@ t.describe("jar_plan: module jars are removed when their sources are injected", 
     t.raw_eq(#kept, #jars)
   end)
 end)
+
+t.describe("jar_plan: unbuilt trees are source-only", function()
+  t.it("an empty jar list is not the expected whole-tree list", function()
+    local fs = FakeFs.new()
+    local r = jar_plan.compute_injected_jars("/aosp", {}, {}, NOOP, {
+      io = fs:io(),
+      source_only = true,
+    })
+    t.raw_eq(#r.jars, 0)
+    t.raw_eq(r.mode, "fallback")
+    t.truthy(r.source_only, "the plan carries the degraded state")
+    t.falsy(r.expected, "not flagged as the root window's whole-tree jar list")
+    t.truthy(r.reason:find("source-only", 1, true), "the reason names the state")
+  end)
+end)

@@ -86,6 +86,17 @@ t.describe("jdtls channel: build_settings fragments", function()
     )
   end)
 
+  t.it("a source-only live push sends sourcePaths but no classpath change", function()
+    local live = channel.build_settings("/aosp", {
+      source_paths = { "frameworks/base/core/java" },
+    }, { live = true })
+    t.falsy(
+      live.project.referencedLibraries,
+      "jars=nil keeps an existing classpath instead of clearing it"
+    )
+    t.same_list(live.project.sourcePaths, { "frameworks/base/core/java" })
+  end)
+
   t.it("start fragment keeps sourcePaths + exclusions + autobuild", function()
     local frag = channel.build_settings("/aosp", {
       jars = { "/aosp/out/x.jar" },

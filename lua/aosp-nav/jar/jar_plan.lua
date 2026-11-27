@@ -257,6 +257,16 @@ function M.compute_injected_jars(root, selected_module_dirs, full_jars, log, opt
   opts = opts or {}
   local io_ = opts.io
 
+  -- An unbuilt tree is a designed degraded state, not a failed closure over
+  -- zero jars. Skip the index scan entirely and label the plan accordingly,
+  -- so the rescan summary and panel cannot call this "root window: whole-tree
+  -- jar list" or a fallback failure.
+  if opts.source_only then
+    local plan = fallback(full_jars, "no build outputs (source-only: module sources only)", log)
+    plan.source_only = true
+    return plan
+  end
+
   -- dedup + trim seeds
   local seen = {}
   local seeds = {}

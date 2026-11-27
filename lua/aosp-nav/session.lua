@@ -761,10 +761,15 @@ local function apply_to_client_impl(root, sess, client)
     end, want_cycle and 1000 or 2000)
   end
 
-  -- jars=nil in source-only: build_settings keeps the key out of the live
-  -- fragment, so jdt.ls keeps whatever classpath it already has. Passing the
-  -- empty sess.jars here would write referencedLibraries=[] and wipe it.
-  jdtls_channel.push_with_source_cycle(client, source_only and nil or sess.jars, sp_rel, {
+  -- source-only: jars=nil keeps referencedLibraries out of the live fragment,
+  -- so jdt.ls keeps whatever classpath it already has. NOTE: the Lua idiom
+  -- `source_only and nil or sess.jars` would fall back to the empty table
+  -- (nil is falsey) and wipe it — use an explicit branch.
+  local push_jars = sess.jars
+  if source_only then
+    push_jars = nil
+  end
+  jdtls_channel.push_with_source_cycle(client, push_jars, sp_rel, {
     cycle = want_cycle,
     on_done = schedule_removals,
   })
@@ -1133,6 +1138,13 @@ function M._scan_root(root)
         source_only = true
       end
     end
+    -- :AospReset may have landed while the jar scan yielded above (or while
+    -- the cache probe was pending). BEFORE any write-back: the old code only
+    -- checked the epoch near the end, so a reset in this window let the dead
+    -- coroutine write a fresh jar cache and resurrect status/notifications.
+    if (S.epoch or 0) ~= epoch then
+      return
+    end
     if source_only then
       jars = {}
       sess.phase = "source-only"
@@ -1221,6 +1233,7 @@ function M._scan_root(root)
     folder = window_folder,
     import_exclusions = cfg._guard_exclusions or {},
     load_index = load_index,
+    source_only = source_only,
   })
   jars = plan.jars
   sess.jars = jars
@@ -1437,18 +1450,43 @@ function M.rerun_all()
 end
 
 ---Rescan (command): drop the cache, join a running scan, re-run.
----cb(summary_line) runs when everything settled.
+---cb(summary_line) runs when everything settled. An unbuilt tree keeps its
+---old jar cache — out may be temporary, and a source-only scan never writes
+---a replacement; deleting it here was the one path that still broke that
+---contract.
 function M.rescan(root, cb)
   root = pathutil.normalize(root)
   local store = S.deps.store
   M.wait_for(root, function()
+    local prev = S.sessions[root]
+    local no_outputs = build_stamp(root) == nil
+    if no_outputs then
+      for _, base in ipairs(scanner.SOONG_BASES) do
+        if fs.is_dir(pathutil.join(root, base)) then
+          no_outputs = false
+          break
+        end
+      end
+    end
+    local keep_cache = no_outputs or (prev ~= nil and prev.phase == "source-only")
     S.sessions[root] = nil
-    store:remove_cache(root)
+    if not keep_cache then
+      store:remove_cache(root)
+    end
     jar_plan._reset_closure_cache()
     M.run_for(root)
     M.wait_for(root, function()
       local sess = S.sessions[root]
-      if cb and sess and sess.plan then
+      if cb and sess and sess.phase == "source-only" then
+        local sp = sess.source_paths
+        local n = sp and sp.rel_paths and #sp.rel_paths or 0
+        cb(
+          string.format(
+            "[aosp-nav] source-only: no build outputs; %d source root(s) injected — build the tree for jar navigation",
+            n
+          )
+        )
+      elseif cb and sess and sess.plan then
         local p = sess.plan
         if p.mode == "closure" then
           cb(

@@ -130,7 +130,7 @@ require("aosp-nav").setup({
 | 命令 | 说明 |
 | --- | --- |
 | `:Aosp` | 自检面板（通用 / Java / Kotlin / C/C++）。按键：`e` 修复 Eclipse 元数据、`m` 选模块、`r` 重扫、`L` 打开日志、`<Tab>` 展开行细节、`q` 关闭 |
-| `:AospRescan[!]` | 丢弃 jar 缓存并重新扫描（同时重跑 Eclipse 护栏）。`!` 还会重启 jdt.ls，让启动期设置重新下发 |
+| `:AospRescan[!]` | 丢弃 jar 缓存并重新扫描（同时重跑 Eclipse 护栏）；未编译的树会保留已有缓存。`!` 还会重启 jdt.ls，让启动期设置重新下发 |
 | `:AospModules` | 选择源码根模块：`<Space>` 勾选、`/` 过滤、`Tab` 展开子模块、`r` 回到自动选择、`<CR>` 确认（未改动时 no-op）、`q`/`<Esc>` 取消 |
 | `:AospReset` | 回滚插件写入的一切：清空全局状态与 Kotlin 分发脚本，清扫**所有** `aosp-<hash>/` 缓存目录（含已删除的 checkout），并报告数量 |
 

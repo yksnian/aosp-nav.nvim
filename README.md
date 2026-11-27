@@ -131,7 +131,7 @@ An unbuilt checkout is still a valid AOSP tree. Instead of failing, the plugin e
 | Command | Description |
 | --- | --- |
 | `:Aosp` | Self-check panel (General / Java / Kotlin / C/C++). Keys: `e` fix Eclipse metadata, `m` modules, `r` rescan, `L` log, `<Tab>` expand row details, `q` close |
-| `:AospRescan[!]` | Drop the jar cache and rescan (also re-runs the Eclipse guard). `!` also restarts jdt.ls to re-apply start-time settings |
+| `:AospRescan[!]` | Drop the jar cache and rescan (also re-runs the Eclipse guard); on an unbuilt tree the old cache is kept. `!` also restarts jdt.ls to re-apply start-time settings |
 | `:AospModules` | Pick source-root modules: `<Space>` toggle, `/` filter, `Tab` expand nested, `r` back to auto, `<CR>` accept (no-op if unchanged), `q`/`<Esc>` cancel |
 | `:AospReset` | Remove everything the plugin wrote: clear global state and the Kotlin dispatch script, sweep **all** `aosp-<hash>/` cache folders (including deleted checkouts), and report counts |
 
