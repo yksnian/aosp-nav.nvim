@@ -19,6 +19,59 @@ local function info(msg)
   vim.health.info(msg)
 end
 
+---Locate the tree from sources that are valid while `:checkhealth` runs.
+---The health scratch buffer's name is a `health://` URI and the editor cwd is
+---often outside the checkout, so the panel's "active editor" seed alone is
+---not enough here. Explicit config, every open file buffer and known session
+---roots are tried first; cwd is only a last resort. URI-like and bracketed
+---names (health://, term://, [quickfix]) are never treated as paths.
+function M._detect_root()
+  local ar = require("aosp-nav.android_root")
+  local fs = require("aosp-nav.infra.fs")
+  local opts = require("aosp-nav").get_opts()
+
+  if opts and opts.android_root then
+    return opts.android_root
+  end
+
+  local seeds = {}
+  local function add(p)
+    if type(p) ~= "string" or p == "" then
+      return
+    end
+    if p:find("://", 1, true) or p:sub(1, 1) == "[" then
+      return
+    end
+    seeds[#seeds + 1] = p
+  end
+
+  if vim.api and vim.api.nvim_list_bufs then
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+      add(vim.api.nvim_buf_get_name(b))
+    end
+  end
+
+  local S = require("aosp-nav.session")._state()
+  if S.last_root then
+    add(S.last_root)
+  end
+  for r in pairs(S.sessions or {}) do
+    add(r)
+  end
+
+  if vim.fn and vim.fn.getcwd then
+    add(vim.fn.getcwd())
+  end
+
+  for _, seed in ipairs(seeds) do
+    local root = ar.detect_aosp_root(seed, fs.is_dir, fs.is_file)
+    if root ~= nil then
+      return root
+    end
+  end
+  return nil
+end
+
 function M.check()
   vim.health.start("aosp-nav.nvim")
 
@@ -37,32 +90,14 @@ function M.check()
   end
   info("version " .. aosp_nav.VERSION)
 
-  -- tree detection: prefer the open buffer's file, then cwd (a user who
-  -- `:checkhealth`s while inside an AOSP file expects the tree to show up
-  -- even when the editor was started from elsewhere)
-  local ar = require("aosp-nav.android_root")
+  -- tree detection: the checkhealth buffer (health://) and cwd are not valid
+  -- seeds — use explicit config, open file buffers and known session roots.
   local fs = require("aosp-nav.infra.fs")
-  local bufname = vim.api.nvim_buf_get_name(0)
-  local candidates = {}
-  if bufname ~= "" then
-    candidates[#candidates + 1] = bufname
-  end
-  local cwd = vim.fn.getcwd()
-  candidates[#candidates + 1] = cwd
-  local root = nil
-  for _, seed in ipairs(candidates) do
-    root = ar.detect_aosp_root(seed, fs.is_dir, fs.is_file)
-    if root ~= nil then
-      break
-    end
-  end
+  local root = M._detect_root()
   if root == nil then
     warn(
-      "no AOSP checkout detected (buffer: "
-        .. (bufname ~= "" and bufname or "none")
-        .. ", cwd: "
-        .. cwd
-        .. ") — open a java/kotlin/c file inside an AOSP checkout (build outputs are optional)"
+      "no AOSP checkout detected — open a java/kotlin/c file inside an AOSP checkout "
+        .. "(build outputs are optional), or set android_root in your config"
     )
     return
   end
@@ -74,7 +109,7 @@ function M.check()
   else
     warn(
       "out/soong/.intermediates missing — source-only mode: module sources from the open file are "
-        .. "navigable; build the tree (lunch + m) for cross-module jars"
+        .. "navigable; build the whole tree for cross-module jars"
     )
   end
   if fs.is_file(root .. "/out/soong/module_bp_java_deps.json") then

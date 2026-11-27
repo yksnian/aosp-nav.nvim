@@ -3511,6 +3511,77 @@ t.describe("E2E: source-only mode (no out)", function()
     )
   end)
 
+  t.it("checkhealth detects the tree from an open buffer, not the health:// buffer", function()
+    build_tree()
+    shim.shim.reset_stat_cache()
+    while #vim.api._buffers > 1 do
+      table.remove(vim.api._buffers)
+    end
+    local S = session._state()
+    S.last_root = nil
+    S.sessions = {}
+    local opts = aosp_nav.get_opts()
+    local saved_root = opts.android_root
+    opts.android_root = nil
+    shim._cwd = "/home/yangwj12" -- health is often launched from outside the tree
+
+    -- current buffer is the health scratch buffer; another buffer holds a
+    -- real AOSP file. The scratch URI must never be used as a seed, but the
+    -- open file buffer must locate the tree.
+    vim.api._buffers[1].name = "health://"
+    local added = vim.api.nvim_create_buf(false, true)
+    vim.api._buffers[added + 1].name = AOSP .. "/system/netd/server/NetdClient.cpp"
+
+    local root = require("aosp-nav.health")._detect_root()
+    t.raw_eq(root, AOSP, "tree found from the open AOSP file buffer")
+
+    -- restore
+    vim.api._buffers[1].name = ""
+    shim._cwd = AOSP
+    opts.android_root = saved_root
+  end)
+
+  t.it("checkhealth warning does not print the health:// buffer or cwd", function()
+    build_tree()
+    shim.shim.reset_stat_cache()
+    while #vim.api._buffers > 1 do
+      table.remove(vim.api._buffers)
+    end
+    local S = session._state()
+    S.last_root = nil
+    S.sessions = {}
+    local opts = aosp_nav.get_opts()
+    local saved_root = opts.android_root
+    opts.android_root = nil
+    shim._cwd = "/home/yangwj12"
+    vim.api._buffers[1].name = "health://"
+    -- no other buffer, no session root: detection must fail cleanly
+
+    local saved_health = vim.health
+    local seen = { warn = {} }
+    vim.health = {
+      start = function() end,
+      ok = function() end,
+      warn = function(m)
+        seen.warn[#seen.warn + 1] = m
+      end,
+      error = function() end,
+      info = function() end,
+    }
+    require("aosp-nav.health").check()
+    vim.health = saved_health
+
+    local joined = table.concat(seen.warn, "\n")
+    t.falsy(joined:find("health://", 1, true), "scratch buffer URI is not printed")
+    t.falsy(joined:find("cwd", 1, true), "cwd is not printed")
+    t.falsy(joined:find("/home/yangwj12", 1, true), "home cwd path is not leaked")
+    t.truthy(joined:find("open a java/kotlin/c file", 1, true), "actionable hint remains")
+
+    vim.api._buffers[1].name = ""
+    shim._cwd = AOSP
+    opts.android_root = saved_root
+  end)
+
   t.it("writes .kls support files without downloading ktlsp on a Java file", function()
     local old_cf = enter_no_out()
     local S = session._state()
