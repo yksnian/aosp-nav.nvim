@@ -3087,6 +3087,94 @@ t.describe("E2E: source-only mode (no out)", function()
     t.falsy(text:find("⚠ jar source", 1, true), "no empty classpath is reported as a failure")
   end)
 
+  t.it("zero source roots are an info row, not a false warning", function()
+    local old_cf = enter_no_out()
+    local S = session._state()
+    session.run_for(AOSP)
+    S.deps.current_file = old_cf
+    S.sessions[AOSP].source_paths = {
+      rel_paths = {},
+      abs_paths = {},
+      skipped_outside = 0,
+      module_source = "auto",
+    }
+    local diagnostics = require("aosp-nav.diagnostics")
+    local aosp_nav = require("aosp-nav")
+    local text = diagnostics.render(diagnostics.collect({
+      cfg = aosp_nav.get_opts,
+      store = aosp_nav._store(),
+      workspace_folders = function()
+        return { AOSP }
+      end,
+    }))
+    t.truthy(text:find("- sourcePaths: 0 injected", 1, true), "an empty scope is an info row")
+    t.falsy(text:find("⚠ sourcePaths", 1, true), "no warning when there is nothing to report")
+  end)
+
+  t.it("an empty / filter returns the module picker to unfiltered mode", function()
+    build_tree()
+    -- one module deeper than VISIBLE_DEPTH: unfiltered mode shows the
+    -- "hidden — Tab to expand" note, filter mode (even an empty pattern) does not
+    local index_path = pathutil.join(AOSP, "out/soong/module_bp_java_deps.json")
+    local fd = io.open(index_path, "r")
+    local deps = json.decode(fd:read("*a"))
+    fd:close()
+    deps["deep.module"] = {
+      path = { "packages/modules/Conn/framework/java" },
+      srcs = { "packages/modules/Conn/framework/java/com/android/conn/Deep.java" },
+      jars = {},
+    }
+    fd = io.open(index_path, "w")
+    fd:write(json.encode(deps))
+    fd:close()
+    require("aosp-nav.jar.module_index")._reset_cache()
+    mkdirs(AOSP .. "/packages/modules/Conn/framework/java/com/android/conn")
+    touch(AOSP .. "/packages/modules/Conn/framework/java/com/android/conn/Deep.java")
+    shim.shim.reset_stat_cache()
+    local file = AOSP .. "/frameworks/base/core/java/com/android/internal/util/ArrayUtils.java"
+    shim.set_active_file(file, "java")
+    shim._cwd = AOSP
+
+    local saved_keymap, saved_lines, saved_input =
+      vim.keymap.set, vim.api.nvim_buf_set_lines, vim.fn.input
+    local handlers, lines = {}, nil
+    vim.keymap.set = function(_mode, lhs, fn, _opts)
+      handlers[lhs] = fn
+    end
+    vim.api.nvim_buf_set_lines = function(_buf, _a, _b, _c, value)
+      lines = value
+    end
+    local input = "zzz"
+    vim.fn.input = function(_opts)
+      return input
+    end
+    local out = {
+      pcall(function()
+        shim.run_user_command("AospModules")
+        t.truthy(handlers["/"], "the picker registered its filter key")
+        handlers["/"]()
+        t.truthy(
+          lines and table.concat(lines, "\n"):find("no module dir matches /zzz/", 1, true),
+          "a pattern that matches nothing is reported"
+        )
+        input = ""
+        handlers["/"]()
+        local cleared = lines and table.concat(lines, "\n") or ""
+        t.falsy(cleared:find("no module dir matches", 1, true), "no stale filter header")
+        t.truthy(
+          cleared:find("deeper module(s) hidden", 1, true),
+          "unfiltered mode restores the hidden-row note (filter is nil, not '')"
+        )
+      end),
+    }
+    vim.fn.input = saved_input
+    vim.api.nvim_buf_set_lines = saved_lines
+    vim.keymap.set = saved_keymap
+    if not out[1] then
+      error(out[2], 0)
+    end
+  end)
+
   t.it("checkhealth explains missing build outputs without a hard error", function()
     local old_cf = enter_no_out()
     local S = session._state()

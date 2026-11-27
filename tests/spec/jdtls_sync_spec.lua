@@ -410,6 +410,113 @@ t.describe("jdtls channel: the source cycle", function()
   end)
 end)
 
+t.describe("jdtls channel: reload strictness", function()
+  -- Minimal invisible project + a fake clock. The classpath has a src entry
+  -- BEFORE a lib (order is fine), but neither the planned root nor the planned
+  -- jar is present: only a strict reload may call that stale.
+  local function reload_with(strict)
+    local folder = "/aosp-reload-" .. tostring(strict)
+    local tmp = os.tmpname()
+    os.remove(tmp)
+    os.execute("mkdir -p '" .. tmp .. "/proj'")
+    local fd = io.open(tmp .. "/proj/.project", "w")
+    fd:write("<location>" .. folder .. "</location>")
+    fd:close()
+    fd = io.open(tmp .. "/proj/.classpath", "w")
+    fd:write(
+      '<classpath><classpathentry kind="src" path="_/frameworks/base/core/java"/>'
+        .. '<classpathentry kind="lib" path="/aosp/out/framework.jar"/></classpath>'
+    )
+    fd:close()
+
+    local saved_vim, real_time = _G.vim, os.time
+    local queue, healed, stopped = {}, {}, 0
+    local clock = 1000
+    local client = {
+      id = strict and 901 or 900,
+      name = "jdtls",
+      config = { root_dir = folder, cmd = { "jdtls", "-data", tmp } },
+    }
+    _G.vim = {
+      defer_fn = function(fn, _ms)
+        queue[#queue + 1] = fn
+      end,
+      lsp = {
+        get_clients = function()
+          return { client }
+        end,
+        stop_client = function()
+          stopped = stopped + 1
+        end,
+      },
+      fn = {
+        glob = function()
+          return { tmp .. "/proj/.project" }
+        end,
+        delete = function() end,
+      },
+      api = {
+        nvim_list_bufs = function()
+          return {}
+        end,
+      },
+      loop = { kill = function() end },
+    }
+    os.time = function()
+      return clock
+    end
+    channel._set_server_probe(function()
+      return false
+    end)
+
+    local out = {
+      pcall(function()
+        local _, retried = channel.reload_stale_sources(
+          folder,
+          folder,
+          { "missing/root" },
+          { "/aosp/out/missing.jar" },
+          1,
+          function(reason)
+            healed[#healed + 1] = reason
+          end,
+          nil,
+          strict,
+          nil,
+          false
+        )
+        t.raw_eq(retried, true, "the first attempt waits for the importer")
+        clock = clock + 50
+        local retry = table.remove(queue, 1)
+        t.truthy(retry, "a retry was queued")
+        retry()
+        return { stopped = stopped, healed = healed }
+      end),
+    }
+
+    os.time = real_time
+    _G.vim = saved_vim
+    channel._set_server_probe(nil)
+    os.execute("rm -rf '" .. tmp .. "'")
+    if not out[1] then
+      error(out[2], 0)
+    end
+    return out[2]
+  end
+
+  t.it("strict=false ignores missing planned roots and jars", function()
+    local r = reload_with(false)
+    t.raw_eq(r.stopped, 0, "a good classpath order leaves the JVM untouched")
+    t.raw_eq(#r.healed, 0, "no heal was reported")
+  end)
+
+  t.it("strict=true still recreates on a missing planned jar", function()
+    local r = reload_with(true)
+    t.raw_eq(r.stopped, 1, "the strict scan-time caller stops the JVM for a rebuild")
+    t.raw_eq(r.healed[1], "jars", "the missing jar is the reason")
+  end)
+end)
+
 t.describe("jdtls channel: removeFromSourcePath (stale-root removal)", function()
   local function recording_client(fail_first)
     local client = fake_client()

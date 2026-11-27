@@ -424,7 +424,15 @@ function M.collect(D)
         full
       )
     else
-      row(#sp.abs_paths == 0 and nil or injected > 0, "sourcePaths", short, nil, "Java", full)
+      -- No source root in scope is an INFO row ("-"), not a warning: there is
+      -- nothing to mark good or bad. `#sp.abs_paths == 0 and nil or injected > 0`
+      -- falls back to the boolean in Lua (nil is falsey) and printed a false
+      -- warning/ok mark for that case.
+      local ok = nil
+      if #sp.abs_paths > 0 then
+        ok = injected > 0
+      end
+      row(ok, "sourcePaths", short, nil, "Java", full)
     end
   end
   if sess and sess.plan then

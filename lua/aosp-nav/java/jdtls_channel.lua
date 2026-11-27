@@ -833,11 +833,17 @@ function M.reload_stale_sources(
   -- push has not been delivered yet, and rebuilding there would race the
   -- ordering cycle with the OLD selection (the project would be recreated
   -- before the new roots can apply).
-  local reason = M.classpath_stale_reason(
-    xml,
-    strict == false and nil or rel_paths,
-    strict == false and nil or jar_paths
-  )
+  -- A non-strict reload judges classpath ORDER only. The scan-time caller
+  -- passes strict=false because a just-pushed new selection has not landed in
+  -- .classpath yet: demanding every planned root/jar here recreates the
+  -- project against the OLD selection. Explicit branches are required —
+  -- `strict == false and nil or rel_paths` falls back to rel_paths in Lua
+  -- because nil is falsey.
+  local stale_rel, stale_jars = rel_paths, jar_paths
+  if strict == false then
+    stale_rel, stale_jars = nil, nil
+  end
+  local reason = M.classpath_stale_reason(xml, stale_rel, stale_jars)
   -- force: the caller needs a deterministic recreate (e.g. a shrinking
   -- selection whose stale roots the server refuses to retract via
   -- removeFromSourcePath). Skip the reason gate but keep every guard above —

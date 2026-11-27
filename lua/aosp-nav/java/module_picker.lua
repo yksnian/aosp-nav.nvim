@@ -28,6 +28,16 @@ local M = {}
 M.VISIBLE_DEPTH = 1
 M.MAX_HEIGHT = 34
 
+---Normalize the `/` filter input. An empty string must mean UNFILTERED, not
+---an empty (truthy) pattern: `pat == "" and nil or pat:lower()` falls back to
+---"" in Lua, leaving the picker in filter mode with a "//" no-match header.
+function M._normalize_filter(pat)
+  if pat == nil or pat == "" then
+    return nil
+  end
+  return pat:lower()
+end
+
 local function seg_count(rel)
   local n = 0
   for _ in rel:gmatch("[^/]+") do
@@ -435,7 +445,7 @@ function M.open(root, deps)
       return
     end
     local anchor = cursor_dir()
-    filter = (pat == "") and nil or pat:lower()
+    filter = M._normalize_filter(pat)
     render(anchor)
   end, keymap_opts)
   vim.keymap.set("n", "<Tab>", function()
