@@ -148,10 +148,12 @@ function M.collect(D)
       and root_source ~= "active editor"
       and (" (" .. root_source .. ")")
     or ""
-  -- A detected root is normally ✓, but a source-only root is degraded: no
-  -- build outputs means no cross-module classpath. Mark it ⚠ so the top row
-  -- cannot be read as a fully working session.
-  local root_ok = root ~= nil and not (sess and sess.phase == "source-only")
+  -- This row answers one question: was an AOSP root detected? ✓ means yes,
+  -- even in source-only mode — the phase text below the dash already says
+  -- "source-only (no build outputs)". The degraded capability gets its own
+  -- ⚠ row ("build outputs") so the warning sits on the thing that is
+  -- actually missing, not on a successfully detected root.
+  local root_ok = root ~= nil
   row(
     root_ok,
     "root",
@@ -159,10 +161,12 @@ function M.collect(D)
       or "not detected (no AOSP file open and no AOSP workspace folder)"
   )
   if sess and sess.phase == "source-only" then
-    -- The reason for the degraded state is a fact, not a failure: source
-    -- roots come from the open file, cross-module jars need a build.
+    -- Source roots come from the open file, so navigation still works; what
+    -- is missing is the build output jar classpath. Mark that gap ⚠ (with
+    -- the build + rescan hint), instead of mislabeling the detected root as
+    -- a warning.
     row(
-      nil,
+      false,
       "build outputs",
       "missing or empty — source-only (module sources from the open file)",
       "build the tree (lunch + m), then :AospRescan for cross-module jars",

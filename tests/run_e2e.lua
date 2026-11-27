@@ -3199,9 +3199,13 @@ t.describe("E2E: source-only mode (no out)", function()
       end,
     }))
     t.truthy(text:find("source-only (no build outputs)", 1, true), "root row is readable")
-    t.truthy(text:find("⚠ root:", 1, true), "a degraded root is a warning, not a success")
-    t.falsy(text:find("✓ root:", 1, true), "no ✓ on a source-only root")
-    t.truthy(text:find("- build outputs: missing or empty", 1, true), "degradation reason is shown")
+    t.truthy(text:find("✓ root:", 1, true), "root detection still succeeds in source-only mode")
+    t.falsy(text:find("⚠ root:", 1, true), "no warning on a successfully detected root")
+    t.truthy(
+      text:find("⚠ build outputs: missing or empty", 1, true),
+      "the missing build outputs are the warning"
+    )
+    t.falsy(text:find("- build outputs:", 1, true), "the degradation is not reported as plain info")
     t.truthy(text:find("- jar scan: skipped (no build outputs)", 1, true))
     t.truthy(text:find("- jar source: 0 injected (source-only)", 1, true))
     t.falsy(text:find("✓ jar source", 1, true), "no empty classpath is reported as success")
