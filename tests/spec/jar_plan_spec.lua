@@ -4,6 +4,7 @@ local t = require("t")
 local path = require("aosp-nav.util.path")
 local json = require("aosp-nav.infra.json")
 local jar_plan = require("aosp-nav.jar.jar_plan")
+local module_index = require("aosp-nav.jar.module_index")
 
 -- ------------------------------------------------------- fake fs layer --
 
@@ -409,6 +410,46 @@ t.describe("compute_injected_jars", function()
     t.raw_eq(r.dropped, 0)
   end)
 
+  t.it("rescues a .impl module whose jar is named after the base module", function()
+    local root, fs = make_root({
+      app = {
+        path = { "packages/modules/Connectivity/framework" },
+        jars = { "out/j/a.jar" },
+        dependencies = { "framework-connectivity.impl" },
+      },
+      ["framework-connectivity.impl"] = {
+        path = { "packages/modules/Connectivity/framework" },
+        jars = {
+          "out/soong/.intermediates/packages/modules/Connectivity/framework/framework-connectivity.impl/android_common/jarjar/turbine/framework-connectivity.jar",
+        },
+      },
+    }, {
+      "out/j/a.jar",
+      "out/soong/.intermediates/packages/modules/Connectivity/framework/framework-connectivity.impl/android_common/combined/framework-connectivity.jar",
+    })
+    jar_plan._reset_closure_cache()
+    local r = jar_plan.compute_injected_jars(
+      root,
+      { "packages/modules/Connectivity/framework" },
+      FULL,
+      NOOP,
+      { io = fs:io() }
+    )
+    local want = path.join(
+      root,
+      "out/soong/.intermediates/packages/modules/Connectivity/framework/framework-connectivity.impl/android_common/combined/framework-connectivity.jar"
+    )
+    local found = false
+    for _, j in ipairs(r.jars) do
+      if j == want then
+        found = true
+      end
+    end
+    t.truthy(found, "the impl module's implementation jar enters the plan")
+    t.raw_eq(r.rescued, 1)
+    t.raw_eq(r.starved, 0)
+  end)
+
   t.it("prefers the numerically highest apex variant when rescuing (apex10 over apex2)", function()
     local root, fs = make_root({
       app = {
@@ -709,6 +750,65 @@ t.describe("jar_plan: module jars are removed when their sources are injected", 
     local kept, dropped = jar_plan.drop_module_jars(jars, root, {})
     t.raw_eq(dropped, 0)
     t.raw_eq(#kept, #jars)
+  end)
+end)
+
+t.describe("jar_plan: generated-source modules keep implementation jars", function()
+  local root = "/aosp"
+  local dir = "packages/modules/Connectivity/framework"
+  local impl = "out/soong/.intermediates/" .. dir .. "/framework-connectivity.impl"
+  local generated_jars = {
+    "/aosp/" .. impl .. "/android_common/javac/framework-connectivity.jar",
+    "/aosp/" .. impl .. "/android_common/combined/framework-connectivity.jar",
+    "/aosp/" .. impl .. "/android_common/jarjar/framework-connectivity.jar",
+    "/aosp/" .. impl .. "/android_common/turbine-combined/framework-connectivity.jar",
+    "/aosp/" .. impl .. "/android_common/jarjar/turbine/framework-connectivity.jar",
+    "/aosp/" .. impl .. "/android_common/stubs/framework-connectivity-stubs.jar",
+  }
+  local index = module_index.build_index({
+    ["framework-connectivity"] = { path = { dir }, jars = {} },
+    ["framework-connectivity-aidl-export-sources"] = {
+      path = { dir },
+      srcs = { dir .. "/src/android/net/ICaptivePortal.aidl" },
+    },
+    ["framework-connectivity-protos"] = {
+      path = { dir },
+      srcs = { dir .. "/proto/connectivity.proto" },
+    },
+  })
+
+  t.it("finds generated sources across modules sharing one directory", function()
+    t.same_list(jar_plan.generated_module_dirs(index, { dir }), { dir })
+    t.same_list(
+      jar_plan.generated_module_dirs(index, { "packages/modules/Wifi/framework" }),
+      {},
+      "a plain Java module is not flagged"
+    )
+    t.same_list(jar_plan.generated_module_dirs(nil, { dir }), {}, "no index means no exception")
+  end)
+
+  t.it("keeps implementation variants but drops turbine and stubs", function()
+    local kept, dropped, kept_generated = jar_plan.drop_module_jars(generated_jars, root, { dir }, {
+      generated = jar_plan.generated_module_dirs(index, { dir }),
+    })
+    t.raw_eq(dropped, 2, "pure turbine + stubs jar are dropped")
+    t.raw_eq(kept_generated, 4, "the four implementation/fallback variants stay")
+    t.raw_eq(#kept, 4)
+    local names = {}
+    for _, j in ipairs(kept) do
+      names[j] = true
+    end
+    t.truthy(names[generated_jars[2]], "combined jar carries the AIDL-generated classes")
+    t.truthy(names[generated_jars[4]], "turbine-combined is a built fallback, not an ABI stub")
+    t.falsy(names[generated_jars[5]], "pure turbine jar is ABI-only")
+    t.falsy(names[generated_jars[6]], "stubs jar is ABI-only")
+  end)
+
+  t.it("still drops every own jar when no generated source is flagged", function()
+    local kept, dropped, kept_generated = jar_plan.drop_module_jars(generated_jars, root, { dir })
+    t.raw_eq(dropped, #generated_jars)
+    t.raw_eq(#kept, 0)
+    t.raw_eq(kept_generated, 0)
   end)
 end)
 

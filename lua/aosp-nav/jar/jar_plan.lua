@@ -31,6 +31,14 @@ M.COMMON_TEST_MODULES = { "platform-test-annotations", "flag-junit-base", "testa
 
 local UNMAPPED_LOG_LIMIT = 40
 local JAR_KINDS = { "javac", "combined", "turbine-combined" }
+local INTERMEDIATES_PREFIX = "out/soong/.intermediates/"
+
+local GENERATED_SRC_EXT = { [".aidl"] = true, [".proto"] = true }
+local GENERATED_STUB_JARS = {
+  ["android_stubs_current.jar"] = true,
+  ["android_system_stubs_current.jar"] = true,
+  ["private-stub-annotations-jar.jar"] = true,
+}
 
 local CONFLICT_STUBS = {
   ["android_stubs_current.jar"] = true,
@@ -94,6 +102,22 @@ local function numeric_aware_less(a, b)
   return #a < #b
 end
 
+---Soong often names the built jar after the BASE module, not the generator
+---module: framework-connectivity.impl produces framework-connectivity.jar.
+---Try the module name first, then progressively strip dotted suffixes.
+local function jar_basenames(name)
+  local out = { name }
+  while true do
+    local shorter = name:match("^(.-)%.[^.]+$")
+    if shorter == nil or shorter == name then
+      break
+    end
+    out[#out + 1] = shorter
+    name = shorter
+  end
+  return out
+end
+
 ---Variant fallback: scan a module's intermediates dir for a built jar when
 ---every jar the build index lists for it is missing on disk. Variant dirs
 ---in DESCENDING numeric order (apex variants beat plain ones); within a
@@ -106,15 +130,18 @@ function M.rescue_built_jar(root, name, dir, io)
   if variants == nil then
     return nil
   end
+  local basenames = jar_basenames(name)
   table.sort(variants, numeric_aware_less)
   local i = #variants
   while i >= 1 do
     local variant = variants[i]
     i = i - 1
     for _, kind in ipairs(JAR_KINDS) do
-      local rel = base .. "/" .. variant .. "/" .. kind .. "/" .. name .. ".jar"
-      if io.is_file(pathutil.join(root, rel)) then
-        return rel
+      for _, bname in ipairs(basenames) do
+        local rel = base .. "/" .. variant .. "/" .. kind .. "/" .. bname .. ".jar"
+        if io.is_file(pathutil.join(root, rel)) then
+          return rel
+        end
       end
     end
   end
@@ -215,42 +242,95 @@ end
 ---  load_index = function(root, log) -> index|nil (optional override)
 ---}
 
+---Module dirs whose build-index entries contain AIDL/proto sources. Their
+---jars can hold classes with NO .java in the injected source roots (AIDL
+---generates Java at build time), so those implementation jars must survive
+---drop_module_jars. The index already resolves filegroups/globs, and several
+---modules may share one dir (framework-connectivity has 0 srcs while
+---framework-connectivity-aidl-export-sources at the same dir has 37 .aidl).
+function M.generated_module_dirs(index, module_dirs)
+  local out = {}
+  if index == nil then
+    return out
+  end
+  local seen = {}
+  for _, d in ipairs(module_dirs or {}) do
+    for _, name in ipairs(index.by_path[d] or {}) do
+      if not seen[d] then
+        local entry = index.by_name[name]
+        for _, src in ipairs(entry and entry.srcs or {}) do
+          if type(src) == "string" and GENERATED_SRC_EXT[src:match("%.[^./]+$") or ""] then
+            seen[d] = true
+            out[#out + 1] = d
+            break
+          end
+        end
+      end
+    end
+  end
+  return out
+end
+
+---ABI-only jar variants that can be dropped even for a generated-source
+---module: pure turbine output and the SDK/API stubs. `turbine-combined` is a
+---built fallback jar and stays, as do javac/combined/jarjar variants.
+local function is_abi_stub_jar(rel)
+  if rel:find("/turbine/", 1, true) then
+    return true
+  end
+  local b = basename(rel)
+  return GENERATED_STUB_JARS[b] == true or b:find("stubs", 1, true) ~= nil
+end
+
 ---Drop the jars a module built for itself once that module's source root is
 ---injected: both the compiled copy and the sources would be on the classpath
 ---and jdt.ls would have to pick between two definitions of the same type
 ---(WifiManager lives in 9 framework-wifi*.jar plus framework/java). House
 ---policy is to delete the duplicate data, never to rely on classpath order.
+---
+---Exception: a module with AIDL/proto sources keeps its implementation jars
+---(javac/combined/jarjar/turbine-combined), because those classes have no
+---.java source to jump to. Only its ABI stubs are still dropped.
 ---@param jars string[] absolute jar paths
 ---@param root string AOSP root
 ---@param module_dirs string[] module dirs (root-relative) whose sources are injected
----@return string[] kept, integer dropped
-function M.drop_module_jars(jars, root, module_dirs)
+---@param opts table|nil { generated = string[] } from generated_module_dirs()
+---@return string[] kept, integer dropped, integer kept_generated
+function M.drop_module_jars(jars, root, module_dirs, opts)
+  local generated = {}
+  for _, d in ipairs(opts and opts.generated or {}) do
+    generated[d] = true
+  end
   local prefixes = {}
   for _, d in ipairs(module_dirs or {}) do
-    prefixes[#prefixes + 1] = "out/soong/.intermediates/" .. d .. "/"
+    prefixes[#prefixes + 1] = { dir = d, prefix = INTERMEDIATES_PREFIX .. d .. "/" }
   end
   if #prefixes == 0 then
-    return jars, 0
+    return jars, 0, 0
   end
   local base = pathutil.normalize(root)
   local kept = {}
   local dropped = 0
+  local kept_generated = 0
   for _, j in ipairs(jars) do
     local rel = pathutil.relative(base, pathutil.normalize(j)) or ""
-    local own = false
+    local own_dir = nil
+    -- longest prefix wins when a selection contains both a parent and a child
     for _, p in ipairs(prefixes) do
-      if rel:sub(1, #p) == p then
-        own = true
-        break
+      if rel:sub(1, #p.prefix) == p.prefix and (own_dir == nil or #p.prefix > #own_dir.prefix) then
+        own_dir = p
       end
     end
-    if own then
+    if own_dir ~= nil and not (generated[own_dir.dir] and not is_abi_stub_jar(rel)) then
       dropped = dropped + 1
     else
+      if own_dir ~= nil and generated[own_dir.dir] then
+        kept_generated = kept_generated + 1
+      end
       kept[#kept + 1] = j
     end
   end
-  return kept, dropped
+  return kept, dropped, kept_generated
 end
 
 function M.compute_injected_jars(root, selected_module_dirs, full_jars, log, opts)

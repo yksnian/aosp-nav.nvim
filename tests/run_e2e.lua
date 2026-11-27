@@ -3755,5 +3755,116 @@ t.describe("E2E: source-only mode (no out)", function()
   end)
 end)
 
+t.describe("E2E: generated-source modules keep AIDL implementation jars", function()
+  local session = require("aosp-nav.session")
+  local aosp_nav = require("aosp-nav")
+  local dir = "packages/modules/Connectivity/framework"
+  local scope = AOSP .. "/" .. dir
+  local combined_rel = "out/soong/.intermediates/"
+    .. dir
+    .. "/framework-connectivity.impl/android_common/combined/framework-connectivity.jar"
+  local turbine_rel = "out/soong/.intermediates/"
+    .. dir
+    .. "/framework-connectivity.impl/android_common/jarjar/turbine/framework-connectivity.jar"
+
+  t.it("builds a Connectivity-style tree with AIDL sources and only a combined jar", function()
+    build_tree()
+    mkdirs(scope .. "/.git")
+    mkdirs(scope .. "/src/android/net")
+    touch(scope .. "/src/android/net/ConnectivityService.java")
+    touch(scope .. "/src/android/net/ICaptivePortal.aidl")
+    -- the index names a turbine jar that is NOT on disk; only the combined
+    -- implementation jar exists, exactly like the real Connectivity tree
+    mkdirs(pathutil.parent(pathutil.join(AOSP, combined_rel)))
+    touch(pathutil.join(AOSP, combined_rel))
+
+    local f = io.open(pathutil.join(AOSP, "out/soong/module_bp_java_deps.json"), "r")
+    local parsed = json.decode(f:read("*a"))
+    f:close()
+    parsed["framework-connectivity"] = {
+      path = { dir },
+      srcs = { dir .. "/src/android/net/ConnectivityService.java" },
+      jars = {},
+      dependencies = {},
+    }
+    -- the impl module owns the indexed (missing) turbine jar and is rescued
+    -- to the combined variant that actually exists on disk
+    parsed["framework-connectivity.impl"] = {
+      path = { dir },
+      jars = { turbine_rel },
+      dependencies = {},
+    }
+    parsed["framework-connectivity-aidl-export-sources"] = {
+      path = { dir },
+      srcs = { dir .. "/src/android/net/ICaptivePortal.aidl" },
+      jars = {},
+    }
+    local w = io.open(pathutil.join(AOSP, "out/soong/module_bp_java_deps.json"), "w")
+    w:write(json.encode(parsed))
+    w:close()
+    local future = math.floor(os.time()) + 400
+    os.execute(string.format("touch -d @%d %q", future, AOSP .. "/out/soong/build.ninja"))
+    os.execute(
+      string.format("touch -d @%d %q", future + 1, AOSP .. "/out/soong/module_bp_java_deps.json")
+    )
+    shim.shim.reset_stat_cache()
+    aosp_nav.set_opts({ kotlin = { enabled = false }, log_level = "debug", scope = "auto" })
+    local S = session._state()
+    S.sessions[AOSP] = nil
+    S.queue = {}
+    S.queued[AOSP] = nil
+    S.inflight[AOSP] = nil
+    S.sp_pushed = {}
+    S.sp_pushed_lists = {}
+    aosp_nav._clear_pinned_folders()
+    shim.shim.clients = {}
+    local store = aosp_nav._store()
+    store:remove_cache(AOSP)
+    store:update(AOSP, function(st)
+      st.source_root_modules = nil
+      st.source_root_modules_by_scope = nil
+      return st
+    end)
+  end)
+
+  t.it("keeps the implementation jar while ordinary classes still resolve to source", function()
+    shim._cwd = scope
+    shim.set_active_file(scope .. "/src/android/net/ConnectivityService.java", "java")
+    shim.fire_filetype("java")
+    local sess = session._state().sessions[AOSP]
+    t.truthy(sess and sess.phase == "ready", "a built subtree reaches the ready phase")
+    t.raw_eq(sess.folder, scope, "the Connectivity-style subtree is the window scope")
+
+    local has_combined, has_turbine = false, false
+    for _, j in ipairs(sess.jars or {}) do
+      if j:find(combined_rel, 1, true) then
+        has_combined = true
+      end
+      if j:find(turbine_rel, 1, true) then
+        has_turbine = true
+      end
+    end
+    t.truthy(has_combined, "the AIDL-generated classes stay reachable through the jar")
+    t.falsy(has_turbine, "no non-existent turbine path is injected")
+
+    local has_src = false
+    for _, r in ipairs(sess.source_paths and sess.source_paths.rel_paths or {}) do
+      if r == "src" or r:find("src/android/net", 1, true) then
+        has_src = true
+      end
+    end
+    t.truthy(has_src, "ConnectivityService.java still resolves to source, not the jar")
+
+    local settings = aosp_nav.jdtls_settings(AOSP)
+    local has_start = false
+    for _, j in ipairs(settings and settings.project and settings.project.referencedLibraries or {}) do
+      if j:find(combined_rel, 1, true) then
+        has_start = true
+      end
+    end
+    t.truthy(has_start, "the start fragment matches the live push (no classpath rewrite)")
+  end)
+end)
+
 local failures = t.print_summary()
 os.exit(failures == 0 and 0 or 1)

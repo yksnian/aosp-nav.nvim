@@ -78,6 +78,21 @@ local function log(...)
   end
 end
 
+---A module with AIDL/proto sources keeps its implementation jars even when
+---its source roots are injected: the generated Java has no .java on disk.
+---Both the scan and the start fragment MUST use this same rule, or the live
+---push rebuilds the classpath again right after jdt.ls starts.
+local function generated_dirs_for(load_index, injected)
+  if #injected == 0 then
+    return {}
+  end
+  local ok, index = pcall(load_index)
+  if not ok or index == nil then
+    return {}
+  end
+  return jar_plan.generated_module_dirs(index, injected)
+end
+
 function M._state()
   return S
 end
@@ -1046,7 +1061,9 @@ function M.cached_java_settings(root)
         end
       end
     end
-    plan_jars = jar_plan.drop_module_jars(plan_jars, root, injected)
+    plan_jars = jar_plan.drop_module_jars(plan_jars, root, injected, {
+      generated = generated_dirs_for(load_index, injected),
+    })
   end
 
   -- Start-only: large scopes and >100 injected sourcePaths disable autobuild;
@@ -1343,14 +1360,21 @@ function M._scan_root(root)
         end
       end
     end
-    local kept, own_dropped = jar_plan.drop_module_jars(jars, root, injected)
+    local kept, own_dropped, own_kept = jar_plan.drop_module_jars(jars, root, injected, {
+      generated = generated_dirs_for(load_index, injected),
+    })
     if own_dropped > 0 then
       jars = kept
       sess.jars = kept
       sess.own_jars_dropped = own_dropped
       log(
         string.format(
-          "[aosp-nav] jarPlan: dropped %d jar(s) built by modules whose source roots are injected",
+          "[aosp-nav] jarPlan: dropped %d jar(s) built by modules whose source roots are injected"
+            .. (
+              own_kept > 0
+                and ("; kept " .. own_kept .. " implementation jar(s) for generated sources")
+              or ""
+            ),
           own_dropped
         )
       )
