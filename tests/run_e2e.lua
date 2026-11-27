@@ -2536,6 +2536,103 @@ t.describe("E2E: session error recovery", function()
       "next trigger retries instead of deadlocking"
     )
   end)
+
+  t.it("a jdt.ls push failure is reported as failed, never ready", function()
+    build_tree()
+    shim.shim.reset_stat_cache()
+    local file = AOSP .. "/frameworks/base/core/java/com/android/internal/util/ArrayUtils.java"
+    mkdirs(AOSP .. "/frameworks/base/core/java/com/android/internal/util")
+    touch(file)
+    shim.set_active_file(file, "java")
+    shim.shim.clients = { shim.make_jdtls_client(AOSP) }
+    local session = require("aosp-nav.session")
+    local aosp_nav = require("aosp-nav")
+    aosp_nav.set_opts({ kotlin = { enabled = false }, log_level = "debug" })
+    local S = session._state()
+    S.sessions[AOSP] = nil
+    S.notified[AOSP .. "\0scan-failed"] = nil
+    local notices = {}
+    local old_notify = S.deps.notify
+    S.deps.notify = function(msg)
+      notices[#notices + 1] = msg
+    end
+    local jc = require("aosp-nav.java.jdtls_channel")
+    local real_push = jc.push_with_source_cycle
+    jc.push_with_source_cycle = function()
+      error("synthetic push failure")
+    end
+    local ok, err = pcall(session.run_for, AOSP)
+    jc.push_with_source_cycle = real_push
+    S.deps.notify = old_notify
+    t.truthy(ok, tostring(err))
+    t.raw_eq(S.sessions[AOSP].phase, "failed", "an undelivered classpath is not ready")
+    t.raw_eq(#notices, 1, "the user is notified once")
+    t.truthy(notices[1]:find("failed", 1, true), "the notice names the failure")
+  end)
+
+  t.it("a deferred push failure is reported instead of a fake ready", function()
+    build_tree()
+    shim.shim.reset_stat_cache()
+    local file = AOSP .. "/frameworks/base/core/java/com/android/internal/util/ArrayUtils.java"
+    mkdirs(AOSP .. "/frameworks/base/core/java/com/android/internal/util")
+    touch(file)
+    shim.set_active_file(file, "java")
+    shim.shim.clients = {}
+    local session = require("aosp-nav.session")
+    local aosp_nav = require("aosp-nav")
+    aosp_nav.set_opts({ kotlin = { enabled = false }, log_level = "debug" })
+    local S = session._state()
+    S.sessions[AOSP] = nil
+    S.notified[AOSP .. "\0scan-failed"] = nil
+    local notices = {}
+    local old_notify = S.deps.notify
+    S.deps.notify = function(msg)
+      notices[#notices + 1] = msg
+    end
+    session.run_for(AOSP)
+    t.raw_eq(S.sessions[AOSP].phase, "ready", "the scan itself succeeded")
+    local jc = require("aosp-nav.java.jdtls_channel")
+    t.truthy(#jc.pending_attach_roots() > 0, "the push was deferred")
+    local real_push = jc.push_with_source_cycle
+    jc.push_with_source_cycle = function()
+      error("synthetic deferred push failure")
+    end
+    local client = shim.make_jdtls_client(AOSP)
+    shim.shim.clients = { client }
+    shim.fire_lsp_attach(client)
+    jc.push_with_source_cycle = real_push
+    S.deps.notify = old_notify
+    t.raw_eq(S.sessions[AOSP].phase, "failed", "the deferred failure is visible")
+    t.raw_eq(#notices, 1, "the user is notified once")
+  end)
+
+  t.it("a failed apply recovers on the next scan even though the session is reused", function()
+    build_tree()
+    shim.shim.reset_stat_cache()
+    local file = AOSP .. "/frameworks/base/core/java/com/android/internal/util/ArrayUtils.java"
+    mkdirs(AOSP .. "/frameworks/base/core/java/com/android/internal/util")
+    touch(file)
+    shim.set_active_file(file, "java")
+    shim.shim.clients = { shim.make_jdtls_client(AOSP) }
+    local session = require("aosp-nav.session")
+    local aosp_nav = require("aosp-nav")
+    aosp_nav.set_opts({ kotlin = { enabled = false }, log_level = "debug" })
+    local S = session._state()
+    S.sessions[AOSP] = nil
+    local jc = require("aosp-nav.java.jdtls_channel")
+    local real_push = jc.push_with_source_cycle
+    jc.push_with_source_cycle = function()
+      error("synthetic push failure")
+    end
+    session.run_for(AOSP)
+    jc.push_with_source_cycle = real_push
+    t.raw_eq(S.sessions[AOSP].phase, "failed", "first apply failed")
+    local failed_sess = S.sessions[AOSP]
+
+    session.run_for(AOSP) -- reuses the failed session object
+    t.raw_eq(S.sessions[AOSP], failed_sess, "the session object was reused")
+    t.raw_eq(S.sessions[AOSP].phase, "ready", "a successful retry is not blocked by a stale flag")
+  end)
 end)
 
 -- ---------------------------------------------------------------------------

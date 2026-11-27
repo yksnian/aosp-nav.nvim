@@ -861,6 +861,33 @@ local function apply_to_client_impl(root, sess, client)
   end
 end
 
+---A failed jdt.ls apply means the classpath was never delivered. Report it
+---here, inside the readiness callback: jdtls_channel.mark_ready wraps every
+---waiter in its own pcall, so an error thrown from apply_to_client_impl can
+---never reach the queue normalizer. `apply_failed` also keeps _scan_root's
+---status tail from overwriting this with "ready".
+local function report_apply_failure(root, sess, err)
+  log("[aosp-nav] jdt.ls apply failed: " .. tostring(err))
+  sess.apply_failed = tostring(err)
+  if S.sessions[root] == sess then
+    sess.phase = "failed"
+  end
+  if S.deps.status then
+    S.deps.status.set(root, "failed", 0)
+    S.deps.status.set_blocked(guard.get_blocked_count())
+  end
+  if S.deps.notify and notified_once(root, "scan-failed") then
+    pcall(
+      S.deps.notify,
+      "[aosp-nav] jdt.ls apply failed for "
+        .. root
+        .. ": "
+        .. tostring(err):match("^[^\n]*")
+        .. " — run :AospRescan to retry, or :Aosp then L for the log."
+    )
+  end
+end
+
 -- VSCode waits for redhat.java's serverReady() before it touches the
 -- running session. LspAttach is too early on a big tree: the invisible
 -- project is still being imported and commands sent then can be dropped.
@@ -872,7 +899,10 @@ apply_to_client = function(root, sess, client)
   sess.applied_clients = sess.applied_clients or {}
   sess.applied_clients[client.id] = true
   jdtls_channel.when_ready(client, function()
-    apply_to_client_impl(root, sess, client)
+    local ok, err = pcall(apply_to_client_impl, root, sess, client)
+    if not ok then
+      report_apply_failure(root, sess, err)
+    end
   end)
 end
 
@@ -1059,6 +1089,9 @@ function M._scan_root(root)
     return
   end
   sess.phase = "scanning"
+  -- A previous apply failure left this flag on the reused session object.
+  -- Clear it at scan start so a successful retry can reach "ready" again.
+  sess.apply_failed = nil
   if deps.status then
     deps.status.set(root, "scanning", 0)
   end
@@ -1373,15 +1406,12 @@ function M._scan_root(root)
   -- attaches later (push_when_attached): the live push (jars + client-
   -- relative sourcePaths, ordering cycle first time) + crash probe
   -- (module-level, so warm restarts reuse it).
+  --
+  -- A push error is reported by report_apply_failure inside the readiness
+  -- callback (which jdtls_channel wraps in its own pcall), not here.
   local client = jdtls_channel.client_for(root)
-  local function apply_guarded(c)
-    local ok, err = pcall(apply_to_client, root, sess, c)
-    if not ok then
-      log("[aosp-nav] jdt.ls apply failed: " .. tostring(err))
-    end
-  end
   if client then
-    apply_guarded(client)
+    apply_to_client(root, sess, client)
   else
     -- The scan finished while jdt.ls is still spawning (or not started).
     -- The start-time opts hook already ran with an empty jar cache, so
@@ -1394,7 +1424,7 @@ function M._scan_root(root)
         return
       end
       log("[aosp-nav] jdt.ls attached after the scan; delivering the live push now")
-      apply_guarded(c)
+      apply_to_client(root, sess, c)
     end)
   end
 
@@ -1402,7 +1432,10 @@ function M._scan_root(root)
   -- source-only stays its own phase (never fake "ready"): settled() compares
   -- the recorded stamp so building out/ upgrades it on the next trigger.
   local degraded = sess.phase == "source-only"
-  if degraded then
+  if sess.apply_failed then
+    -- report_apply_failure already set failed + notified during the apply;
+    -- never overwrite that with a success status here.
+  elseif degraded then
     notify_reset(root, "scan-failed") -- a still-unbuilt tree is not a failure
     if deps.status then
       deps.status.set(root, "source-only", 0)

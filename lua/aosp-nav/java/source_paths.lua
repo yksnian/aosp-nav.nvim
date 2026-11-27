@@ -38,6 +38,8 @@ local function nearest_bp_dir(start, root, io_)
   end
   root = pathutil.normalize(root)
   while dir and dir ~= "" do
+    -- The tree root is checked too: a tree carrying its own Android.bp is
+    -- itself a valid module boundary.
     if
       io_.is_file(pathutil.join(dir, "Android.bp"))
       or io_.is_file(pathutil.join(dir, "Android.mk"))
@@ -45,7 +47,7 @@ local function nearest_bp_dir(start, root, io_)
       return dir
     end
     if dir == root then
-      return nil -- never treat the tree itself as a module
+      return nil -- no build file at root: stop, never ascend past the tree
     end
     local up = pathutil.parent(dir)
     if up == nil or up == dir then
