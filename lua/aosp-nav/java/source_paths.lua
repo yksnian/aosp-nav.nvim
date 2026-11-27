@@ -58,10 +58,34 @@ local function nearest_bp_dir(start, root, io_)
   return nil
 end
 
----Derive a few source roots for an unbuilt tree from the active file (or the
----window folder). Returns paths relative to `root`; `io_.is_dir/is_file`
----decide which candidates actually exist. Never scans the whole tree.
-local function derive_no_index_roots(root, file, folder, io_)
+---Derive the single source root for one unbuilt module, given a seed (the
+---active file or a selected module dir). Returns a path relative to `root`,
+---or nil when no build file / source dir can be found. Never scans the tree.
+local function derive_root_from(seed, root, io_)
+  local module = nearest_bp_dir(seed, root, io_)
+  if module == nil then
+    return nil
+  end
+  local base = pathutil.basename(module)
+  if base == "java" or base == "src" or base == "kotlin" then
+    return pathutil.relative(root, module)
+  end
+  for _, rel in ipairs(NO_INDEX_SOURCE_DIRS) do
+    local p = pathutil.join(module, rel)
+    if io_.is_dir(p) then
+      return pathutil.relative(root, p) -- first match only, see the comment above
+    end
+  end
+  return nil
+end
+
+---Derive source roots for an unbuilt tree: the active file's module first,
+---then every explicitly selected (or default) module dir. The latter is what
+---keeps a root window's promise — on a tree with no build index the default
+---`frameworks/base/core/java` + `services/core` still land on sourcePaths, so
+---opening a Wifi file can still jump into framework sources. Deduped, capped,
+---and all relative to `root` (the caller re-bases them to the client root).
+local function derive_no_index_roots(root, file, folder, modules, io_)
   local out, seen = {}, {}
   local function add(p)
     if p and not seen[p] then
@@ -69,20 +93,9 @@ local function derive_no_index_roots(root, file, folder, io_)
       out[#out + 1] = p
     end
   end
-  local module = nearest_bp_dir(file or folder, root, io_)
-  if module then
-    local base = pathutil.basename(module)
-    if base == "java" or base == "src" or base == "kotlin" then
-      add(pathutil.relative(root, module))
-    else
-      for _, rel in ipairs(NO_INDEX_SOURCE_DIRS) do
-        local p = pathutil.join(module, rel)
-        if io_.is_dir(p) then
-          add(pathutil.relative(root, p))
-          break -- mutually exclusive: only the highest-priority layout wins
-        end
-      end
-    end
+  add(derive_root_from(file or folder, root, io_))
+  for _, m in ipairs(modules or {}) do
+    add(derive_root_from(pathutil.join(root, m), root, io_))
   end
   return out
 end
@@ -180,7 +193,7 @@ function M.collect_desired(cfg, root, folder, explicit_modules, io_, load_index,
       if log then
         log(
           string.format(
-            "[aosp-nav] sourcePaths: %d module(s) selected but the build index is unavailable (build the tree first)",
+            "[aosp-nav] sourcePaths: %d module(s) selected but the build index is unavailable; deriving their source dirs directly (build the tree for jars)",
             #modules
           )
         )
@@ -193,7 +206,7 @@ function M.collect_desired(cfg, root, folder, explicit_modules, io_, load_index,
   -- handful of source roots from the active file / window scope. Existing
   -- configured roots are kept first; the cap is applied to the merged set.
   if no_index then
-    for _, p in ipairs(derive_no_index_roots(root, current_file, folder, io_)) do
+    for _, p in ipairs(derive_no_index_roots(root, current_file, folder, modules, io_)) do
       entries[#entries + 1] = p
       if #entries >= NO_INDEX_ROOT_LIMIT then
         break

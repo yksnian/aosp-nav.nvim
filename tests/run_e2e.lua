@@ -3241,6 +3241,54 @@ t.describe("E2E: source-only mode (no out)", function()
     t.truthy(proj and proj.sourcePaths and #proj.sourcePaths > 0, "start fragment carries sources")
   end)
 
+  t.it("root window + no out still exposes framework sources when editing a Wifi file", function()
+    local old_cf = enter_no_out()
+    -- A Wifi module boundary and a source file; the fixture has no Wifi BP,
+    -- so plant one. Framework defaults (core/java + services/core) are what
+    -- must land on sourcePaths even though there is no build index.
+    mkdirs(AOSP .. "/packages/modules/Wifi/framework/java/com/android/wifi")
+    touch(AOSP .. "/packages/modules/Wifi/framework/java/Android.bp")
+    touch(AOSP .. "/frameworks/base/services/core/Android.bp")
+    mkdirs(AOSP .. "/frameworks/base/services/core/java/com/android/server")
+    touch(AOSP .. "/frameworks/base/services/core/java/com/android/server/SystemServer.java")
+    local wifi = AOSP .. "/packages/modules/Wifi/framework/java/com/android/wifi/WifiManager.java"
+    touch(wifi)
+    shim.shim.reset_stat_cache()
+
+    local S = session._state()
+    S.sessions[AOSP] = nil
+    S.queue = {}
+    S.queued[AOSP] = nil
+    S.inflight[AOSP] = nil
+    aosp_nav._clear_pinned_folders()
+    shim._cwd = AOSP -- root window, like `scope="tree"` or starting at the tree top
+    shim.set_active_file(wifi, "java")
+    S.deps.current_file = function()
+      return wifi
+    end
+
+    session.run_for(AOSP)
+    S.deps.current_file = old_cf
+
+    local sess = S.sessions[AOSP]
+    t.raw_eq(sess.phase, "source-only")
+    t.truthy(sess.seeded_defaults, "root window seeded the default modules")
+    local paths = table.concat(sess.source_paths.abs_paths, "\n")
+    t.truthy(
+      paths:find("packages/modules/Wifi/framework/java", 1, true),
+      "the active Wifi module is navigable"
+    )
+    t.truthy(
+      paths:find("frameworks/base/core/java", 1, true),
+      "framework core sources are injected without a build index"
+    )
+    -- services/core has no java basename: its java/ child is the source root
+    t.truthy(
+      paths:find("frameworks/base/services/core/java", 1, true),
+      "framework services sources resolve through their java/ child"
+    )
+  end)
+
   t.it("building out/ upgrades source-only to ready on the next scan", function()
     local old_cf = enter_no_out()
     local S = session._state()

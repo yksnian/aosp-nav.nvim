@@ -60,7 +60,7 @@ t.describe("java.source_paths: no-index derivation", function()
       { source_roots = {} },
       ROOT,
       opts.folder or ROOT,
-      nil, -- explicit_modules nil -> auto branch -> load_index() == nil
+      opts.modules, -- nil -> auto branch -> load_index() == nil
       io_,
       function()
         return nil
@@ -106,6 +106,52 @@ t.describe("java.source_paths: no-index derivation", function()
 
   t.it("no file and root folder yields no roots (honest empty state)", function()
     local r = no_index_plan({ files = { ["/aosp/Android.bp"] = true } })
+    t.same_list(r.abs_paths, {})
+  end)
+
+  t.it("selected modules add their source dirs so a root window can cross modules", function()
+    -- A Wifi file with no build index: the active module gives one root, and
+    -- the root window's default modules supply the framework sources. Without
+    -- this, gd from Wifi into Context.java finds nothing on an unbuilt tree.
+    local wifi = "/aosp/packages/modules/Wifi/framework/java/com/android/wifi/WifiManager.java"
+    local wifi_bp = "/aosp/packages/modules/Wifi/framework/java/Android.bp"
+    local fw_core = "/aosp/frameworks/base/core/java"
+    local fw_svc = "/aosp/frameworks/base/services/core"
+    local r = no_index_plan({
+      file = wifi,
+      modules = { "frameworks/base/core/java", "frameworks/base/services/core" },
+      files = {
+        [wifi_bp] = true,
+        [fw_core .. "/Android.bp"] = true,
+        [fw_svc .. "/Android.bp"] = true,
+      },
+      dirs = {
+        ["/aosp/packages/modules/Wifi/framework/java"] = true,
+        [fw_core] = true,
+        [fw_svc] = true,
+        [fw_svc .. "/java"] = true,
+      },
+    })
+    t.truthy(r.no_index)
+    -- active module first, then default modules; services/core (no java
+    -- basename) resolves to its java/ child, deduped against the active root
+    t.same_list(r.abs_paths, {
+      "/aosp/packages/modules/Wifi/framework/java",
+      fw_core,
+      fw_svc .. "/java",
+    })
+    t.same_list(r.rel_paths, {
+      "packages/modules/Wifi/framework/java",
+      "frameworks/base/core/java",
+      "frameworks/base/services/core/java",
+    })
+  end)
+
+  t.it("a selected module that does not exist contributes nothing", function()
+    local r = no_index_plan({
+      modules = { "frameworks/base/gone" },
+      files = { ["/aosp/Android.bp"] = true },
+    })
     t.same_list(r.abs_paths, {})
   end)
 end)

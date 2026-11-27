@@ -91,7 +91,7 @@ Eight keys; everything derivable from the tree is derived (AOSP root, module sel
 require("aosp-nav").setup({
   enabled = true,
   android_root = nil,           -- explicit root; auto-detected per file when nil
-  scope = "auto",               -- "tree" pins the window to the AOSP checkout top (see below)
+  scope = "auto",               -- "auto" derives scope from cwd/file; "tree" always uses the AOSP root (see below)
   exclude = {
     jars = {},                  -- regex on jar file name AND module name
     paths = {},                 -- substring on the path relative to .intermediates/
@@ -121,7 +121,7 @@ By default cross-module `gd` lands in the decompiled `jdt://` view of an injecte
 
 ### Without build outputs (source-only)
 
-An unbuilt checkout is still a valid AOSP tree. Instead of failing, the plugin enters `source-only`: no `referencedLibraries` are written (an existing classpath is left untouched), and `sourcePaths` are derived from the open file's module — the `Android.bp` directory itself when its basename is `java`/`src`/`kotlin`, otherwise `src/java` → `src/main/java` → `src` → `java` → `kotlin` — plus any `source_roots` you configured (16 roots max). Cross-module jumps into jars do not work until you build; navigation inside the opened module does.
+An unbuilt checkout is still a valid AOSP tree. Instead of failing, the plugin enters `source-only`: no `referencedLibraries` are written (an existing classpath is left untouched), and `sourcePaths` are derived from the open file's module — the `Android.bp` directory itself when its basename is `java`/`src`/`kotlin`, otherwise `src/java` → `src/main/java` → `src` → `java` → `kotlin` — plus any `source_roots` you configured (16 roots max). Cross-module jumps into **jars** do not work until you build, but source navigation does: in a root window (or `scope="tree"`) the selected/default modules are also converted to source dirs directly, so a Wifi file can still jump into `frameworks/base` sources. Without a build index this covers the chosen modules, not the whole tree.
 
 - The statusline shows `AOSP:src`; `:Aosp` adds a `build outputs` row and marks jar scan/source as info (`-`), never as ✓/⚠.
 - No jar cache is written **or deleted**. After `lunch + m`, entering an AOSP buffer again (or `:AospRescan`) upgrades the session to normal `ready` operation.
@@ -147,7 +147,9 @@ Neovim has no workspace folders, so the plugin derives an **effective window sco
 
 The pin is per AOSP root. Crossing into another subtree later changes nothing — no re-plan, no prompt, no second jdt.ls; `root_dir` is the pinned scope. To work elsewhere, restart nvim there or `:cd` into it before the first AOSP file is focused. There is one jdt.ls JVM per checkout/workspace.
 
-**Always use the whole tree**: set `scope = "tree"` in your `setup()` options when you start nvim in a subtree (e.g. `frameworks/base`) but want the VS Code "workspace folder = AOSP checkout" setup — whole-tree jar navigation, so mainline modules such as `packages/modules/Wifi` resolve from the same session. It pins the scope to the checkout top on first use, exactly as if you had launched nvim there; your cwd is **not** changed and no restart is needed. The root-window rules still apply: the two default source-root modules, autobuild off, and a single jdt.ls. Pick extra source roots with `:AospModules` (or `source_roots`) if you also want to jump into Wifi's real sources instead of its decompiled jars. Leave `scope` unset (or `"auto"`) for the cwd/file derivation above.
+**Always use the whole tree**: set `scope = "tree"` to switch off cwd/file-based window derivation entirely — the window scope is the AOSP checkout top everywhere, regardless of where nvim was started or which module the current file belongs to. This is the VS Code "workspace folder = AOSP checkout" setup: one whole-tree jar navigation session, so mainline modules such as `packages/modules/Wifi` resolve from wherever you open them, with no re-plan and no subtree pin to reason about. It pins to the checkout top on first use, exactly as if you had launched nvim there; your cwd is **not** changed and no restart is needed. The root-window rules still apply: the two default source-root modules, autobuild off, and a single jdt.ls. Pick extra source roots with `:AospModules` (or `source_roots`) if you also want to jump into Wifi's real sources instead of its decompiled jars. Leave `scope` unset (or `"auto"`) for the cwd/file derivation above.
+
+`scope = "tree"` is a deliberate simplification, not a free optimization: it trades the narrower sub-scope (fewer source paths, autobuild on unless >100 sourcePaths) for a single predictable scope in which every module's jars are on the classpath. If you only ever navigate inside one module, `"auto"` keeps startup lighter; if you jump across modules or open files from history, `"tree"` removes the whole class of "why does `gd` find nothing here" problems.
 
 **Normal `:q` sends no signal to jdt.ls.** Neovim's LSP shutdown is when Eclipse flushes a clean workspace snapshot, and racing that save with SIGTERM previously left `.metadata` dirty (≈95 s recovery on the next open). After an abnormal exit (`:qa!`, crash), the next start reclaims orphan JVMs indexing the same workspace: SIGTERM, wait up to ~8 s, then start fresh — never SIGKILL, which corrupts `.metadata`. A JVM with a live editor (nvim/lvim) in its parent chain is never touched.
 
